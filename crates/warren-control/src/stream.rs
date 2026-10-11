@@ -82,10 +82,12 @@ async fn run(
     loop {
         loop {
             let events = app.store.events_after(last, 256).await?;
-            let Some(first) = events.first() else { break };
-            if first.seq != last + 1 {
-                // The events right after `last` were pruned between reading
-                // the bounds and reading the log: never skip them silently.
+            if events.is_empty() {
+                break;
+            }
+            if events.iter().zip(last + 1..).any(|(e, seq)| e.seq != seq) {
+                // Events the node needs were pruned between reading the
+                // bounds and reading the log: never skip them silently.
                 let (latest, _) = app.store.event_bounds().await?;
                 send(&tx, &snapshot(&app, latest).await?).await?;
                 last = latest;

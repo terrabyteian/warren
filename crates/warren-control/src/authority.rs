@@ -19,6 +19,7 @@ use warren_core::clock;
 use warren_core::identity::Principal;
 use warren_core::jose::Jwk;
 use warren_core::keys::{PublicKey, SigningKey, random_bytes};
+use warren_core::params;
 use warren_core::x509::{
     self, Certificate, CertificateSpec, EMPTY_NAME, Identity, IssuerInfo, Usage,
 };
@@ -145,6 +146,7 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// A certificate authority: its key and certificate.
 pub struct Ca {
+    name: String,
     key: SigningKey,
     /// The CA certificate, DER.
     pub der: Vec<u8>,
@@ -182,6 +184,8 @@ pub struct Issued {
     pub not_before: i64,
     /// End of validity, Unix seconds.
     pub not_after: i64,
+    /// When to renew: half-way from issuance to `not_after`.
+    pub renew_at: i64,
 }
 
 /// Every key the control plane holds.
@@ -203,6 +207,8 @@ pub struct Authority {
 
 const ROOT_LIFETIME: i64 = 10 * 365 * 86_400;
 const ISSUING_LIFETIME: i64 = 5 * 365 * 86_400;
+/// How long before a CA expires the control plane starts warning about it.
+const CA_EXPIRY_WARNING: i64 = 90 * 86_400;
 
 fn serial() -> Result<[u8; 16], Error> {
     let mut serial: [u8; 16] = random_bytes().map_err(|e| Error::Internal(e.to_string()))?;
@@ -258,6 +264,26 @@ impl Authority {
             posture_key: load_key(store, kek, "posture-signing").await?,
             assertion_key: load_key(store, kek, "session-assertion-signing").await?,
         })
+        .inspect(Authority::warn_if_expiring)
+    }
+
+    /// Logs a warning for each CA that expires within `CA_EXPIRY_WARNING`.
+    /// Nothing is issued past a CA's own expiry, so once one expires the
+    /// certificates it issues stop.
+    pub fn warn_if_expiring(&self) {
+        let now = clock::now_secs();
+        for ca in [&self.root, &self.client, &self.infra] {
+            if ca.cert.not_after - now < CA_EXPIRY_WARNING {
+                crate::log::warn(
+                    "keys",
+                    &format!(
+                        "the {} expires at {}; certificates it issues cannot outlive it, so replace it before then",
+                        ca.name,
+                        clock::rfc3339(ca.cert.not_after)
+                    ),
+                );
+            }
+        }
     }
 
     /// The trust domain.
@@ -344,7 +370,19 @@ impl Authority {
     }
 }
 
+/// Signs a leaf with `ca`, refusing one that would be valid outside the
+/// CA's own validity, which verifiers anchored at the root would reject.
 fn issue(spec: &CertificateSpec<'_>, ca: &Ca) -> Result<Issued, Error> {
+    let now = clock::now_secs();
+    if now < ca.cert.not_before || spec.not_after > ca.cert.not_after {
+        return Err(Error::Unavailable(format!(
+            "the {} is valid from {} until {}, so it cannot issue a certificate valid until {}",
+            ca.name,
+            clock::rfc3339(ca.cert.not_before),
+            clock::rfc3339(ca.cert.not_after),
+            clock::rfc3339(spec.not_after)
+        )));
+    }
     let der = x509::build_certificate(spec, &ca.issuer(), |tbs| ca.key.sign_der(tbs))
         .map_err(|e| Error::Internal(e.to_string()))?;
     let parsed = Certificate::parse(&der).map_err(|e| Error::Internal(e.to_string()))?;
@@ -352,6 +390,7 @@ fn issue(spec: &CertificateSpec<'_>, ca: &Ca) -> Result<Issued, Error> {
         serial: parsed.serial_hex(),
         not_before: spec.not_before,
         not_after: spec.not_after,
+        renew_at: params::renew_at(clock::now_secs(), spec.not_after),
         der,
     })
 }
@@ -389,14 +428,42 @@ async fn load_ca(
                 "{name} certificate does not match its key"
             )));
         }
-        return Ok(Ca { key, der, cert });
+        return Ok(Ca {
+            name: name.into(),
+            key,
+            der,
+            cert,
+        });
     }
+    let lifetime = match parent {
+        None => ROOT_LIFETIME,
+        Some(_) => ISSUING_LIFETIME,
+    };
+    let (ca, pkcs8) = create_ca(name, cn, parent, lifetime)?;
+    store
+        .insert_signing_key(
+            name,
+            &kek.seal(name, &pkcs8)?,
+            Some(&x509::pem_encode("CERTIFICATE", &ca.der)),
+        )
+        .await?;
+    Ok(ca)
+}
+
+/// A new CA valid for `lifetime` seconds, signed by `parent` or by itself,
+/// with its key as PKCS#8.
+fn create_ca(
+    name: &str,
+    cn: &str,
+    parent: Option<&Ca>,
+    lifetime: i64,
+) -> Result<(Ca, Zeroizing<Vec<u8>>), Error> {
     let key = SigningKey::generate().map_err(|e| Error::Internal(e.to_string()))?;
     let now = clock::now_secs();
     let subject = x509::common_name(cn);
-    let (usage, lifetime) = match parent {
-        None => (Usage::Ca { path_len: 1 }, ROOT_LIFETIME),
-        Some(_) => (Usage::Ca { path_len: 0 }, ISSUING_LIFETIME),
+    let usage = match parent {
+        None => Usage::Ca { path_len: 1 },
+        Some(_) => Usage::Ca { path_len: 0 },
     };
     let spec = CertificateSpec {
         serial: serial()?,
@@ -424,15 +491,16 @@ async fn load_ca(
     }
     .map_err(|e| Error::Internal(e.to_string()))?;
     let pkcs8 = key.to_pkcs8().map_err(|e| Error::Internal(e.to_string()))?;
-    store
-        .insert_signing_key(
-            name,
-            &kek.seal(name, &pkcs8)?,
-            Some(&x509::pem_encode("CERTIFICATE", &der)),
-        )
-        .await?;
     let cert = Certificate::parse(&der).map_err(|e| Error::Internal(e.to_string()))?;
-    Ok(Ca { key, der, cert })
+    Ok((
+        Ca {
+            name: name.into(),
+            key,
+            der,
+            cert,
+        },
+        pkcs8,
+    ))
 }
 
 /// Device tunnel addresses for allocation index `index`: the index-th
@@ -493,6 +561,38 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn nothing_outlives_its_issuing_ca() {
+        let root = create_ca("root-ca", "test root", None, 86_400).unwrap().0;
+        let infra = create_ca("infrastructure-ca", "test infra", Some(&root), 3_600)
+            .unwrap()
+            .0;
+        let key = SigningKey::generate().unwrap();
+        let spec = |not_after: i64| CertificateSpec {
+            serial: serial().unwrap(),
+            not_before: clock::now_secs() - 60,
+            not_after,
+            subject: EMPTY_NAME.to_vec(),
+            public_key: key.public_key(),
+            usage: Usage::Leaf {
+                server_auth: true,
+                client_auth: true,
+            },
+            uris: vec!["spiffe://example.test/relay/n-1".into()],
+            dns_names: vec![],
+            identity: None,
+        };
+        let within = clock::now_secs() + 1_800;
+        let issued = issue(&spec(within), &infra).unwrap();
+        assert_eq!(issued.not_after, within);
+        let past = infra.cert.not_after + 1;
+        let refused = issue(&spec(past), &infra).unwrap_err();
+        assert!(
+            matches!(&refused, Error::Unavailable(m) if m.contains("infrastructure-ca")),
+            "{refused:?}"
+        );
     }
 
     #[test]

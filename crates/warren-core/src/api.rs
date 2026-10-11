@@ -72,7 +72,8 @@ pub struct Session {
     pub expires_at: i64,
     /// The signed-in user.
     pub user: UserInfo,
-    /// When the user authenticated at the IdP, Unix seconds.
+    /// When the user authenticated at the IdP, Unix seconds, or 0 when the
+    /// IdP did not say (`x509::AUTH_TIME_UNKNOWN`).
     pub auth_time: i64,
     /// Whether that authentication used multi-factor authentication.
     pub mfa: bool,

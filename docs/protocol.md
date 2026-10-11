@@ -87,7 +87,8 @@ Applies to links A to E.
   keys.
 - Certificates are verified against the deployment trust bundle
   ([section 10](#10-certificate-profile)), not the system or WebPKI roots,
-  except where link D explicitly allows WebPKI before enrollment.
+  except where link D explicitly allows WebPKI
+  ([section 10.1](#101-trust-hierarchy)).
 - 0-RTT MUST NOT be used on any link (replay risk on CONNECT requests and
   control calls). Session resumption MAY be used; a resumption ticket MUST NOT
   outlive the certificate that authenticated the original handshake, and the
@@ -475,8 +476,13 @@ Requirements:
   verify relays, connectors and the control plane's client API against the
   bundle only, and require the certificate to name the role they expect
   (`warren://{td}/control-plane/{id}` for the control plane), so no relay or
-  connector certificate can stand in for the control plane. The control plane
-  never issues a node a certificate for its own or the IdP's host names.
+  connector certificate can stand in for the control plane. When the operator
+  gives the organization URL's host a certificate of its own (WebPKI or the
+  operator's CA), the control plane presents that one there, and clients
+  verify link D at that host against the system trust store (or the CA their
+  MDM profile installs) instead; under its other names the control plane
+  keeps presenting its infrastructure certificate, for link E. The control
+  plane never issues a node a certificate for its own or the IdP's host names.
 - The trust domain `{td}` is the deployment's identifier, used in URI SANs.
 
 ### 10.2 User+device certificate
@@ -518,8 +524,11 @@ Requirements:
   belongs to (`SESSION_MAX_LIFETIME`).
 - Issuance needs a signed PKCS#10 request from the device key, a live session,
   an enabled user, an approved and unrevoked device, and passing baseline
-  posture. Renewal starts at half-life (`CLIENT_CERT_RENEW_AT`, fixed at 0.5)
-  over the existing mTLS channel.
+  posture. Renewal starts at half-life (`CLIENT_CERT_RENEW_AT`, fixed at 0.5),
+  counted from issuance rather than from `notBefore`, which is backdated by
+  `CLOCK_SKEW_ALLOWANCE`, over the existing mTLS channel.
+- No certificate is issued valid past its issuing CA's own `notAfter`; the
+  control plane warns 90 days before a CA expires.
 
 ### 10.3 Infrastructure certificates
 
@@ -575,6 +584,11 @@ Requirements:
   `WARREN_OID_ARC.1`, encoded as in [section 10.2](#102-userdevice-certificate).
   Until a hardware attestation path exists the enrollment trust class is
   device-reported (1).
+- **`authTime`** in the identity extension comes only from the ID token's
+  `auth_time` claim, never from when the token was issued (a silent single
+  sign-on issues a fresh token without authenticating anyone). When the IdP
+  leaves `auth_time` out, `authTime` is 0: freshness is unknown, and every
+  `auth.maxAge` condition fails, asking the user to sign in again.
 - **Key identifiers** (Subject and Authority Key Identifier) are the leftmost
   160 bits of the SHA-256 digest of the subject public key (RFC 7093,
   method 1).
@@ -627,7 +641,7 @@ The endpoints, all JSON unless noted, are described in
 | Step | Request |
 | --- | --- |
 | Discovery | `GET /.well-known/warren`: trust domain, API base, sign-in endpoints, trust bundle (root, client CA, infrastructure CA, PEM), protocol versions. |
-| Sign-in | `GET /v1/auth/authorize` with `redirect_uri`, `code_challenge`, `code_challenge_method=S256` and `state`, in the system browser. The redirect URI is an `http` loopback URI on `127.0.0.1` or `[::1]` with any port (RFC 8252 section 7.3), or one the deployment configures exactly; anything else gets an error page, never a redirect. The control plane runs its own authorization-code flow with PKCE and a nonce toward the IdP, then redirects to the client with a one-time `code` (valid 2 minutes) and the client's `state`, or with `error` and a human-readable `error_description`. |
+| Sign-in | `GET /v1/auth/authorize` with `redirect_uri`, `code_challenge`, `code_challenge_method=S256` and `state`, and `prompt=login` when the user asked to sign in again (after a `reauth_required` or `mfa_required` refusal), in the system browser. The redirect URI is an `http` loopback URI on `127.0.0.1` or `[::1]` with any port (RFC 8252 section 7.3), or one the deployment configures exactly; anything else gets an error page, never a redirect. The control plane runs its own authorization-code flow with PKCE and a nonce toward the IdP, sending `max_age` set to the shortest `auth.maxAge` in policy when policy has one, and `prompt=login` when the client sent it, so the IdP authenticates the user afresh rather than reuse its own session; either one obliges the IdP to report `auth_time` (OpenID Connect Core section 3.1.2.1), and an ID token without it leaves the sign-in time unknown ([section 10.4](#104-encodings)). It then redirects to the client with a one-time `code` (valid 2 minutes) and the client's `state`, or with `error` and a human-readable `error_description`. |
 | Session | `POST /v1/auth/token` with a compact JWS (ES256, `typ` `warren-session-request+jws`, the device's public key as the header's `jwk`) whose payload is `{code, code_verifier, redirect_uri, iat}`. The control plane checks the signature, the PKCE verifier, the redirect URI and that `iat` is within `CLOCK_SKEW_ALLOWANCE`, and returns a session bound to that key with a bearer token. |
 | Enrollment | `POST /v1/devices` with a PKCS#10 request signed by the session's device key, platform facts, and where the key lives. |
 | Certificates | `POST /v1/certificates` with a PKCS#10 request signed by the session's device key. Renewal is the same call. |
@@ -643,7 +657,10 @@ posture evaluation in M2.
 
 ### 11.2 Relays and connectors to control plane (link E)
 
-- mTLS with infrastructure certificates.
+- mTLS with infrastructure certificates. When the organization URL's host has
+  an operator-supplied certificate ([section 10.1](#101-trust-hierarchy)),
+  nodes reach the control plane under one of its other names, where it still
+  presents its infrastructure certificate, and verify it against the bundle.
 - **Policy bundles.** (Until the control plane publishes them, M1 relays and
   connectors load the same content, unsigned, from a static file, reloaded
   on `SIGHUP` and subject to the same version rule.) The control plane
@@ -753,8 +770,9 @@ Wire format:
 - Snapshots: `{"type": "snapshot", "seq", "revocations", "bundle_version",
   "bundle_digest"}`. A stream without `after`, or with an `after` the control
   plane no longer retains (`EVENT_RETENTION`), starts with one.
-- If events the node needs were pruned while it resumed, the control plane
-  sends a snapshot instead of skipping them.
+- Pruning drops only the oldest events, by sequence number, so the events
+  retained never have a gap. If events the node needs were pruned while it
+  resumed, the control plane sends a snapshot instead of skipping them.
 - The control plane closes the stream when the node is revoked, or when the
   certificate it connected with is revoked or expires.
 - Acknowledgements: `POST /v1/node/events/ack` with
@@ -781,7 +799,7 @@ defaults are initial and may change with measurement.
 | Parameter | Value | Meaning |
 | --- | --- | --- |
 | `CLIENT_CERT_LIFETIME` | at most 4 h (fixed bound) | User+device certificate lifetime |
-| `CLIENT_CERT_RENEW_AT` | 0.5 (fixed) | Fraction of lifetime at which renewal starts |
+| `CLIENT_CERT_RENEW_AT` | 0.5 (fixed) | Fraction of lifetime, from issuance, at which renewal starts |
 | `REVOCATION_DEADLINE` | 10 s (fixed) | Commit to last connection cut |
 | `POSTURE_RECHECK_INTERVAL` | at most 5 min (fixed bound) | Maximum time between posture reports |
 | `POSTURE_STATEMENT_LIFETIME` | at most 5 min (fixed bound) | Validity of a signed posture statement, from its oldest observation |

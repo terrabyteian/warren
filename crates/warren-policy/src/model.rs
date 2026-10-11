@@ -1347,15 +1347,14 @@ fn parse_time_of_day(text: &str) -> Option<i64> {
 
 const WEEKDAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
+/// Zone names from the IANA Time Zone Database, one per line, so a
+/// schedule can only name a zone every enforcement point can resolve.
+const TIMEZONES: &str = include_str!("timezones.txt");
+
 fn valid_timezone(tz: &str) -> bool {
-    !tz.is_empty()
-        && tz.len() <= 64
-        && tz.split('/').all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'+'))
-        })
+    TIMEZONES
+        .lines()
+        .any(|zone| zone == tz && !zone.starts_with('#'))
 }
 
 fn parse_schedule(ctx: &mut Ctx<'_>, node: &Node) -> Option<Schedule> {
@@ -1371,7 +1370,10 @@ fn parse_schedule(ctx: &mut Ctx<'_>, node: &Node) -> Option<Schedule> {
         }
     };
     if !valid_timezone(&timezone) {
-        ctx.error(node.line, format!("{timezone:?} is not a time zone name"));
+        ctx.error(
+            node.line,
+            format!("{timezone:?} is not a time zone in the IANA Time Zone Database"),
+        );
         return None;
     }
     let Some(windows) = f.get("windows").and_then(|w| ctx.list(w, "windows")) else {

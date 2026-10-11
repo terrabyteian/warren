@@ -65,6 +65,19 @@ pub enum DeviceAction {
     Revoke,
 }
 
+/// What enrolling a device key did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enrollment {
+    /// The key was new: a device was created for the user.
+    Created,
+    /// The device was enrolled already and is now bound to this user too.
+    BoundUser,
+    /// The device was enrolled already for this user.
+    Again,
+    /// The device is revoked; nothing changed.
+    Revoked,
+}
+
 /// A device's approval state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceStatus {
@@ -406,11 +419,14 @@ impl Store {
         Ok((latest as u64, oldest.unwrap_or(latest + 1) as u64))
     }
 
-    /// Drops events committed before `before_ms`, keeping at least the last
-    /// one so resumption can tell how far back the log goes.
+    /// Drops events up to the last one committed before `before_ms`, keeping
+    /// at least the last one so resumption can tell how far back the log
+    /// goes. Only a prefix of the log is ever dropped, so what remains has
+    /// no gaps even if the clock stepped back between commits.
     pub async fn prune_events(&self, before_ms: i64) -> Result<u64, Error> {
         let r = sqlx::query(
-            "DELETE FROM events WHERE committed_at_ms < ? AND seq < (SELECT MAX(seq) FROM events)",
+            "DELETE FROM events WHERE seq <= (SELECT MAX(seq) FROM events WHERE committed_at_ms < ?) \
+             AND seq < (SELECT MAX(seq) FROM events)",
         )
         .bind(before_ms)
         .execute(&self.pool)
@@ -938,8 +954,8 @@ impl Store {
     }
 
     /// Enrolls a device for a user, or binds an already enrolled key to
-    /// another user. Addresses are allocated from the pools with
-    /// `allocate`, given a fresh index.
+    /// another user; a revoked device is left as it is. Addresses are
+    /// allocated from the pools with `allocate`, given a fresh index.
     pub async fn enroll_device(
         &self,
         user_id: &str,
@@ -948,17 +964,25 @@ impl Store {
         key_storage: &str,
         platform: &Platform,
         allocate: impl FnOnce(i64) -> Result<(String, String), Error>,
-    ) -> Result<(Device, bool), Error> {
+    ) -> Result<(Device, Enrollment), Error> {
         let mut tx = self.begin().await?;
         let now = clock::now_secs();
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT id FROM devices WHERE public_key = ?")
+        let existing: Option<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM devices WHERE public_key = ?")
                 .bind(public_key)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(db)?;
         let (id, created) = match existing {
-            Some(id) => (id, false),
+            Some((id, status)) if status == DeviceStatus::Revoked.as_str() => {
+                drop(tx);
+                let device = self
+                    .device(&id)
+                    .await?
+                    .ok_or_else(|| Error::Internal("device vanished".into()))?;
+                return Ok((device, Enrollment::Revoked));
+            }
+            Some((id, _)) => (id, false),
             None => {
                 let id = new_id("d")?;
                 let index = Self::next_counter(&mut tx, "device_address").await?;
@@ -986,19 +1010,26 @@ impl Store {
                 (id, true)
             }
         };
-        sqlx::query("INSERT INTO device_users (device_id, user_id, created_at) VALUES (?, ?, ?) ON CONFLICT (device_id, user_id) DO NOTHING")
+        let bound = sqlx::query("INSERT INTO device_users (device_id, user_id, created_at) VALUES (?, ?, ?) ON CONFLICT (device_id, user_id) DO NOTHING")
             .bind(&id)
             .bind(user_id)
             .bind(now)
             .execute(&mut *tx)
             .await
-            .map_err(db)?;
+            .map_err(db)?
+            .rows_affected()
+            > 0;
         tx.commit().await.map_err(db)?;
         let device = self
             .device(&id)
             .await?
             .ok_or_else(|| Error::Internal("device vanished".into()))?;
-        Ok((device, created))
+        let enrollment = match (created, bound) {
+            (true, _) => Enrollment::Created,
+            (false, true) => Enrollment::BoundUser,
+            (false, false) => Enrollment::Again,
+        };
+        Ok((device, enrollment))
     }
 
     /// Applies an admin's change to a device, atomically and only from a
@@ -1406,5 +1437,50 @@ impl FromStr for DeviceStatus {
             "pending" | "approved" | "disabled" | "revoked" => Ok(DeviceStatus::parse(s)),
             other => Err(Error::BadRequest(format!("unknown device status {other}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pruning_never_leaves_a_gap() {
+        let dir = std::env::temp_dir().join(format!(
+            "warren-store-{}",
+            warren_core::keys::hex(&warren_core::keys::random_bytes::<6>().unwrap())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("warren.db")).await.unwrap();
+        for i in 0..4 {
+            store
+                .emit(EventBody::UserDisabled {
+                    user_id: format!("u-{i}"),
+                })
+                .await
+                .unwrap();
+        }
+        // The clock stepped back between commits: event 2 looks newer than
+        // event 3.
+        for (seq, at) in [(1, 1_000), (2, 9_000), (3, 2_000), (4, 9_500)] {
+            sqlx::query("UPDATE events SET committed_at_ms = ? WHERE seq = ?")
+                .bind(at)
+                .bind(seq)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        store.prune_events(5_000).await.unwrap();
+        let left: Vec<u64> = store
+            .events_after(0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(left, [4]);
+        assert_eq!(store.event_bounds().await.unwrap(), (4, 4));
+        store.close().await;
+        std::fs::remove_dir_all(dir).ok();
     }
 }

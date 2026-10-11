@@ -39,12 +39,14 @@ struct Metadata {
 pub struct SignIn {
     /// The IdP's subject identifier.
     pub subject: String,
-    /// The email, if the IdP asserted one it did not mark unverified.
+    /// The email, if the IdP asserted one and marked it verified.
     pub email: String,
     /// Groups from the configured claim.
     pub groups: Vec<String>,
-    /// When the user authenticated, Unix seconds.
-    pub auth_time: i64,
+    /// When the user authenticated, Unix seconds, if the IdP said. It is
+    /// never inferred from when the token was issued: a silent single
+    /// sign-on issues a new token without authenticating anyone.
+    pub auth_time: Option<i64>,
     /// Whether the authentication used multi-factor authentication.
     pub mfa: bool,
 }
@@ -132,16 +134,23 @@ impl Provider {
         Ok(m)
     }
 
-    /// The URL that starts sign-in at the IdP.
+    /// The URL that starts sign-in at the IdP. `max_age` asks the IdP to
+    /// authenticate the user again if they last did longer ago than that
+    /// many seconds, and `login` to authenticate them again regardless
+    /// (OpenID Connect Core section 3.1.2.1); either way the ID token must
+    /// then carry `auth_time`.
     pub async fn authorize_url(
         &self,
         redirect_uri: &str,
         state: &str,
         nonce: &str,
         challenge: &str,
+        max_age: Option<i64>,
+        login: bool,
     ) -> Result<String, Error> {
         let m = self.metadata().await?;
-        let query = form_urlencoded::Serializer::new(String::new())
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.config.client_id)
             .append_pair("redirect_uri", redirect_uri)
@@ -149,8 +158,14 @@ impl Provider {
             .append_pair("state", state)
             .append_pair("nonce", nonce)
             .append_pair("code_challenge", challenge)
-            .append_pair("code_challenge_method", "S256")
-            .finish();
+            .append_pair("code_challenge_method", "S256");
+        if let Some(max_age) = max_age {
+            query.append_pair("max_age", &max_age.to_string());
+        }
+        if login {
+            query.append_pair("prompt", "login");
+        }
+        let query = query.finish();
         let sep = if m.authorization_endpoint.contains('?') {
             '&'
         } else {
@@ -333,15 +348,17 @@ impl Provider {
         let subject = str_claim("sub")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| bad("no subject"))?;
-        let auth_time = int_claim("auth_time").unwrap_or(iat);
-        if auth_time > now + self.skew {
+        let auth_time = int_claim("auth_time");
+        if auth_time.is_some_and(|t| t > now + self.skew) {
             return Err(bad("authentication time in the future"));
         }
+        // An email the IdP did not mark verified may be one the user typed
+        // in themselves, so it never identifies anyone.
         let email = match (
             str_claim("email"),
             claims.get("email_verified").and_then(Value::as_bool),
         ) {
-            (Some(e), Some(true) | None) => e.to_ascii_lowercase(),
+            (Some(e), Some(true)) => e.to_ascii_lowercase(),
             _ => String::new(),
         };
         let groups = match claims.get(&self.config.groups_claim) {
@@ -469,7 +486,9 @@ mod tests {
             "exp": 2_000,
             "iat": 1_000,
             "nonce": "n",
+            "auth_time": 990,
             "email": "Ada@Example.com",
+            "email_verified": true,
             "groups": ["engineering"],
             "amr": ["pwd", "mfa"],
         })
@@ -481,8 +500,52 @@ mod tests {
         assert_eq!(s.subject, "00u1");
         assert_eq!(s.email, "ada@example.com");
         assert_eq!(s.groups, ["engineering"]);
-        assert_eq!(s.auth_time, 1_000);
+        assert_eq!(s.auth_time, Some(990));
         assert!(s.mfa);
+    }
+
+    #[test]
+    fn a_missing_auth_time_is_unknown_not_the_issue_time() {
+        let p = provider();
+        let mut c = claims();
+        c.as_object_mut().unwrap().remove("auth_time");
+        assert_eq!(p.check_claims(&c, "n", 1_500).unwrap().auth_time, None);
+        c["auth_time"] = json!(1_500 + 121);
+        assert!(p.check_claims(&c, "n", 1_500).is_err());
+    }
+
+    #[tokio::test]
+    async fn freshness_is_requested_from_the_idp() {
+        let p = provider();
+        *p.metadata.lock().await = Some(Arc::new(Metadata {
+            issuer: "https://idp.example.com".into(),
+            authorization_endpoint: "https://idp.example.com/authorize".into(),
+            token_endpoint: "https://idp.example.com/token".into(),
+            jwks_uri: "https://idp.example.com/jwks".into(),
+        }));
+        let params = |url: String| -> Vec<(String, String)> {
+            let (_, query) = url.split_once('?').unwrap();
+            form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect()
+        };
+        let get = |params: &[(String, String)], k: &str| {
+            params.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        };
+        let plain = params(
+            p.authorize_url("https://cp/cb", "s", "n", "c", None, false)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(get(&plain, "max_age"), None);
+        assert_eq!(get(&plain, "prompt"), None);
+        let fresh = params(
+            p.authorize_url("https://cp/cb", "s", "n", "c", Some(3600), true)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(get(&fresh, "max_age").as_deref(), Some("3600"));
+        assert_eq!(get(&fresh, "prompt").as_deref(), Some("login"));
     }
 
     #[test]
@@ -523,6 +586,17 @@ mod tests {
         c["amr"] = json!(["pwd"]);
         let s = p.check_claims(&c, "n", 1_500).unwrap();
         assert_eq!(s.email, "");
+        // An IdP that lets users set their own email and never says whether
+        // it is verified: the email identifies nobody.
+        let mut c = claims();
+        c.as_object_mut().unwrap().remove("email_verified");
+        c["email"] = json!("ceo@example.com");
+        assert_eq!(p.check_claims(&c, "n", 1_500).unwrap().email, "");
+        c["email_verified"] = json!("true");
+        assert_eq!(p.check_claims(&c, "n", 1_500).unwrap().email, "");
+        let mut c = claims();
+        c["amr"] = json!(["pwd"]);
+        let s = p.check_claims(&c, "n", 1_500).unwrap();
         assert!(!s.mfa);
         c["acr"] = json!("urn:example:mfa");
         assert!(p.check_claims(&c, "n", 1_500).unwrap().mfa);

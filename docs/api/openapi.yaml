@@ -59,8 +59,9 @@ paths:
         - { name: code_challenge, in: query, required: true, schema: { type: string } }
         - { name: code_challenge_method, in: query, required: true, schema: { type: string, enum: [S256] } }
         - { name: state, in: query, required: true, schema: { type: string, maxLength: 512 } }
+        - { name: prompt, in: query, required: false, schema: { type: string, enum: [login] }, description: "login when the user asked to sign in again: the identity provider must authenticate them afresh." }
       responses:
-        "302": { description: Redirect to the identity provider. }
+        "302": { description: "Redirect to the identity provider, with max_age set to the shortest auth.maxAge in policy, and prompt=login if the client sent it." }
         "400": { description: An HTML page explaining why sign-in could not start; never a redirect. }
         "502": { description: The identity provider is unreachable. }
   /v1/auth/callback:
@@ -376,7 +377,7 @@ paths:
                 role: { type: string, enum: [relay, connector] }
                 group: { type: string, description: The connector group, for connectors. }
       responses:
-        "201": { description: "The token, wj1.<secret>.<root CA fingerprint>, valid once for JOIN_TOKEN_LIFETIME." }
+        "201": { description: "The token, wj1.<secret>.<root CA fingerprint>, valid once for JOIN_TOKEN_LIFETIME, and control_plane, the URL the node joins at: publicUrl, or with an operator certificate on its host, the same URL under an internal name from dnsNames." }
   /v1/admin/nodes:
     get:
       tags: [admin]
@@ -466,7 +467,7 @@ components:
             id: { type: string }
             email: { type: string }
             groups: { type: array, items: { type: string } }
-        auth_time: { type: integer }
+        auth_time: { type: integer, description: "When the user authenticated at the identity provider, Unix seconds; 0 when it did not say." }
         mfa: { type: boolean }
     EnrollRequest:
       type: object

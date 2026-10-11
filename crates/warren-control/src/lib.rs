@@ -22,20 +22,20 @@ pub mod web;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use warren_core::clock;
 use warren_core::identity::{Principal, Role};
-use warren_core::keys::SigningKey;
+use warren_core::keys::{SigningKey, sha256};
 use warren_core::params::INFRA_CERT_LIFETIME;
 
 use crate::app::App;
 use crate::audit::Actor;
 use crate::authority::{Authority, Kek};
-use crate::config::Config;
+use crate::config::{Config, TlsFiles};
 use crate::store::Store;
 use crate::web::ServerCert;
 
@@ -89,12 +89,61 @@ pub struct ControlPlane {
     pub admin_socket: PathBuf,
     admin_socket_id: Option<(u64, u64)>,
     app: Arc<App>,
+    certificates: Arc<Certificates>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 /// How long revocation events are kept for nodes to resume from.
 const EVENT_RETENTION: Duration = Duration::from_secs(7 * 86_400);
+
+/// How often the operator's certificate files are checked for changes.
+const CERT_FILE_POLL: Duration = Duration::from_secs(30);
+
+/// The listener's certificates, and the operator's files behind the one for
+/// the public host.
+struct Certificates {
+    server: Arc<ServerCert>,
+    operator: Option<TlsFiles>,
+    /// A digest of the operator's files as last read.
+    seen: Mutex<[u8; 32]>,
+}
+
+impl Certificates {
+    /// Reads the operator's files and, if they changed since they were last
+    /// read, presents the certificate they hold. Returns whether it did; a
+    /// change that does not load leaves the current certificate in place.
+    fn reload(&self) -> Result<bool, Error> {
+        let Some(files) = &self.operator else {
+            return Ok(false);
+        };
+        let read = |path: &Path| {
+            std::fs::read_to_string(path)
+                .map(zeroize::Zeroizing::new)
+                .map_err(|e| Error::Tls(format!("{}: {e}", path.display())))
+        };
+        let (cert, key) = (read(&files.cert_file)?, read(&files.key_file)?);
+        let digest = sha256(&[sha256(cert.as_bytes()), sha256(key.as_bytes())].concat());
+        {
+            let mut seen = self
+                .seen
+                .lock()
+                .map_err(|_| Error::Internal("certificate state poisoned".into()))?;
+            if *seen == digest {
+                return Ok(false);
+            }
+            *seen = digest;
+        }
+        self.server.set_operator(&cert, &key).map_err(|e| {
+            Error::Tls(format!(
+                "{} and {}: {e}",
+                files.cert_file.display(),
+                files.key_file.display()
+            ))
+        })?;
+        Ok(true)
+    }
+}
 
 fn issue_own_cert(
     app_authority: &Authority,
@@ -172,9 +221,29 @@ impl ControlPlane {
         app.publish().await?;
 
         let (chain, pkcs8) = issue_own_cert(&app.authority, config, &app.id)?;
-        let server_cert = Arc::new(ServerCert::new(chain, &pkcs8)?);
+        let internal_names = config
+            .dns_names
+            .iter()
+            .filter(|n| **n != config.public_host)
+            .cloned()
+            .collect();
+        let certificates = Arc::new(Certificates {
+            server: Arc::new(ServerCert::new(chain, &pkcs8, internal_names)?),
+            operator: config.tls.clone(),
+            seen: Mutex::new([0; 32]),
+        });
+        if config.tls.is_some() {
+            certificates
+                .reload()
+                .map_err(|e| Error::Config(e.to_string()))?;
+        } else {
+            log::warn(
+                "tls",
+                "no tls.certFile and tls.keyFile are configured, so the HTTPS listener presents a certificate from the deployment's private CA; browsers will not trust it, and browser sign-in will show a certificate error until they are set",
+            );
+        }
         let tls = web::server_config(
-            server_cert.clone(),
+            certificates.server.clone(),
             &[
                 app.authority.client.der.clone(),
                 app.authority.infra.der.clone(),
@@ -207,23 +276,30 @@ impl ControlPlane {
         }
 
         tasks.push(tokio::spawn(app.clone().publisher()));
-        // Renew the control plane's own certificate at half-life, and prune
-        // the event log.
+        // Renew the control plane's own certificate at half-life, reload the
+        // operator's when its files change, and prune the event log.
         let maintenance = app.clone();
+        let certs = certificates.clone();
         tasks.push(tokio::spawn(async move {
             let half = INFRA_CERT_LIFETIME / 2;
             let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
+            let mut poll = tokio::time::interval_at(
+                tokio::time::Instant::now() + CERT_FILE_POLL,
+                CERT_FILE_POLL,
+            );
             let mut prune = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 tokio::select! {
                     _ = renew.tick() => {
+                        maintenance.authority.warn_if_expiring();
                         match issue_own_cert(&maintenance.authority, &maintenance.config, &maintenance.id)
-                            .and_then(|(chain, key)| server_cert.replace(chain, &key))
+                            .and_then(|(chain, key)| certs.server.replace(chain, &key))
                         {
                             Ok(()) => log::info("tls", "renewed the control plane's certificate"),
                             Err(e) => log::error("tls", &format!("cannot renew the control plane's certificate: {e}")),
                         }
                     }
+                    _ = poll.tick() => log_reload(certs.reload()),
                     _ = prune.tick() => {
                         let before = clock::now_millis() - EVENT_RETENTION.as_millis() as i64;
                         if let Err(e) = maintenance.store.prune_events(before).await {
@@ -253,6 +329,7 @@ impl ControlPlane {
             admin_socket_id: None,
             admin_socket,
             app,
+            certificates,
             shutdown,
             tasks,
         })
@@ -261,6 +338,14 @@ impl ControlPlane {
     /// The shared state.
     pub fn app(&self) -> &Arc<App> {
         &self.app
+    }
+
+    /// Rereads the operator's certificate files (`tls.certFile` and
+    /// `tls.keyFile`) now, as the control plane does every 30 seconds and on
+    /// SIGHUP. Returns whether a new certificate is being presented; files
+    /// that do not load leave the current one in place.
+    pub fn reload_certificate(&self) -> Result<bool, Error> {
+        self.certificates.reload()
     }
 
     /// Stops listening and closes the database.
@@ -278,6 +363,17 @@ impl ControlPlane {
             let _ = std::fs::remove_file(&self.admin_socket);
         }
         self.app.store.close().await;
+    }
+}
+
+fn log_reload(result: Result<bool, Error>) {
+    match result {
+        Ok(true) => log::info("tls", "presenting the new certificate from tls.certFile"),
+        Ok(false) => {}
+        Err(e) => log::error(
+            "tls",
+            &format!("cannot load the new certificate; the previous one stays in use: {e}"),
+        ),
     }
 }
 
@@ -354,7 +450,7 @@ fn bind_admin_socket(path: &Path) -> Result<tokio::net::UnixListener, Error> {
 }
 
 /// Runs the control plane with the configuration at `config_path` until
-/// SIGINT or SIGTERM. SIGHUP reloads policy.
+/// SIGINT or SIGTERM. SIGHUP reloads policy and the operator's certificate.
 pub fn run(config_path: &Path) -> Result<(), Error> {
     let mut config = Config::load(config_path)?;
     if let Some(dir) = config_path.parent() {
@@ -366,7 +462,7 @@ pub fn run(config_path: &Path) -> Result<(), Error> {
         .map_err(|e| Error::Internal(e.to_string()))?;
     runtime.block_on(async move {
         let cp = ControlPlane::start(config).await?;
-        wait_for_signals(cp.app()).await;
+        wait_for_signals(&cp).await;
         log::info("control-plane", "shutting down");
         cp.shutdown().await;
         Ok(())
@@ -374,7 +470,7 @@ pub fn run(config_path: &Path) -> Result<(), Error> {
 }
 
 #[cfg(unix)]
-async fn wait_for_signals(app: &Arc<App>) {
+async fn wait_for_signals(cp: &ControlPlane) {
     use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
         signal(SignalKind::terminate()),
@@ -389,7 +485,8 @@ async fn wait_for_signals(app: &Arc<App>) {
             _ = term.recv() => return,
             _ = int.recv() => return,
             _ = hup.recv() => {
-                match app.load_policy(&Actor::System).await {
+                log_reload(cp.reload_certificate());
+                match cp.app.load_policy(&Actor::System).await {
                     Ok(_) => log::info("policy", "policy reloaded"),
                     Err(errors) => log::error("policy", &format!("policy rejected; the previous policy stays in force: {}", errors.join("; "))),
                 }
@@ -399,7 +496,7 @@ async fn wait_for_signals(app: &Arc<App>) {
 }
 
 #[cfg(not(unix))]
-async fn wait_for_signals(_app: &Arc<App>) {
+async fn wait_for_signals(_cp: &ControlPlane) {
     let _ = tokio::signal::ctrl_c().await;
 }
 

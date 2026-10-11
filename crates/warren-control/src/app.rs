@@ -2,7 +2,7 @@
 //! loading policy, publishing bundles, announcing events, and recognizing
 //! sessions and nodes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use http::StatusCode;
@@ -119,21 +119,7 @@ impl App {
     /// the errors are returned.
     pub async fn load_policy(&self, actor: &Actor) -> Result<PolicyStatus, Vec<String>> {
         let now = clock::now_secs();
-        let mut reserved = self.config.reserved();
-        if let Ok(nodes) = self.store.nodes().await {
-            for n in nodes
-                .iter()
-                .filter(|n| n.role == "relay" && n.revoked_at.is_none())
-            {
-                reserved.extend(n.dns_names.iter().cloned());
-            }
-        }
-        let result = match model::load_dir(&self.config.policy_dir) {
-            Ok((objects, diags)) => compile::compile(objects, diags, &reserved)
-                .map_err(|d| d.iter().map(|d| d.to_string()).collect::<Vec<_>>()),
-            Err(e) => Err(vec![format!("{}: {e}", self.config.policy_dir.display())]),
-        };
-        match result {
+        match self.compile_policy().await {
             Ok(compiled) => {
                 let digest = compiled.policy.digest.clone();
                 let rules = compiled.policy.rules.len();
@@ -173,6 +159,43 @@ impl App {
                 Err(errors)
             }
         }
+    }
+
+    /// Compiles the policy directory with the relays' names reserved, and
+    /// flags groups no known user has at the IdP. Refuses to compile when
+    /// the store cannot say which names are taken.
+    async fn compile_policy(&self) -> Result<Compiled, Vec<String>> {
+        let unreadable = |e: Error| {
+            vec![format!(
+                "cannot read the relays and users policy is checked against: {e}"
+            )]
+        };
+        let mut reserved = self.config.reserved();
+        for n in self
+            .store
+            .nodes()
+            .await
+            .map_err(unreadable)?
+            .iter()
+            .filter(|n| n.role == "relay" && n.revoked_at.is_none())
+        {
+            reserved.extend(n.dns_names.iter().cloned());
+        }
+        let known_groups: BTreeSet<String> = self
+            .store
+            .users()
+            .await
+            .map_err(unreadable)?
+            .into_iter()
+            .flat_map(|u| u.groups)
+            .collect();
+        let (objects, diags) = model::load_dir(&self.config.policy_dir)
+            .map_err(|e| vec![format!("{}: {e}", self.config.policy_dir.display())])?;
+        let mut compiled = compile::compile(objects, diags, &reserved)
+            .map_err(|d| d.iter().map(|d| d.to_string()).collect::<Vec<_>>())?;
+        let unknown = compile::unknown_groups(&compiled.objects, &known_groups);
+        compiled.warnings.extend(unknown);
+        Ok(compiled)
     }
 
     /// Announces committed events to every event stream.
@@ -315,44 +338,87 @@ impl App {
     /// user. Revoked, expired and disabled ones are refused with a reason
     /// the client can show.
     pub async fn session<B>(&self, req: &http::Request<B>) -> Result<(Session, User), ApiError> {
+        self.check_session(req).await.map_err(|(e, _)| e)
+    }
+
+    /// Like [`App::session`], for requests that yield a credential: a
+    /// refusal is audited as `activity` on an `entity` failing, naming the
+    /// session's user when the token is known.
+    pub async fn credential_session<B>(
+        &self,
+        req: &http::Request<B>,
+        activity: Activity,
+        entity: &str,
+    ) -> Result<(Session, User), ApiError> {
+        self.check_session(req).await.map_err(|(e, user_id)| {
+            let actor = match user_id {
+                Some(id) => Actor::User {
+                    id,
+                    email: String::new(),
+                },
+                None => Actor::Anonymous,
+            };
+            let mut r = audit::record(
+                activity,
+                false,
+                &actor,
+                &format!("{entity} refused: {}", e.reason),
+            );
+            r.insert("entity".into(), audit::entity(entity, ""));
+            self.audit(r);
+            e
+        })
+    }
+
+    /// The session and user, or the refusal with the user it concerns
+    /// when the token named a session.
+    async fn check_session<B>(
+        &self,
+        req: &http::Request<B>,
+    ) -> Result<(Session, User), (ApiError, Option<String>)> {
         let token = req
             .headers()
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| ApiError::unauthenticated("Sign in to warren first."))?;
+            .ok_or_else(|| (ApiError::unauthenticated("Sign in to warren first."), None))?;
         let session = self
             .store
             .session_by_token(&secret_hash(token))
-            .await?
+            .await
+            .map_err(|e| (e.into(), None))?
             .ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::UNAUTHORIZED,
-                    "reauth_required",
-                    "Your sign-in is not valid. Sign in again.",
+                (
+                    ApiError::new(
+                        StatusCode::UNAUTHORIZED,
+                        "reauth_required",
+                        "Your sign-in is not valid. Sign in again.",
+                    ),
+                    None,
                 )
             })?;
+        let refuse = |e: ApiError| Err((e, Some(session.user_id.clone())));
         if session.revoked_at.is_some() {
-            return Err(ApiError::new(
+            return refuse(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "revoked",
                 "Your sign-in was revoked by an administrator. Sign in again.",
             ));
         }
         if session.expires_at <= clock::now_secs() {
-            return Err(ApiError::new(
+            return refuse(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "reauth_required",
                 "Your sign-in has ended. Sign in again.",
             ));
         }
-        let user = self
-            .store
-            .user(&session.user_id)
-            .await?
-            .ok_or_else(ApiError::internal)?;
+        let user = match self.store.user(&session.user_id).await {
+            Ok(Some(user)) => user,
+            Ok(None) => return refuse(ApiError::internal()),
+            Err(e) => return refuse(e.into()),
+        };
         if user.disabled {
-            return Err(ApiError::new(
+            return refuse(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "user_disabled",
                 "Your warren account is disabled. Contact your administrator.",
@@ -363,8 +429,37 @@ impl App {
 
     /// The relay or connector presenting the TLS client certificate in
     /// `peer`: issued by the infrastructure CA, naming a node of this
-    /// deployment that is still enabled, and not itself revoked.
+    /// deployment that is still enabled, and not itself revoked. Refusals
+    /// are audited with the identity the certificate claimed.
     pub async fn node(&self, peer: &Peer) -> Result<(Node, Certificate), ApiError> {
+        let result = self.check_node(peer).await;
+        if let Err(e) = &result {
+            let claimed = peer
+                .certificates
+                .first()
+                .and_then(|der| Certificate::parse(der).ok())
+                .map(|c| (c.serial_hex(), c.uris));
+            let mut r = audit::record(
+                Activity::Logon,
+                false,
+                &Actor::Anonymous,
+                &format!("relay or connector refused: {}", e.detail),
+            );
+            r.insert("auth_protocol".into(), "mTLS".into());
+            r.insert(
+                "unmapped".into(),
+                json!({
+                    "source": peer.addr.map(|a| a.to_string()),
+                    "certificate_uris": claimed.as_ref().map(|c| &c.1),
+                    "certificate_serial": claimed.as_ref().map(|c| &c.0),
+                }),
+            );
+            self.audit(r);
+        }
+        result
+    }
+
+    async fn check_node(&self, peer: &Peer) -> Result<(Node, Certificate), ApiError> {
         let denied =
             |why: &str| ApiError::new(StatusCode::FORBIDDEN, "node_not_allowed", why.to_owned());
         let leaf = peer.certificates.first().ok_or_else(|| {

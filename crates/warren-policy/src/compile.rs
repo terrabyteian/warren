@@ -195,15 +195,6 @@ fn check(objects: &Objects, reserved: &[String], diags: &mut Vec<Diagnostic>) {
     for (src, when) in schedules {
         let Some(s) = &when.schedule else { continue };
         let field = timezone_field(&s.timezone);
-        if !valid_field(&field) {
-            error(
-                diags,
-                src,
-                when.line,
-                format!("time zone {:?} cannot be used in a schedule", s.timezone),
-            );
-            continue;
-        }
         match fields.get(&field) {
             Some((tz, first, line)) if *tz != s.timezone => error(
                 diags,
@@ -415,35 +406,49 @@ fn check(objects: &Objects, reserved: &[String], diags: &mut Vec<Diagnostic>) {
         .iter()
         .map(|p| p.meta.name.as_str())
         .collect();
-    let check_refs =
-        |what: &crate::model::What, when: &When, src: &Source, diags: &mut Vec<Diagnostic>| {
-            for app in &what.apps {
-                if !app_names.contains(app.as_str()) {
-                    error(diags, src, what.line, format!("app {app} is not defined"));
-                }
+    let check_refs = |what: &crate::model::What,
+                      when: &When,
+                      deny: bool,
+                      src: &Source,
+                      diags: &mut Vec<Diagnostic>| {
+        for app in &what.apps {
+            if !app_names.contains(app.as_str()) {
+                error(diags, src, what.line, format!("app {app} is not defined"));
             }
-            if !what.match_labels.is_empty()
-                && !objects
-                    .apps
-                    .iter()
-                    .any(|a| labels_match(&what.match_labels, &a.meta.labels))
-            {
+        }
+        if !what.match_labels.is_empty()
+            && !objects
+                .apps
+                .iter()
+                .any(|a| labels_match(&what.match_labels, &a.meta.labels))
+        {
+            if deny {
+                // A misspelt label would quietly switch the deny off.
+                error(diags, src, what.line, "appSelector selects no app".into());
+            } else {
                 warning(diags, src, what.line, "appSelector selects no app".into());
             }
-            for profile in &when.posture {
-                if !profile_names.contains(profile.as_str()) {
-                    error(
-                        diags,
-                        src,
-                        when.line,
-                        format!("posture profile {profile} is not defined"),
-                    );
-                }
+        }
+        for profile in &when.posture {
+            if !profile_names.contains(profile.as_str()) {
+                error(
+                    diags,
+                    src,
+                    when.line,
+                    format!("posture profile {profile} is not defined"),
+                );
             }
-        };
+        }
+    };
     for policy in &objects.policies {
         for rule in &policy.rules {
-            check_refs(&rule.what, &rule.when, &policy.meta.source, diags);
+            check_refs(
+                &rule.what,
+                &rule.when,
+                rule.deny,
+                &policy.meta.source,
+                diags,
+            );
             let via = rule_via(rule);
             if !rule.when.posture.is_empty() && via.contains(&Via::Browser) {
                 let message = if via.contains(&Via::Client) {
@@ -458,11 +463,48 @@ fn check(objects: &Objects, reserved: &[String], diags: &mut Vec<Diagnostic>) {
         }
     }
     for policy in &objects.request_policies {
-        check_refs(&policy.what, &policy.when, &policy.meta.source, diags);
+        check_refs(
+            &policy.what,
+            &policy.when,
+            false,
+            &policy.meta.source,
+            diags,
+        );
         if let Some(auto) = &policy.automatic {
-            check_refs(&policy.what, auto, &policy.meta.source, diags);
+            check_refs(&policy.what, auto, false, &policy.meta.source, diags);
         }
     }
+}
+
+/// Warnings for groups that policy names but the IdP has not asserted for
+/// any user in `known`, which is how a misspelt group shows up. The IdP
+/// owns group names and a correctly named group may have no members yet,
+/// so these are warnings rather than errors.
+pub fn unknown_groups(objects: &Objects, known: &BTreeSet<String>) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let mut check = |who: &Who, deny: bool, source: &Source, line: usize| {
+        for group in who.groups.iter().filter(|g| !known.contains(*g)) {
+            let message = if deny {
+                format!(
+                    "no user has group {group} at the IdP yet, so this deny rule blocks nobody; check its spelling"
+                )
+            } else {
+                format!("no user has group {group} at the IdP yet; check its spelling")
+            };
+            warning(&mut diags, source, line, message);
+        }
+    };
+    for policy in &objects.policies {
+        for rule in &policy.rules {
+            check(&rule.who, rule.deny, &policy.meta.source, rule.line);
+        }
+    }
+    for policy in &objects.request_policies {
+        let source = &policy.meta.source;
+        check(&policy.who, false, source, source.line);
+        check(&policy.approvers, false, source, source.line);
+    }
+    diags
 }
 
 fn labels_match(selector: &BTreeMap<String, String>, labels: &BTreeMap<String, String>) -> bool {
@@ -547,12 +589,6 @@ pub fn timezone_field(timezone: &str) -> String {
     field
 }
 
-/// Whether a field name is a Cedar identifier warren can use.
-fn valid_field(field: &str) -> bool {
-    field.starts_with(|c: char| c.is_ascii_alphabetic())
-        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 struct CompiledPolicy {
     text: String,
     info: RuleInfo,
@@ -586,33 +622,35 @@ fn condition(
     }
 }
 
-fn who_scope(who: &Who, principal_var: &str) -> (String, Option<Condition>) {
+/// `who` as an expression over the user `var`.
+fn who_expression(who: &Who, var: &str) -> String {
+    let mut terms: Vec<String> = who
+        .groups
+        .iter()
+        .map(|g| format!("{var} in {}", uid("Group", g)))
+        .collect();
+    terms.extend(who.users.iter().map(|u| {
+        if u.contains('@') {
+            format!("{var}.email == {}", cedar_str(&u.to_ascii_lowercase()))
+        } else {
+            format!("{var}.subject == {}", cedar_str(u))
+        }
+    }));
+    paren_or(terms)
+}
+
+fn who_scope(who: &Who) -> (String, Option<Condition>) {
     if who.users.is_empty() && who.groups.len() == 1 {
         return (
             format!("principal in {}", uid("Group", &who.groups[0])),
             None,
         );
     }
-    let mut terms: Vec<String> = who
-        .groups
-        .iter()
-        .map(|g| format!("{principal_var} in {}", uid("Group", g)))
-        .collect();
-    terms.extend(who.users.iter().map(|u| {
-        if u.contains('@') {
-            format!(
-                "{principal_var}.email == {}",
-                cedar_str(&u.to_ascii_lowercase())
-            )
-        } else {
-            format!("{principal_var}.subject == {}", cedar_str(u))
-        }
-    }));
     (
         "principal is Warren::User".into(),
         Some(condition(
             "who",
-            paren_or(terms),
+            who_expression(who, "principal"),
             "no_rule",
             "No policy allows you to reach {app}.",
         )),
@@ -665,8 +703,8 @@ fn paren_or(terms: Vec<String>) -> String {
     }
 }
 
-fn scope(who: &Who, what: &crate::model::What, principal_var: &str) -> Scope {
-    let (principal, who_cond) = who_scope(who, principal_var);
+fn scope(who: &Who, what: &crate::model::What) -> Scope {
+    let (principal, who_cond) = who_scope(who);
     let (resource, what_cond) = what_scope(what);
     Scope {
         principal,
@@ -675,13 +713,13 @@ fn scope(who: &Who, what: &crate::model::What, principal_var: &str) -> Scope {
     }
 }
 
-fn posture_conditions(check: &Check, prefix: &str) -> Condition {
+/// A posture check. With `absent_matches` (deny rules) a missing device or
+/// signal satisfies the check, so a deny never lapses for want of data.
+fn posture_conditions(check: &Check, prefix: &str, absent_matches: bool) -> Condition {
     let signals = format!("{prefix}.device.signals");
     let name = check.signal.name();
-    let mut terms = vec![
-        format!("{prefix} has device"),
-        format!("{signals} has {name}"),
-    ];
+    let present = format!("{prefix} has device && {signals} has {name}");
+    let mut terms = Vec::new();
     let field = format!("{signals}.{name}");
     let (problem, fix) = match &check.signal {
         Signal::DiskEncryption => {
@@ -740,9 +778,14 @@ fn posture_conditions(check: &Check, prefix: &str) -> Condition {
         terms.push(format!("{field}.trust >= {}", check.min_trust));
     }
     let fix = check.remediation.clone().unwrap_or(fix);
+    let expression = if absent_matches {
+        format!("(if {present} then {} else true)", terms.join(" && "))
+    } else {
+        format!("{present} && {}", terms.join(" && "))
+    };
     condition(
         "posture",
-        terms.join(" && "),
+        expression,
         "posture_failed",
         format!("{problem} {fix}"),
     )
@@ -758,11 +801,14 @@ fn format_age(secs: i64) -> String {
     }
 }
 
-/// The `when` conditions, in the order the explainer reports them.
+/// The `when` conditions, in the order the explainer reports them. Deny
+/// rules pass `absent_matches`, so context the request lacks (a device, a
+/// signal, a source address) never lets it escape the deny.
 fn when_conditions(
     when: &When,
     via: Option<&[Via]>,
     prefix: &str,
+    absent_matches: bool,
     objects: &Objects,
     timezones: &mut BTreeMap<String, String>,
 ) -> Vec<Condition> {
@@ -783,7 +829,12 @@ fn when_conditions(
     }
     for name in &when.posture {
         if let Some(profile) = objects.profiles.iter().find(|p| &p.meta.name == name) {
-            out.extend(profile.checks.iter().map(|c| posture_conditions(c, prefix)));
+            out.extend(
+                profile
+                    .checks
+                    .iter()
+                    .map(|c| posture_conditions(c, prefix, absent_matches)),
+            );
         }
     }
     if let Some(max_age) = when.auth.max_age {
@@ -836,9 +887,14 @@ fn when_conditions(
                 )
             })
             .collect();
+        let ranges = paren_or(terms);
         out.push(condition(
             "network",
-            format!("{prefix} has network && {}", paren_or(terms)),
+            if absent_matches {
+                format!("(if {prefix} has network then {ranges} else true)")
+            } else {
+                format!("{prefix} has network && {ranges}")
+            },
             "network_not_allowed",
             "{app} isn't available from this network.",
         ));
@@ -891,7 +947,7 @@ fn render(out: &mut Output, source: &Source, d: Draft) {
 fn generate(objects: &Objects, out: &mut Output) {
     for policy in &objects.policies {
         for rule in &policy.rules {
-            let s = scope(&rule.who, &rule.what, "principal");
+            let s = scope(&rule.who, &rule.what);
             let via = rule_via(rule);
             let mut conditions = s.conditions;
             let via_filter = if via.len() == 2 {
@@ -903,6 +959,7 @@ fn generate(objects: &Objects, out: &mut Output) {
                 &rule.when,
                 via_filter,
                 "context",
+                rule.deny,
                 objects,
                 &mut out.timezones,
             ));
@@ -932,12 +989,13 @@ fn generate_request_policy(policy: &AccessRequestPolicy, objects: &Objects, out:
     let client = [Via::Client];
 
     // Requesting.
-    let s = scope(&policy.who, &policy.what, "principal");
+    let s = scope(&policy.who, &policy.what);
     let mut conditions = s.conditions;
     conditions.extend(when_conditions(
         &policy.when,
         Some(&client),
         "context",
+        false,
         objects,
         &mut out.timezones,
     ));
@@ -955,9 +1013,11 @@ fn generate_request_policy(policy: &AccessRequestPolicy, objects: &Objects, out:
         },
     );
 
-    // Approving: never your own request.
-    let s = scope(&policy.approvers, &policy.what, "principal");
+    // Approving: only requests this policy lets the requester make, and
+    // never your own.
+    let s = scope(&policy.approvers, &policy.what);
     let mut conditions = s.conditions;
+    conditions.push(requester_condition(policy));
     conditions.push(condition(
         "not-requester",
         "context.requester != principal".into(),
@@ -979,11 +1039,14 @@ fn generate_request_policy(policy: &AccessRequestPolicy, objects: &Objects, out:
     );
 
     // Connecting under a grant.
-    let s = scope(&policy.who, &policy.what, "principal");
+    let s = scope(&policy.who, &policy.what);
     let mut conditions = s.conditions;
     conditions.push(condition(
         "grant",
-        "context.grants.contains(resource)".into(),
+        format!(
+            "context.grants.contains({{ app: resource, policy: {} }})",
+            cedar_str(name)
+        ),
         "request_access",
         "You don't have access to {app}. Request access.",
     ));
@@ -991,6 +1054,7 @@ fn generate_request_policy(policy: &AccessRequestPolicy, objects: &Objects, out:
         &policy.when,
         Some(&client),
         "context",
+        false,
         objects,
         &mut out.timezones,
     ));
@@ -1012,10 +1076,12 @@ fn generate_request_policy(policy: &AccessRequestPolicy, objects: &Objects, out:
     if let Some(auto) = &policy.automatic {
         let (resource, what_cond) = what_scope(&policy.what);
         let mut conditions: Vec<Condition> = what_cond.into_iter().collect();
+        conditions.push(requester_condition(policy));
         conditions.extend(when_conditions(
             auto,
             None,
             "context.request",
+            false,
             objects,
             &mut out.timezones,
         ));
@@ -1033,6 +1099,16 @@ fn generate_request_policy(policy: &AccessRequestPolicy, objects: &Objects, out:
             },
         );
     }
+}
+
+/// An approval's requester must be someone the policy lets request.
+fn requester_condition(policy: &AccessRequestPolicy) -> Condition {
+    condition(
+        "requester",
+        who_expression(&policy.who, "context.requester"),
+        "no_rule",
+        "The requester cannot request {app} under this policy.",
+    )
 }
 
 /// The Cedar schema for a policy set that uses schedules in `timezones`
@@ -1054,6 +1130,7 @@ pub fn schema(timezones: &BTreeSet<String>) -> String {
   entity App in [AppLabel] {{ connectorGroup: String }};
 
   type Signal = {{ ok: Bool, trust: Long }};
+  type Grant = {{ app: App, policy: String }};
   type Device = {{
     id: String,
     signals: {{
@@ -1071,7 +1148,7 @@ pub fn schema(timezones: &BTreeSet<String>) -> String {
     auth: {{ ageSeconds: Long, mfa: Bool }},
     network?: {{ source: ipaddr }},
     time: {{ {} }},
-    grants: Set<App>,
+    grants: Set<Grant>,
   }};
 
   action connect appliesTo {{ principal: [User], resource: [App], context: Context }};
@@ -1212,6 +1289,23 @@ fn what_matches(what: &crate::model::What, app: &App) -> bool {
 }
 
 impl Compiled {
+    /// The shortest `auth.maxAge` any rule or request policy sets, in
+    /// seconds: how recently a sign-in must have authenticated the user for
+    /// every freshness condition to hold.
+    pub fn shortest_max_age(&self) -> Option<i64> {
+        let rules = self.objects.policies.iter().flat_map(|p| &p.rules);
+        rules
+            .map(|r| &r.when)
+            .chain(
+                self.objects
+                    .request_policies
+                    .iter()
+                    .flat_map(|p| std::iter::once(&p.when).chain(&p.automatic)),
+            )
+            .filter_map(|w| w.auth.max_age)
+            .min()
+    }
+
     /// The apps `user` may reach or request, by name. Apps the user may
     /// neither reach nor request are absent, so entitlement data never
     /// names them (docs/protocol.md section 11.1).

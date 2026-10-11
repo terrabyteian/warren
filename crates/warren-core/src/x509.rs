@@ -173,6 +173,11 @@ pub enum Usage {
     },
 }
 
+/// `authTime` when the IdP did not report when the user authenticated:
+/// freshness is unknown, and the sign-in counts as older than any
+/// `auth.maxAge`, so freshness-gated rules ask the user to sign in again.
+pub const AUTH_TIME_UNKNOWN: i64 = 0;
+
 /// The warren identity extension carried by user+device certificates
 /// (docs/protocol.md section 10.2).
 ///
@@ -180,7 +185,8 @@ pub enum Usage {
 /// WarrenIdentity ::= SEQUENCE {
 ///   version     INTEGER,             -- 1
 ///   sessionId   UTF8String,
-///   authTime    INTEGER,             -- IdP authentication time, Unix seconds
+///   authTime    INTEGER,             -- IdP authentication time, Unix seconds;
+///                                    -- 0 when the IdP did not report it
 ///   mfa         BOOLEAN,             -- the sign-in used multi-factor authentication
 ///   trustClass  INTEGER (1..3),      -- device enrollment trust class
 ///   tunnelV4    OCTET STRING (SIZE (4)),
@@ -195,7 +201,8 @@ pub enum Usage {
 pub struct Identity {
     /// The sign-in session the certificate belongs to.
     pub session_id: String,
-    /// When the user last authenticated at the IdP, in Unix seconds.
+    /// When the user last authenticated at the IdP, in Unix seconds, or
+    /// [`AUTH_TIME_UNKNOWN`].
     pub auth_time: i64,
     /// Whether that authentication used multi-factor authentication.
     pub mfa: bool,

@@ -20,15 +20,15 @@ use warren_core::events::AckRequest;
 use warren_core::identity::{Principal, Role, is_valid_name};
 use warren_core::jose::{self, b64url};
 use warren_core::keys::{PublicKey, sha256};
-use warren_core::params::{self, INFRA_CERT_LIFETIME, PROTOCOL_VERSION, REVOCATION_DEADLINE};
-use warren_core::x509::{self, Identity};
+use warren_core::params::{INFRA_CERT_LIFETIME, PROTOCOL_VERSION, REVOCATION_DEADLINE};
+use warren_core::x509::{self, AUTH_TIME_UNKNOWN, Identity};
 use warren_policy::compile::Access;
 use warren_policy::names::{DomainPattern, is_host_name};
 
 use crate::app::{App, new_secret, secret_hash};
 use crate::audit::{self, Activity, Actor};
 use crate::config::Approval;
-use crate::store::{AuthCode, AuthRequest, Device, DeviceStatus, Node, Session};
+use crate::store::{AuthCode, AuthRequest, Device, DeviceStatus, Enrollment, Node, Session};
 use crate::stream;
 use crate::web::{
     self, ApiError, Body, Handler, MAX_BODY, Peer, check_protocol, json, page, param, problem,
@@ -39,6 +39,8 @@ use crate::web::{
 const AUTH_REQUEST_LIFETIME: i64 = 600;
 /// How long the one-time code handed to the client is valid.
 const AUTH_CODE_LIFETIME: i64 = 120;
+/// The largest body read before the caller is authenticated.
+const PREAUTH_BODY: usize = 16 << 10;
 
 /// Every route the HTTPS API serves, as (method, path). The OpenAPI
 /// description in `docs/api/openapi.yaml` is tested against this list.
@@ -181,6 +183,17 @@ async fn authorize<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Api
     if client_state.is_empty() || client_state.len() > 512 {
         return bad("The sign-in request has no valid state. Start sign-in again from the app.");
     }
+    // `prompt=login` is the client's "sign in again": the IdP must
+    // authenticate the user afresh rather than reuse its own session.
+    let login = match param(&q, "prompt") {
+        None => false,
+        Some("login") => true,
+        Some(_) => {
+            return bad("The sign-in request asks for an unknown prompt. Update the warren app.");
+        }
+    };
+    // Ask the IdP for a sign-in recent enough for every freshness rule.
+    let max_age = app.compiled().and_then(|c| c.shortest_max_age());
     let state = new_secret()?;
     let nonce = new_secret()?;
     let verifier = new_secret()?;
@@ -200,7 +213,7 @@ async fn authorize<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Api
     let callback = format!("{}/v1/auth/callback", app.config.public_url);
     match app
         .idp
-        .authorize_url(&callback, &state, &nonce, &s256(&verifier))
+        .authorize_url(&callback, &state, &nonce, &s256(&verifier), max_age, login)
         .await
     {
         Ok(url) => Ok(redirect(&url)),
@@ -272,6 +285,13 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
             ]);
         }
     };
+    let auth_time = signin.auth_time.unwrap_or_else(|| {
+        crate::log::warn(
+            "idp",
+            "the ID token has no auth_time, so how recently the user authenticated is unknown and rules with auth.maxAge will ask them to sign in again",
+        );
+        AUTH_TIME_UNKNOWN
+    });
     let (user, changed) = app
         .store
         .record_sign_in(
@@ -279,7 +299,7 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
             &signin.subject,
             &signin.email,
             &signin.groups,
-            signin.auth_time,
+            auth_time,
         )
         .await?;
     if changed {
@@ -314,7 +334,7 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
                 user_id: user.id.clone(),
                 client_challenge: pending.client_challenge.clone(),
                 client_redirect_uri: pending.client_redirect_uri.clone(),
-                auth_time: signin.auth_time,
+                auth_time,
                 mfa: signin.mfa,
             },
             clock::now_secs() + AUTH_CODE_LIFETIME,
@@ -332,7 +352,7 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
 }
 
 async fn token(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiError> {
-    let body = read_body(req, 16 << 10).await?;
+    let body = read_body(req, PREAUTH_BODY).await?;
     let text = std::str::from_utf8(&body)
         .map_err(|_| ApiError::bad_request("the request must be a JWS"))?;
     let (key, payload) = jose::Unverified::parse(text.trim(), SESSION_REQUEST_TYP)
@@ -460,7 +480,33 @@ fn clip(s: &str) -> String {
 }
 
 async fn enroll(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiError> {
-    let (session, user) = app.session(&req).await?;
+    let (session, user) = app
+        .credential_session(&req, Activity::Enroll, "device")
+        .await?;
+    let result = enroll_device(app, req, &session, &user).await;
+    if let Err(e) = &result {
+        let mut r = audit::record(
+            Activity::Enroll,
+            false,
+            &Actor::User {
+                id: user.id.clone(),
+                email: user.email.clone(),
+            },
+            &format!("device refused: {}", e.reason),
+        );
+        r.insert("entity".into(), audit::entity("device", ""));
+        r.insert("unmapped".into(), json!({ "session_id": session.id }));
+        app.audit(r);
+    }
+    result
+}
+
+async fn enroll_device(
+    app: &App,
+    req: Request<Incoming>,
+    session: &Session,
+    user: &crate::store::User,
+) -> Result<Response<Body>, ApiError> {
     let body: EnrollRequest = read_json(req).await?;
     csr_key(&body.csr, Some(&session.public_key))?;
     if !matches!(body.key_storage.as_str(), "secure-enclave" | "software") {
@@ -478,7 +524,7 @@ async fn enroll(app: &App, req: Request<Incoming>) -> Result<Response<Body>, Api
         Approval::Manual => DeviceStatus::Pending,
     };
     let (pool_v4, pool_v6) = (app.config.device_pool_v4, app.config.device_pool_v6);
-    let (device, created) = app
+    let (device, enrollment) = app
         .store
         .enroll_device(
             &user.id,
@@ -492,33 +538,30 @@ async fn enroll(app: &App, req: Request<Incoming>) -> Result<Response<Body>, Api
             },
         )
         .await?;
-    if device.status == DeviceStatus::Revoked {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "device_revoked",
-            "This device has been revoked and cannot be enrolled again.",
-        ));
-    }
+    let message = match enrollment {
+        Enrollment::Revoked => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "device_revoked",
+                "This device has been revoked and cannot be enrolled again.",
+            ));
+        }
+        Enrollment::Created => "device enrolled",
+        Enrollment::BoundUser => "enrolled device bound to another user",
+        Enrollment::Again => "device enrolled again by the same user",
+    };
     let actor = Actor::User {
         id: user.id.clone(),
         email: user.email.clone(),
     };
-    let mut r = audit::record(
-        Activity::Enroll,
-        true,
-        &actor,
-        if created {
-            "device enrolled"
-        } else {
-            "device bound to another user"
-        },
-    );
+    let mut r = audit::record(Activity::Enroll, true, &actor, message);
     r.insert("entity".into(), audit::entity("device", &device.id));
     r.insert(
         "unmapped".into(),
         json!({ "key_storage": body.key_storage, "platform": platform, "status": device.status.as_str() }),
     );
     app.audit(r);
+    let created = enrollment == Enrollment::Created;
     if created && device.status == DeviceStatus::Approved {
         let mut r = audit::record(
             Activity::Activate,
@@ -567,7 +610,9 @@ fn device_refusal(status: DeviceStatus) -> Option<ApiError> {
 }
 
 async fn client_certificate(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiError> {
-    let (session, user) = app.session(&req).await?;
+    let (session, user) = app
+        .credential_session(&req, Activity::Create, "certificate")
+        .await?;
     let result = issue_client_certificate(app, req, &session, &user).await;
     if let Err(e) = &result {
         let mut r = audit::record(
@@ -673,7 +718,7 @@ async fn issue_client_certificate(
             serial: issued.serial,
             not_before: issued.not_before,
             not_after: issued.not_after,
-            renew_at: params::renew_at(issued.not_before, issued.not_after),
+            renew_at: issued.renew_at,
         },
     ))
 }
@@ -781,7 +826,8 @@ pub fn token_secret(token: &str) -> Option<&str> {
 }
 
 async fn join(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiError> {
-    let body: JoinRequest = read_json(req).await?;
+    let body: JoinRequest = serde_json::from_slice(&read_body(req, PREAUTH_BODY).await?)
+        .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?;
     let invalid = || {
         let mut r = audit::record(
             Activity::Enroll,
@@ -915,7 +961,7 @@ async fn join(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiEr
                 serial: issued.serial,
                 not_before: issued.not_before,
                 not_after: issued.not_after,
-                renew_at: params::renew_at(issued.not_before, issued.not_after),
+                renew_at: issued.renew_at,
             },
             trust_bundle: app.authority.trust_bundle(),
             policy_key: app.authority.policy_jwk(),
@@ -1027,6 +1073,28 @@ async fn node_certificate(
     peer: &Peer,
 ) -> Result<Response<Body>, ApiError> {
     let (node, cert) = app.node(peer).await?;
+    let result = renew_node_certificate(app, req, &node, &cert).await;
+    if let Err(e) = &result {
+        let mut r = audit::record(
+            Activity::Create,
+            false,
+            &Actor::Node {
+                id: node.id.clone(),
+            },
+            &format!("infrastructure certificate refused: {}", e.reason),
+        );
+        r.insert("entity".into(), audit::entity("certificate", ""));
+        app.audit(r);
+    }
+    result
+}
+
+async fn renew_node_certificate(
+    app: &App,
+    req: Request<Incoming>,
+    node: &Node,
+    cert: &x509::Certificate,
+) -> Result<Response<Body>, ApiError> {
     let body: CertificateRequest = read_json(req).await?;
     let key = csr_key(&body.csr, Some(&node.public_key))?;
     let [uri] = cert.uris.as_slice() else {
@@ -1076,7 +1144,7 @@ async fn node_certificate(
             serial: issued.serial,
             not_before: issued.not_before,
             not_after: issued.not_after,
-            renew_at: params::renew_at(issued.not_before, issued.not_after),
+            renew_at: issued.renew_at,
         },
     ))
 }

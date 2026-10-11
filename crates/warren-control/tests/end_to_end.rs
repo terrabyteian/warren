@@ -17,6 +17,7 @@ use warren_control::config::Config;
 use warren_control::{ControlPlane, admin_request, audit};
 use warren_core::events::{EventBody, Line};
 use warren_core::identity::Principal;
+use warren_core::keys::SigningKey;
 use warren_core::params::REVOCATION_DEADLINE;
 use warren_core::policy_bundle::{Bundle, View};
 use warren_core::x509::{self, Certificate};
@@ -306,7 +307,9 @@ async fn sign_in_enroll_certify_and_revoke() {
     assert_eq!(client.device().await.status, "approved");
 
     // The certificate follows the profile.
+    let asked = clock::now_secs();
     let issued = client.certificate().await.unwrap();
+    let answered = clock::now_secs();
     let chain = x509::pem_decode("CERTIFICATE", &issued.certificate_chain).unwrap();
     assert_eq!(chain.len(), 2);
     let cert = Certificate::parse(&chain[0]).unwrap();
@@ -319,9 +322,14 @@ async fn sign_in_enroll_certify_and_revoke() {
     assert_eq!(cert.public_key, *client.key.public_key());
     assert!(cert.not_after - cert.not_before <= 4 * 3600 + 120);
     assert!(cert.not_after - clock::now_secs() <= 4 * 3600);
-    assert_eq!(
+    // Half-life counts from issuance, not from the backdated notBefore.
+    assert!(cert.not_before < asked);
+    assert!(
+        (asked + cert.not_after) / 2 <= issued.renew_at
+            && issued.renew_at <= (answered + cert.not_after) / 2,
+        "{} not half-way from issuance to {}",
         issued.renew_at,
-        cert.not_before + (cert.not_after - cert.not_before) / 2
+        cert.not_after
     );
     assert!(cert.serial.len() >= 8);
     let user_id = session.user.id.clone();
@@ -681,6 +689,18 @@ async fn sign_in_enroll_certify_and_revoke() {
         relay.get("/v1/node/bundle").await.status,
         StatusCode::FORBIDDEN
     );
+    let refused = d
+        .audit_records()
+        .into_iter()
+        .find(|r| r["message"] == "relay or connector refused: this node has been revoked")
+        .expect("the revoked relay's refusal is audited");
+    assert_eq!(refused["status"], "Failure");
+    assert!(
+        refused["unmapped"]["certificate_uris"][0]
+            .as_str()
+            .unwrap()
+            .contains(&relay.joined.node_id)
+    );
 
     // A node resuming from a retained sequence number gets what it missed.
     let mut resumed = connector.events(Some(event.seq - 1)).await;
@@ -836,6 +856,114 @@ async fn automatic_approval_and_disabled_sign_in() {
         .map(|a| a.name)
         .collect();
     assert_eq!(names, ["billing"]);
+    d.cp.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_enrollments_and_certificates_are_audited() {
+    let d = Deployment::start("automatic").await;
+    let mut client = d.client();
+    client.sign_in().await;
+    let (_, device) = client.enroll().await;
+    let device_id = device["id"].as_str().unwrap().to_owned();
+    let (status, _) = client.enroll().await;
+    assert_eq!(status, StatusCode::OK);
+    let message = |m: &str| d.audit_records().into_iter().find(|r| r["message"] == m);
+    assert!(message("device enrolled again by the same user").is_some());
+
+    // A certificate request on a revoked session is refused and audited.
+    let (_, sessions) = d
+        .admin("GET", "/v1/admin/users/00u-ada/sessions", None)
+        .await;
+    let session_id = sessions[0]["id"].as_str().unwrap().to_owned();
+    d.admin(
+        "POST",
+        &format!("/v1/admin/sessions/{session_id}/revoke"),
+        None,
+    )
+    .await;
+    let (status, problem) = client.certificate().await.unwrap_err();
+    assert_eq!(
+        (status, problem["reason"].clone()),
+        (StatusCode::UNAUTHORIZED, json!("revoked"))
+    );
+    let refused = message("certificate refused: revoked").expect("refusal audited");
+    assert_eq!(refused["status"], "Failure");
+    assert_eq!(refused["actor"]["user"]["uid"], sessions[0]["user_id"]);
+
+    // A revoked device is refused, audited, and gains no users.
+    client.sign_in().await;
+    d.admin(
+        "POST",
+        &format!("/v1/admin/devices/{device_id}/revoke"),
+        None,
+    )
+    .await;
+    let (status, problem) = client.enroll().await;
+    assert_eq!(
+        (status, problem["reason"].clone()),
+        (StatusCode::FORBIDDEN, json!("device_revoked"))
+    );
+    assert!(message("device refused: device_revoked").is_some());
+    *d.idp.idp.user.lock().unwrap() = IdpUser {
+        sub: "00u-fin".into(),
+        email: "fin@example.com".into(),
+        groups: vec!["finance".into()],
+        amr: vec!["pwd".into()],
+    };
+    let mut other = d.client();
+    other.key = SigningKey::from_pkcs8(&client.key.to_pkcs8().unwrap()).unwrap();
+    other.sign_in().await;
+    let (status, _) = other.enroll().await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, devices) = d.admin("GET", "/v1/admin/devices", None).await;
+    let users = &devices.as_array().unwrap()[0]["users"];
+    assert_eq!(users.as_array().unwrap().len(), 1, "{devices}");
+    d.cp.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sign_in_asks_for_and_records_freshness() {
+    let d = Deployment::start("automatic").await;
+    // The policy's shortest auth.maxAge (12h) is asked of the IdP, and
+    // prompt=login only when the client asks to sign in again.
+    let mut client = d.client();
+    let session = client.sign_in().await;
+    let first = d.idp.idp.authorize_requests.lock().unwrap()[0].clone();
+    assert_eq!(first.get("max_age").map(String::as_str), Some("43200"));
+    assert_eq!(first.get("prompt"), None);
+    let now = clock::now_secs();
+    assert!((now - 10..=now).contains(&session.auth_time));
+    let back = client.browser_sign_in_with(&[("prompt", "login")]).await;
+    assert!(back.contains_key("code"));
+    let again = d.idp.idp.authorize_requests.lock().unwrap()[1].clone();
+    assert_eq!(again.get("prompt").map(String::as_str), Some("login"));
+    let back = client
+        .http
+        .request(
+            Method::GET,
+            &format!(
+                "{}/v1/auth/authorize?redirect_uri=http://127.0.0.1:9/cb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&prompt=none",
+                d.base
+            ),
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(back.status, StatusCode::BAD_REQUEST);
+
+    // An IdP that leaves auth_time out: freshness is unknown, never the
+    // token's issue time, and the certificate says so.
+    *d.idp.idp.omit_auth_time.lock().unwrap() = true;
+    let mut unsure = d.client();
+    let session = unsure.sign_in().await;
+    assert_eq!(session.auth_time, x509::AUTH_TIME_UNKNOWN);
+    unsure.enroll().await;
+    let issued = unsure.certificate().await.unwrap();
+    let chain = x509::pem_decode("CERTIFICATE", &issued.certificate_chain).unwrap();
+    let identity = Certificate::parse(&chain[0]).unwrap().identity.unwrap();
+    assert_eq!(identity.auth_time, x509::AUTH_TIME_UNKNOWN);
     d.cp.shutdown().await;
 }
 

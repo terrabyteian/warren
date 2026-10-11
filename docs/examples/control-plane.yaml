@@ -7,11 +7,23 @@
 trustDomain: example.com
 
 # The organization URL clients are given. Its host is reserved: no app can
-# claim it. Clients pin the deployment's trust bundle (from an MDM profile in
-# managed fleets), because the control plane's certificate comes from the
-# deployment's own infrastructure CA.
+# claim it.
 publicUrl: https://warren.example.com
 listen: "[::]:443"
+
+# The certificate the organization URL presents to browsers (sign-in) and to
+# clients: a PEM chain, leaf first, and its unencrypted PEM key, from WebPKI
+# or the organization's own CA. Replaced files are picked up within 30
+# seconds or on SIGHUP. Without tls, the control plane presents its own
+# certificate from the deployment's private CA, which browsers do not trust.
+tls:
+  certFile: /etc/warren/tls/tls.crt
+  keyFile: /etc/warren/tls/tls.key
+
+# More names for the control plane's own certificate. With tls set, relays
+# and connectors reach the control plane under one of these, where it keeps
+# presenting its own certificate; point it at the same address as publicUrl.
+dnsNames: [nodes.warren.example.com]
 
 # State: the SQLite database, the admin socket and, by default, the
 # key-encryption key. Keep the key-encryption key on separate storage in

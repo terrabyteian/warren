@@ -126,12 +126,14 @@ pub const EVENT_STALE_AFTER: Duration = Duration::from_secs(6);
 /// `INFRA_CERT_LIFETIME`: relay, connector and control-plane certificates.
 pub const INFRA_CERT_LIFETIME: Duration = Duration::from_secs(24 * 3600);
 
-/// When a certificate valid from `not_before` to `not_after` should be
-/// renewed: at half-life (`CLIENT_CERT_RENEW_AT`, fixed at 0.5).
-pub fn renew_at(not_before: i64, not_after: i64) -> i64 {
-    let mid = (i128::from(not_before) + i128::from(not_after)) / 2;
+/// When a certificate issued at `issued_at` and valid until `not_after`
+/// should be renewed: at half-life (`CLIENT_CERT_RENEW_AT`, fixed at 0.5).
+/// Half-life counts from issuance, not from `notBefore`, which is backdated
+/// by the clock-skew allowance.
+pub fn renew_at(issued_at: i64, not_after: i64) -> i64 {
+    let mid = (i128::from(issued_at) + i128::from(not_after)) / 2;
     // The midpoint of two i64 values is itself an i64.
-    i64::try_from(mid).unwrap_or(not_before)
+    i64::try_from(mid).unwrap_or(issued_at)
 }
 
 #[cfg(test)]
@@ -141,6 +143,10 @@ mod tests {
     #[test]
     fn renewal_is_at_half_life_without_overflow() {
         assert_eq!(renew_at(100, 300), 200);
+        // A certificate cut short by its session's end, issued at 1000 with
+        // notBefore backdated to 880 and notAfter at 1100: renewal still
+        // lies ahead.
+        assert_eq!(renew_at(1_000, 1_100), 1_050);
         assert_eq!(renew_at(-1, i64::MAX), i64::MAX / 2);
         assert_eq!(renew_at(i64::MIN, i64::MAX), 0);
     }

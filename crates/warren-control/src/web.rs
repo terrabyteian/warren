@@ -4,18 +4,19 @@
 //! TLS is rustls on aws-lc-rs, TLS 1.3 only, no 0-RTT (G16,
 //! docs/protocol.md section 3).
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue, LOCATION};
 use http::{Request, Response, StatusCode};
-use http_body::Frame;
+use http_body::{Frame, SizeHint};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -341,36 +342,91 @@ pub trait Handler: Send + Sync + 'static {
     ) -> impl Future<Output = Response<Body>> + Send;
 }
 
-/// The control plane's own server certificate, replaceable while running so
-/// it can be renewed without restarting.
+/// The control plane's server certificates: its own, from the
+/// infrastructure CA, and optionally one the operator supplies for the
+/// public host. Both are replaceable while running, so they can be renewed
+/// without restarting.
 #[derive(Debug)]
-pub struct ServerCert(RwLock<Arc<CertifiedKey>>);
+pub struct ServerCert {
+    own: RwLock<Arc<CertifiedKey>>,
+    operator: RwLock<Option<Arc<CertifiedKey>>>,
+    internal_names: Vec<String>,
+}
 
 impl ServerCert {
-    /// A certificate chain and its PKCS#8 key.
-    pub fn new(chain: Vec<Vec<u8>>, pkcs8: &[u8]) -> Result<ServerCert, Error> {
-        Ok(ServerCert(RwLock::new(Arc::new(certified_key(
-            chain, pkcs8,
-        )?))))
+    /// The control plane's own certificate chain and PKCS#8 key, presented
+    /// for every name until an operator certificate is set, and for
+    /// `internal_names` always.
+    pub fn new(
+        chain: Vec<Vec<u8>>,
+        pkcs8: &[u8],
+        internal_names: Vec<String>,
+    ) -> Result<ServerCert, Error> {
+        Ok(ServerCert {
+            own: RwLock::new(Arc::new(certified_key(
+                chain,
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec())),
+            )?)),
+            operator: RwLock::new(None),
+            internal_names,
+        })
     }
 
-    /// Replaces the certificate.
+    /// Replaces the control plane's own certificate.
     pub fn replace(&self, chain: Vec<Vec<u8>>, pkcs8: &[u8]) -> Result<(), Error> {
-        let key = Arc::new(certified_key(chain, pkcs8)?);
-        if let Ok(mut slot) = self.0.write() {
+        let key = Arc::new(certified_key(
+            chain,
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec())),
+        )?);
+        if let Ok(mut slot) = self.own.write() {
             *slot = key;
+        }
+        Ok(())
+    }
+
+    /// Sets the operator's certificate, presented for every name but the
+    /// internal ones: a PEM chain, leaf first, and an unencrypted PEM key
+    /// (`PRIVATE KEY`, `EC PRIVATE KEY` or `RSA PRIVATE KEY`) that must
+    /// match the leaf.
+    pub fn set_operator(&self, chain_pem: &str, key_pem: &str) -> Result<(), Error> {
+        let pem = |e: warren_core::x509::X509Error| Error::Tls(e.to_string());
+        let chain = warren_core::x509::pem_decode("CERTIFICATE", chain_pem).map_err(pem)?;
+        if chain.is_empty() {
+            return Err(Error::Tls(
+                "no CERTIFICATE block in the certificate file".into(),
+            ));
+        }
+        let mut keys = Vec::new();
+        for label in ["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"] {
+            for der in warren_core::x509::pem_decode(label, key_pem).map_err(pem)? {
+                keys.push(match label {
+                    "PRIVATE KEY" => PrivateKeyDer::Pkcs8(der.into()),
+                    "EC PRIVATE KEY" => PrivateKeyDer::Sec1(der.into()),
+                    _ => PrivateKeyDer::Pkcs1(der.into()),
+                });
+            }
+        }
+        let [key] = <[_; 1]>::try_from(keys).map_err(|_| {
+            Error::Tls(
+                "the key file must hold exactly one unencrypted PRIVATE KEY, EC PRIVATE KEY or RSA PRIVATE KEY block".into(),
+            )
+        })?;
+        let certified = certified_key(chain, key)?;
+        certified
+            .keys_match()
+            .map_err(|e| Error::Tls(format!("the key does not match the certificate: {e}")))?;
+        if let Ok(mut slot) = self.operator.write() {
+            *slot = Some(Arc::new(certified));
         }
         Ok(())
     }
 }
 
-fn certified_key(chain: Vec<Vec<u8>>, pkcs8: &[u8]) -> Result<CertifiedKey, Error> {
+fn certified_key(chain: Vec<Vec<u8>>, key: PrivateKeyDer<'static>) -> Result<CertifiedKey, Error> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let key = provider
         .key_provider
-        .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            pkcs8.to_vec(),
-        )))
+        .load_private_key(key)
         .map_err(|e| Error::Tls(e.to_string()))?;
     Ok(CertifiedKey::new(
         chain.into_iter().map(CertificateDer::from).collect(),
@@ -379,8 +435,19 @@ fn certified_key(chain: Vec<Vec<u8>>, pkcs8: &[u8]) -> Result<CertifiedKey, Erro
 }
 
 impl ResolvesServerCert for ServerCert {
-    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.0.read().ok().map(|k| k.clone())
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let internal = hello.server_name().is_some_and(|name| {
+            self.internal_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name))
+        });
+        if !internal
+            && let Ok(operator) = self.operator.read()
+            && let Some(key) = operator.as_ref()
+        {
+            return Some(key.clone());
+        }
+        self.own.read().ok().map(|k| k.clone())
     }
 }
 
@@ -427,12 +494,153 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// the process's file descriptors.
 const MAX_CONNECTIONS: usize = 4096;
 
-/// Serves one TLS connection with the protocol ALPN chose: HTTP/2 with
-/// keep-alive pings that drop dead peers, or HTTP/1.1 with a deadline for
-/// each request's headers. No protocol sniffing, so nothing waits unbounded
+/// The most connections one source holds at once: one IPv4 address, or one
+/// IPv6 /64. Beyond it the source's new connections are closed at once, so
+/// no single source can take every slot of [`MAX_CONNECTIONS`]. Clients and
+/// nodes need one connection each, so this only binds when many share an
+/// address behind NAT.
+pub const MAX_CONNECTIONS_PER_SOURCE: usize = 64;
+
+/// The most requests one HTTP/2 connection may have in progress at once.
+const MAX_CONCURRENT_STREAMS: u32 = 32;
+
+/// How long a connection may stay open with no request in progress. A
+/// request counts until its response body is finished, so event streams
+/// keep their connection.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the accept loops pause after a failed accept (such as running
+/// out of file descriptors) before trying again.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The requests a connection has in progress, from the moment each arrives
+/// until its response body is finished or dropped.
+#[derive(Clone)]
+struct Activity(Arc<watch::Sender<usize>>);
+
+impl Activity {
+    fn new() -> Activity {
+        Activity(Arc::new(watch::channel(0).0))
+    }
+
+    fn begin(&self) -> InFlight {
+        self.0.send_modify(|n| *n += 1);
+        InFlight(self.0.clone())
+    }
+
+    /// Resolves once there has been no request in progress for
+    /// [`IDLE_TIMEOUT`].
+    async fn idle(&self) {
+        let mut rx = self.0.subscribe();
+        loop {
+            let _ = rx.wait_for(|n| *n == 0).await;
+            tokio::select! {
+                _ = tokio::time::sleep(IDLE_TIMEOUT) => {
+                    if *rx.borrow_and_update() == 0 {
+                        return;
+                    }
+                }
+                _ = rx.changed() => {}
+            }
+        }
+    }
+}
+
+struct InFlight(Arc<watch::Sender<usize>>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n = n.saturating_sub(1));
+    }
+}
+
+/// A response body that keeps its request counted as in progress.
+struct Tracked {
+    body: Body,
+    _in_flight: InFlight,
+}
+
+impl http_body::Body for Tracked {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// Open connections per source, for [`MAX_CONNECTIONS_PER_SOURCE`].
+#[derive(Clone, Default)]
+struct Sources(Arc<Mutex<HashMap<IpAddr, usize>>>);
+
+struct SourceSlot(Sources, IpAddr);
+
+impl Sources {
+    fn acquire(&self, addr: IpAddr) -> Option<SourceSlot> {
+        let source = match addr.to_canonical() {
+            IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !(u128::MAX >> 64))),
+            v4 => v4,
+        };
+        let mut open = self.0.lock().ok()?;
+        let n = open.entry(source).or_default();
+        if *n >= MAX_CONNECTIONS_PER_SOURCE {
+            return None;
+        }
+        *n += 1;
+        Some(SourceSlot(self.clone(), source))
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        if let Ok(mut open) = (self.0).0.lock()
+            && let Some(n) = open.get_mut(&self.1)
+        {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.1);
+            }
+        }
+    }
+}
+
+/// Drives `conn` until it ends, or until it has been idle for
+/// [`IDLE_TIMEOUT`]; then shuts it down gracefully, giving it
+/// [`HANDSHAKE_TIMEOUT`] to finish.
+async fn close_when_idle<C: Future>(
+    conn: C,
+    activity: &Activity,
+    shutdown: impl FnOnce(Pin<&mut C>),
+) {
+    let mut conn = std::pin::pin!(conn);
+    tokio::select! {
+        _ = conn.as_mut() => return,
+        _ = activity.idle() => shutdown(conn.as_mut()),
+    }
+    let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn).await;
+}
+
+/// Serves one TLS connection with the protocol ALPN chose: HTTP/2 with a
+/// bounded number of concurrent streams and keep-alive pings that drop dead
+/// peers, or HTTP/1.1 with a deadline for each request's headers. Either is
+/// closed once idle. No protocol sniffing, so nothing waits unbounded
 /// before the first request.
-async fn serve_connection<S>(tls: tokio_rustls::server::TlsStream<TcpStream>, service: S)
-where
+async fn serve_connection<S>(
+    tls: tokio_rustls::server::TlsStream<TcpStream>,
+    service: S,
+    activity: Activity,
+) where
     S: hyper::service::Service<Request<Incoming>, Response = Response<Body>, Error = Infallible>
         + Send
         + 'static,
@@ -441,18 +649,25 @@ where
     let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
     let io = TokioIo::new(tls);
     if h2 {
-        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+        let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        builder
             .timer(TokioTimer::new())
             .keep_alive_interval(Some(Duration::from_secs(30)))
             .keep_alive_timeout(Duration::from_secs(20))
-            .serve_connection(io, service)
-            .await;
+            .max_concurrent_streams(MAX_CONCURRENT_STREAMS);
+        close_when_idle(builder.serve_connection(io, service), &activity, |c| {
+            c.graceful_shutdown()
+        })
+        .await;
     } else {
-        let _ = hyper::server::conn::http1::Builder::new()
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder
             .timer(TokioTimer::new())
-            .header_read_timeout(Duration::from_secs(10))
-            .serve_connection(io, service)
-            .await;
+            .header_read_timeout(Duration::from_secs(10));
+        close_when_idle(builder.serve_connection(io, service), &activity, |c| {
+            c.graceful_shutdown()
+        })
+        .await;
     }
 }
 
@@ -466,13 +681,20 @@ pub async fn serve_tls<H: Handler>(
     let acceptor = TlsAcceptor::from(config);
     let mut connections = tokio::task::JoinSet::new();
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let sources = Sources::default();
     loop {
         let accepted = tokio::select! {
             a = listener.accept() => a,
             _ = shutdown.changed() => break,
         };
-        let Ok((tcp, addr)) = accepted else { continue };
-        let Ok(slot) = slots.clone().try_acquire_owned() else {
+        let Ok((tcp, addr)) = accepted else {
+            tokio::time::sleep(ACCEPT_BACKOFF).await;
+            continue;
+        };
+        let (Ok(slot), Some(source)) = (
+            slots.clone().try_acquire_owned(),
+            sources.acquire(addr.ip()),
+        ) else {
             // At capacity: close this one rather than queue it.
             drop(tcp);
             continue;
@@ -480,7 +702,7 @@ pub async fn serve_tls<H: Handler>(
         let acceptor = acceptor.clone();
         let handler = handler.clone();
         connections.spawn(async move {
-            let _slot = slot;
+            let _slots = (slot, source);
             let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await
             else {
                 return;
@@ -494,12 +716,24 @@ pub async fn serve_tls<H: Handler>(
                     .unwrap_or_default(),
                 addr: Some(addr),
             });
+            let activity = Activity::new();
+            let requests = activity.clone();
             let service = hyper::service::service_fn(move |req| {
                 let handler = handler.clone();
                 let peer = peer.clone();
-                async move { Ok::<_, Infallible>(handler.handle(req, peer).await) }
+                let in_flight = requests.begin();
+                async move {
+                    let resp = handler.handle(req, peer).await;
+                    Ok::<_, Infallible>(resp.map(|body| {
+                        Tracked {
+                            body,
+                            _in_flight: in_flight,
+                        }
+                        .boxed()
+                    }))
+                }
             });
-            serve_connection(tls, service).await;
+            serve_connection(tls, service, activity).await;
         });
         while connections.try_join_next().is_some() {}
     }
@@ -518,7 +752,10 @@ pub async fn serve_unix<H: Handler>(
             a = listener.accept() => a,
             _ = shutdown.changed() => break,
         };
-        let Ok((stream, _)) = accepted else { continue };
+        let Ok((stream, _)) = accepted else {
+            tokio::time::sleep(ACCEPT_BACKOFF).await;
+            continue;
+        };
         let handler = handler.clone();
         connections.spawn(async move {
             let peer = Arc::new(Peer::default());

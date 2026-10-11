@@ -391,7 +391,7 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
                     "role": role.as_str(),
                     "group": body.group,
                     "expires_at": expires_at,
-                    "control_plane": app.config.public_url,
+                    "control_plane": app.config.node_url(),
                 }),
             ))
         }

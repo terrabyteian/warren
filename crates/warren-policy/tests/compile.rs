@@ -97,6 +97,12 @@ impl Engine {
     }
 }
 
+/// A context's grants: one grant for `app` issued under the request
+/// policy `policy`.
+fn grant(app: &str, policy: &str) -> serde_json::Value {
+    json!([{ "app": { "type": "Warren::App", "id": app }, "policy": policy }])
+}
+
 fn good_device() -> serde_json::Value {
     json!({
         "id": "d-1",
@@ -174,7 +180,8 @@ fn the_documented_examples_compile() {
         "context.network.source.isInRange(ip(\"203.0.113.0/24\"))",
         "(context.time.europe_berlin >= 1920 && context.time.europe_berlin < 2580)",
         "context.requester != principal",
-        "context.grants.contains(resource)",
+        "context.grants.contains({ app: resource, policy: \"prod-db-break-glass\" })",
+        "context.requester in Warren::Group::\"sre\"",
         "principal == Warren::AutoApprover::\"automatic\"",
         "context.request.time.utcMinuteOfWeek >= 1800",
     ] {
@@ -322,7 +329,7 @@ fn decisions_match_the_documentation() {
         Decision::Deny
     );
     let mut granted = context(Some(good_device()), 60, true, monday_9);
-    granted["grants"] = json!([{ "type": "Warren::App", "id": "prod-db" }]);
+    granted["grants"] = grant("prod-db", "prod-db-break-glass");
     let (d, why) = engine.decide("sam", "prod-db", granted);
     assert_eq!(d, Decision::Allow);
     assert_eq!(why, ["prod-db-break-glass/connect"]);
@@ -534,16 +541,31 @@ fn schedule_policy(rule_zone: &str, other_zone: &str) -> String {
 #[test]
 fn time_zones_that_would_share_a_field_are_refused() {
     assert!(compile_text(&schedule_policy("Etc/GMT+5", "Etc/GMT-5")).is_ok());
-    let errors = errors_of(&schedule_policy("Etc/GMT-5", "Etc_GMT-5"));
+    let errors = errors_of(&schedule_policy("UTC", "Etc/UTC"));
     assert!(
         errors.iter().any(|e| e.contains("cannot both be used")),
         "{errors:?}"
     );
-    let errors = errors_of(&schedule_policy("1Zone/X", "UTC"));
-    assert!(
-        errors.iter().any(|e| e.contains("cannot be used")),
-        "{errors:?}"
-    );
+}
+
+#[test]
+fn only_real_time_zones_are_accepted() {
+    assert!(compile_text(&schedule_policy("America/Port-au-Prince", "Asia/Kolkata")).is_ok());
+    // Well formed, but not zones an enforcement point could resolve.
+    for zone in [
+        "Europe/Atlantis",
+        "Etc_GMT-5",
+        "Mars/Olympus_Mons",
+        "1Zone/X",
+    ] {
+        let errors = errors_of(&schedule_policy(zone, "UTC"));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("not a time zone in the IANA Time Zone Database")),
+            "{zone}: {errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -682,6 +704,94 @@ fn request_and_approval_policies_decide() {
             .0,
         Decision::Deny
     );
+    // Only requests this policy lets the requester make are approved.
+    assert_eq!(
+        engine
+            .decide_as(auto, "approve", "prod-db", approval("cy", 1440 + 7 * 60))
+            .0,
+        Decision::Deny
+    );
+    assert_eq!(
+        engine
+            .decide_as(
+                "Warren::User::\"lee\"",
+                "approve",
+                "prod-db",
+                approval("cy", 0)
+            )
+            .0,
+        Decision::Deny
+    );
+}
+
+/// Two request policies for one app: `human` lets employees request with a
+/// manager's approval, `auto` lets SREs request with automatic approval.
+fn two_request_policies() -> Compiled {
+    let request_policy = |name: &str, who: &str, approval: &str| {
+        format!(
+            "---\napiVersion: warren.dev/v1alpha1\nkind: AccessRequestPolicy\nmetadata: {{ name: {name} }}\nspec:\n  who: {{ groups: [{who}] }}\n  what: {{ apps: [db] }}\n  approval:\n{approval}  maxDuration: 1h\n"
+        )
+    };
+    let text = format!(
+        "{GROUP}{}{}{}",
+        app("db", "db.lab.example.com", ""),
+        request_policy(
+            "human",
+            "employees",
+            "    approvers: { groups: [managers] }\n"
+        ),
+        request_policy(
+            "auto",
+            "sre",
+            "    approvers: { groups: [sre-leads] }\n    automatic:\n      when: { auth: { mfa: true } }\n"
+        ),
+    );
+    compile_text(&text).unwrap()
+}
+
+#[test]
+fn approvals_and_grants_belong_to_their_request_policy() {
+    let compiled = two_request_policies();
+    let users = [
+        user("emma", &["employees"]),
+        user("sam", &["sre"]),
+        user("mo", &["managers"]),
+        user("lee", &["sre-leads"]),
+    ];
+    let engine = Engine::new(&compiled, &users);
+    let request = context(None, 60, true, None);
+    let approval = |requester: &str| json!({ "requester": { "type": "Warren::User", "id": requester }, "request": request });
+    let approve = |approver: &str, requester: &str| {
+        engine
+            .decide_as(approver, "approve", "db", approval(requester))
+            .0
+    };
+    let auto = "Warren::AutoApprover::\"automatic\"";
+    // The SREs' automatic approval never approves an employee's request.
+    assert_eq!(approve(auto, "sam"), Decision::Allow);
+    assert_eq!(approve(auto, "emma"), Decision::Deny);
+    // Each policy's approvers approve only that policy's requesters.
+    assert_eq!(approve("Warren::User::\"mo\"", "emma"), Decision::Allow);
+    assert_eq!(approve("Warren::User::\"lee\"", "emma"), Decision::Deny);
+    assert_eq!(approve("Warren::User::\"lee\"", "sam"), Decision::Allow);
+    assert_eq!(approve("Warren::User::\"mo\"", "sam"), Decision::Deny);
+
+    // A grant is honored only by the policy that issued it.
+    let connect = |user: &str, grants: serde_json::Value| {
+        let mut c = context(None, 60, true, None);
+        c["grants"] = grants;
+        engine.decide(user, "db", c)
+    };
+    assert_eq!(connect("emma", grant("db", "auto")).0, Decision::Deny);
+    assert_eq!(
+        connect("emma", grant("db", "human")),
+        (Decision::Allow, vec!["human/connect".to_owned()])
+    );
+    assert_eq!(
+        connect("sam", grant("db", "auto")),
+        (Decision::Allow, vec!["auto/connect".to_owned()])
+    );
+    assert_eq!(connect("sam", grant("db", "human")).0, Decision::Deny);
 }
 
 #[test]
@@ -711,6 +821,108 @@ fn users_can_be_approvers() {
             .decide_as("Warren::AutoApprover::\"automatic\"", "approve", "a", ctx)
             .0,
         Decision::Deny
+    );
+}
+
+#[test]
+fn deny_rules_hold_when_context_is_missing() {
+    let deny = |when: &str| {
+        format!(
+            "{GROUP}{}{}---\napiVersion: warren.dev/v1alpha1\nkind: AccessPolicy\nmetadata: {{ name: p }}\nspec:\n  rules:\n    - name: allow\n      who: {{ groups: [g] }}\n      what: {{ apps: [a] }}\n      when: {{ via: [client, browser] }}\n    - name: deny\n      effect: deny\n      who: {{ groups: [g] }}\n      what: {{ apps: [a] }}\n      when: {when}\n",
+            app("a", "a.lab.example.com", ""),
+            "---\napiVersion: warren.dev/v1alpha1\nkind: PostureProfile\nmetadata: { name: fv }\nspec:\n  platform: macos\n  checks:\n    - signal: diskEncryption\n"
+        )
+    };
+    let decide = |when: &str, context: serde_json::Value| {
+        let compiled = compile_text(&deny(when)).unwrap();
+        Engine::new(&compiled, &[user("u", &["g"])])
+            .decide("u", "a", context)
+            .0
+    };
+
+    // Deny from one network: a request with no observed source is denied.
+    let network = "{ network: { sourceCidrs: [\"198.51.100.0/24\"] } }";
+    let mut no_source = context(None, 0, false, None);
+    no_source.as_object_mut().unwrap().remove("network");
+    assert_eq!(decide(network, no_source), Decision::Deny);
+    assert_eq!(
+        decide(network, context(None, 0, false, None)),
+        Decision::Allow
+    );
+    let mut inside = context(None, 0, false, None);
+    inside["network"] = json!({ "source": { "__extn": { "fn": "ip", "arg": "198.51.100.7" } } });
+    assert_eq!(decide(network, inside), Decision::Deny);
+
+    // Deny on a posture state: no device, or a missing signal, is denied.
+    let posture = "{ posture: [fv] }";
+    assert_eq!(
+        decide(posture, context(None, 0, false, None)),
+        Decision::Deny
+    );
+    let mut no_signal = good_device();
+    no_signal["signals"]
+        .as_object_mut()
+        .unwrap()
+        .remove("diskEncryption");
+    assert_eq!(
+        decide(posture, context(Some(no_signal), 0, false, None)),
+        Decision::Deny
+    );
+    let mut off = good_device();
+    off["signals"]["diskEncryption"]["ok"] = json!(false);
+    assert_eq!(
+        decide(posture, context(Some(off), 0, false, None)),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn deny_selectors_must_select_an_app() {
+    let rule = |effect: &str| {
+        format!(
+            "{GROUP}{}---\napiVersion: warren.dev/v1alpha1\nkind: AccessPolicy\nmetadata: {{ name: p }}\nspec:\n  rules:\n    - name: r\n      effect: {effect}\n      who: {{ groups: [g] }}\n      what: {{ appSelector: {{ matchLabels: {{ env: prdo }} }} }}\n",
+            app("a", "a.lab.example.com", "")
+        )
+    };
+    let errors = errors_of(&rule("deny"));
+    assert!(
+        errors.iter().any(|e| e.contains("selects no app")),
+        "{errors:?}"
+    );
+    let compiled = compile_text(&rule("allow")).unwrap();
+    assert!(
+        compiled
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("selects no app"))
+    );
+}
+
+#[test]
+fn groups_the_idp_never_asserted_are_flagged() {
+    let compiled = docs_examples();
+    let known: BTreeSet<String> = ["engineering", "contractors", "sre"]
+        .iter()
+        .map(|g| (*g).to_owned())
+        .collect();
+    let warnings = compile::unknown_groups(&compiled.objects, &known);
+    let messages: Vec<&str> = warnings.iter().map(|w| w.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["no user has group sre-leads at the IdP yet; check its spelling"]
+    );
+    assert!(warnings.iter().all(|w| w.severity == Severity::Warning));
+    let known: BTreeSet<String> = ["engineering", "sre", "sre-leads"]
+        .iter()
+        .map(|g| (*g).to_owned())
+        .collect();
+    let warnings = compile::unknown_groups(&compiled.objects, &known);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.message.contains("group contractors")
+                && w.message.contains("this deny rule blocks nobody")),
+        "{warnings:?}"
     );
 }
 

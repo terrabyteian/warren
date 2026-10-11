@@ -150,6 +150,10 @@ pub struct TestIdp {
     key: SigningKey,
     codes: Mutex<HashMap<String, PendingCode>>,
     pub token_requests: Mutex<u32>,
+    /// The query of every authorization request, oldest first.
+    pub authorize_requests: Mutex<Vec<HashMap<String, String>>>,
+    /// Leave `auth_time` out of ID tokens, as some IdPs do.
+    pub omit_auth_time: Mutex<bool>,
 }
 
 impl Handler for TestIdp {
@@ -175,6 +179,10 @@ impl Handler for TestIdp {
             }
             (Method::GET, "/authorize") => {
                 let q = web::query(&req).unwrap();
+                self.authorize_requests
+                    .lock()
+                    .unwrap()
+                    .push(q.iter().cloned().collect());
                 let get = |k: &str| web::param(&q, k).unwrap_or("").to_owned();
                 assert_eq!(get("response_type"), "code");
                 assert_eq!(get("client_id"), self.client_id);
@@ -235,7 +243,7 @@ impl Handler for TestIdp {
                     );
                 }
                 let now = clock::now_secs();
-                let claims = json!({
+                let mut claims = json!({
                     "iss": self.issuer,
                     "aud": self.client_id,
                     "sub": pending.user.sub,
@@ -248,6 +256,9 @@ impl Handler for TestIdp {
                     "exp": now + 300,
                     "auth_time": now - 5,
                 });
+                if *self.omit_auth_time.lock().unwrap() {
+                    claims.as_object_mut().unwrap().remove("auth_time");
+                }
                 let header = Header {
                     alg: "ES256".into(),
                     typ: "JWT".into(),
@@ -287,6 +298,8 @@ impl RunningIdp {
             key: SigningKey::generate().unwrap(),
             codes: Mutex::new(HashMap::new()),
             token_requests: Mutex::new(0),
+            authorize_requests: Mutex::new(Vec::new()),
+            omit_auth_time: Mutex::new(false),
         });
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let key = provider
@@ -391,18 +404,24 @@ impl TestClient {
     /// Runs the whole browser flow and exchanges the code for a session.
     /// Returns the redirect back to the client, for tests of failures.
     pub async fn browser_sign_in(&self) -> HashMap<String, String> {
+        self.browser_sign_in_with(&[]).await
+    }
+
+    /// Signs in through the browser, adding `extra` to the authorization
+    /// request (such as `prompt=login`).
+    pub async fn browser_sign_in_with(&self, extra: &[(&str, &str)]) -> HashMap<String, String> {
         let verifier = b64url(&random_bytes::<32>().unwrap());
         let challenge = b64url(&sha256(verifier.as_bytes()));
-        let start = format!(
-            "{}/v1/auth/authorize?{}",
-            self.base,
-            form_urlencoded::Serializer::new(String::new())
-                .append_pair("redirect_uri", REDIRECT_URI)
-                .append_pair("code_challenge", &challenge)
-                .append_pair("code_challenge_method", "S256")
-                .append_pair("state", "client-state-1")
-                .finish()
-        );
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("redirect_uri", REDIRECT_URI)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", "client-state-1");
+        for (k, v) in extra {
+            query.append_pair(k, v);
+        }
+        let start = format!("{}/v1/auth/authorize?{}", self.base, query.finish());
         let to_idp = location(
             &self
                 .http

@@ -49,6 +49,18 @@ pub struct Idp {
     pub mfa_acr_values: Vec<String>,
 }
 
+/// A certificate the operator supplies for the public host, from WebPKI or
+/// the operator's own CA, so browsers trust the sign-in pages. Reloaded
+/// when the files change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsFiles {
+    /// The PEM certificate chain, leaf first.
+    pub cert_file: PathBuf,
+    /// The unencrypted PEM private key: PKCS#8 (`PRIVATE KEY`), SEC1
+    /// (`EC PRIVATE KEY`) or PKCS#1 (`RSA PRIVATE KEY`).
+    pub key_file: PathBuf,
+}
+
 /// The control plane's configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -58,8 +70,14 @@ pub struct Config {
     pub public_url: String,
     /// The host of `public_url`, reserved so no app can claim it.
     pub public_host: String,
-    /// More DNS names for the control plane's certificate.
+    /// More DNS names for the control plane's own certificate, from the
+    /// infrastructure CA. With `tls` set these are the names relays and
+    /// connectors use, since the public host presents the operator's
+    /// certificate.
     pub dns_names: Vec<String>,
+    /// The operator's certificate for the public host; without one the
+    /// public host presents the control plane's own certificate.
+    pub tls: Option<TlsFiles>,
     /// Where the HTTPS API listens.
     pub listen: SocketAddr,
     /// Where the local admin API listens: a Unix socket, created mode 0600.
@@ -101,6 +119,7 @@ const KEYS: &[&str] = &[
     "trustDomain",
     "publicUrl",
     "dnsNames",
+    "tls",
     "listen",
     "adminSocket",
     "dataDir",
@@ -286,6 +305,27 @@ impl Config {
         let dns_names = get(&f, "dnsNames")
             .map(|n| r.host_names(n, "dnsNames"))
             .unwrap_or_default();
+        let mut tls = None;
+        if let Some(n) = get(&f, "tls") {
+            let tf = r.map(n, "tls", &["certFile", "keyFile"]);
+            let cert_file = get(&tf, "certFile").and_then(|p| r.string(p, "tls.certFile"));
+            let key_file = get(&tf, "keyFile").and_then(|p| r.string(p, "tls.keyFile"));
+            match (cert_file, key_file) {
+                (Some(cert_file), Some(key_file)) => {
+                    tls = Some(TlsFiles {
+                        cert_file: cert_file.into(),
+                        key_file: key_file.into(),
+                    })
+                }
+                _ => r.err(n, "tls needs both certFile and keyFile"),
+            }
+            if !dns_names.iter().any(|d| *d != public_host) {
+                r.err(
+                    n,
+                    "tls gives publicUrl's host the operator's certificate, so dnsNames needs another name, where relays and connectors reach the control plane under its own certificate",
+                );
+            }
+        }
         let data_dir = PathBuf::from(
             get(&f, "dataDir")
                 .and_then(|n| r.string(n, "dataDir"))
@@ -420,6 +460,7 @@ impl Config {
             public_url,
             public_host,
             dns_names,
+            tls,
             listen,
             admin_socket,
             data_dir,
@@ -460,10 +501,28 @@ impl Config {
         ]
         .into_iter()
         .flatten()
-        {
+        .chain(
+            self.tls
+                .iter_mut()
+                .flat_map(|t| [&mut t.cert_file, &mut t.key_file]),
+        ) {
             if p.is_relative() {
                 *p = base.join(&*p);
             }
+        }
+    }
+
+    /// Where relays and connectors reach the control plane: `public_url`,
+    /// or with an operator certificate on its host, the same URL under the
+    /// first other name in `dns_names`, which keeps the control plane's own
+    /// certificate.
+    pub fn node_url(&self) -> String {
+        match (
+            &self.tls,
+            self.dns_names.iter().find(|n| **n != self.public_host),
+        ) {
+            (Some(_), Some(name)) => self.public_url.replacen(&self.public_host, name, 1),
+            _ => self.public_url.clone(),
         }
     }
 
@@ -602,6 +661,56 @@ mod tests {
         let e =
             Config::parse(&format!("{MINIMAL}signIn:\n  sessionMaxLifetime: 1000d\n")).unwrap_err();
         assert!(e.contains("90d"), "{e}");
+    }
+
+    #[test]
+    fn operator_certificates_need_both_files_and_an_internal_name() {
+        let tls = "tls:\n  certFile: tls/cert.pem\n  keyFile: /etc/warren/key.pem\n";
+        let mut c = Config::parse(&format!(
+            "{MINIMAL}dnsNames: [nodes.warren.example.com]\n{tls}"
+        ))
+        .unwrap();
+        c.resolve_paths(Path::new("/srv/warren"));
+        assert_eq!(
+            c.tls,
+            Some(TlsFiles {
+                cert_file: "/srv/warren/tls/cert.pem".into(),
+                key_file: "/etc/warren/key.pem".into(),
+            })
+        );
+        assert_eq!(c.node_url(), "https://nodes.warren.example.com");
+        assert_eq!(Config::parse(MINIMAL).unwrap().tls, None);
+        assert_eq!(
+            Config::parse(MINIMAL).unwrap().node_url(),
+            "https://warren.example.com"
+        );
+
+        let e = Config::parse(&format!(
+            "{MINIMAL}dnsNames: [nodes.warren.example.com]\ntls:\n  certFile: cert.pem\n"
+        ))
+        .unwrap_err();
+        assert!(
+            e.contains("line 9") && e.contains("both certFile and keyFile"),
+            "{e}"
+        );
+        let e = Config::parse(&format!(
+            "{MINIMAL}dnsNames: [nodes.warren.example.com]\ntls:\n  keyFile: key.pem\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("both certFile and keyFile"), "{e}");
+        let e =
+            Config::parse(&format!("{MINIMAL}tls:\n  certFile: c\n  keyFile: k\n")).unwrap_err();
+        assert!(e.contains("dnsNames"), "{e}");
+        let e = Config::parse(&format!(
+            "{MINIMAL}dnsNames: [warren.example.com]\ntls:\n  certFile: c\n  keyFile: k\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("dnsNames"), "{e}");
+        let e = Config::parse(&format!(
+            "{MINIMAL}dnsNames: [nodes.warren.example.com]\ntls:\n  certFile: c\n  keyFile: k\n  chain: x\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("chain"), "{e}");
     }
 
     #[test]
