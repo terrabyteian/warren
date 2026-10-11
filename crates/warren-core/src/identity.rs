@@ -1,6 +1,6 @@
-//! warren identities: the `warren://` URIs in certificate SANs and the
-//! warren identity extension of user+device certificates
-//! (docs/protocol.md section 10).
+//! warren identities: the `warren://` URIs in certificate SANs, the warren
+//! identity extension of user+device certificates, and the names of things
+//! in a deployment (docs/protocol.md section 10).
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -312,6 +312,142 @@ impl fmt::Display for WarrenUri {
     }
 }
 
+/// A malformed name or identity URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameError(pub String);
+
+impl fmt::Display for NameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NameError {}
+
+/// Whether `s` is a valid object name: 1 to 63 characters of lowercase
+/// letters, digits and `-`, starting and ending with a letter or digit (a DNS
+/// label). Policy objects, connector groups, nodes, users and devices are all
+/// named this way, so a name can sit in a URI path segment or a Cedar entity
+/// ID without escaping.
+pub fn is_valid_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 63
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && b[0] != b'-'
+        && b[b.len() - 1] != b'-'
+}
+
+/// Whether `s` is a valid trust domain: a lowercase DNS name of at most 253
+/// characters whose labels are valid names.
+pub fn is_valid_trust_domain(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 253 && s.split('.').all(is_valid_name)
+}
+
+/// The role of an infrastructure node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// The control plane.
+    ControlPlane,
+    /// A relay.
+    Relay,
+    /// A connector.
+    Connector,
+}
+
+impl Role {
+    /// The role's name as it appears in URIs and APIs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::ControlPlane => "control-plane",
+            Role::Relay => "relay",
+            Role::Connector => "connector",
+        }
+    }
+
+    /// Parses a role name.
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "control-plane" => Some(Role::ControlPlane),
+            "relay" => Some(Role::Relay),
+            "connector" => Some(Role::Connector),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An identity named by a `warren://{td}/...` URI.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Principal {
+    /// `warren://{td}/user/{id}`
+    User(String),
+    /// `warren://{td}/device/{id}`
+    Device(String),
+    /// `warren://{td}/relay/{id}` or `warren://{td}/control-plane/{id}`
+    Node {
+        /// Relay or control plane.
+        role: Role,
+        /// The node's ID.
+        id: String,
+    },
+    /// `warren://{td}/connector/{group}/{id}`
+    Connector {
+        /// The connector group.
+        group: String,
+        /// The connector replica's ID.
+        id: String,
+    },
+}
+
+impl Principal {
+    /// The URI for this principal in trust domain `td`.
+    pub fn to_uri(&self, td: &str) -> String {
+        match self {
+            Principal::User(id) => format!("warren://{td}/user/{id}"),
+            Principal::Device(id) => format!("warren://{td}/device/{id}"),
+            Principal::Node { role, id } => format!("warren://{td}/{role}/{id}"),
+            Principal::Connector { group, id } => format!("warren://{td}/connector/{group}/{id}"),
+        }
+    }
+
+    /// Parses a URI, returning its trust domain and principal. Every name in
+    /// it must be valid.
+    pub fn parse_uri(uri: &str) -> Result<(String, Principal), NameError> {
+        let bad = || NameError(format!("not a warren identity URI: {uri}"));
+        let rest = uri.strip_prefix("warren://").ok_or_else(bad)?;
+        let parts: Vec<&str> = rest.split('/').collect();
+        let td = parts[0];
+        if !is_valid_trust_domain(td) || !parts[1..].iter().all(|p| is_valid_name(p)) {
+            return Err(bad());
+        }
+        let principal = match parts[1..] {
+            ["user", id] => Principal::User(id.into()),
+            ["device", id] => Principal::Device(id.into()),
+            ["relay", id] => Principal::Node {
+                role: Role::Relay,
+                id: id.into(),
+            },
+            ["control-plane", id] => Principal::Node {
+                role: Role::ControlPlane,
+                id: id.into(),
+            },
+            ["connector", group, id] => Principal::Connector {
+                group: group.into(),
+                id: id.into(),
+            },
+            _ => return Err(bad()),
+        };
+        Ok((td.into(), principal))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +513,70 @@ mod tests {
         let oid = identity_extension_oid();
         assert_eq!(oid[0], 105);
         assert_eq!(*oid.last().unwrap(), 1);
+    }
+
+    #[test]
+    fn names() {
+        for ok in ["a", "grafana", "lab-web", "u-0123abcd", &"x".repeat(63)] {
+            assert!(is_valid_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "-a",
+            "a-",
+            "Grafana",
+            "a_b",
+            "a.b",
+            "é",
+            &"x".repeat(64),
+        ] {
+            assert!(!is_valid_name(bad), "{bad}");
+        }
+        assert!(is_valid_trust_domain("example.com"));
+        assert!(!is_valid_trust_domain("example..com"));
+        assert!(!is_valid_trust_domain("Example.com"));
+    }
+
+    #[test]
+    fn uris_round_trip() {
+        let all = [
+            Principal::User("u-1".into()),
+            Principal::Device("d-1".into()),
+            Principal::Node {
+                role: Role::Relay,
+                id: "r-1".into(),
+            },
+            Principal::Node {
+                role: Role::ControlPlane,
+                id: "cp".into(),
+            },
+            Principal::Connector {
+                group: "homelab".into(),
+                id: "c-1".into(),
+            },
+        ];
+        for p in all {
+            let uri = p.to_uri("example.com");
+            assert_eq!(
+                Principal::parse_uri(&uri).unwrap(),
+                ("example.com".into(), p)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_uris_are_rejected() {
+        for bad in [
+            "https://example.com/user/u-1",
+            "warren://example.com/user",
+            "warren://example.com/user/u-1/x",
+            "warren://example.com/user/U-1",
+            "warren://example.com/connector/g",
+            "warren://example.com/admin/x",
+            "warren:///user/u-1",
+            "warren://example.com/user/u-1?x=1",
+        ] {
+            assert!(Principal::parse_uri(bad).is_err(), "{bad}");
+        }
     }
 }

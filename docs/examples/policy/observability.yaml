@@ -1,0 +1,35 @@
+apiVersion: warren.dev/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: observability
+spec:
+  rules:
+    - name: engineers-view-grafana
+      who:
+        groups: [engineering]
+      what:
+        apps: [grafana]
+      when:
+        posture: [managed-mac]
+        auth: { maxAge: 12h, mfa: true }
+        via: [client, browser]        # default [client]; browser = clientless
+
+    - name: contractors-office-hours
+      who:
+        groups: [contractors]
+      what:
+        appSelector: { matchLabels: { team: observability } }
+      when:
+        posture: [managed-mac]
+        schedule:
+          timezone: Europe/Berlin
+          windows: [{ days: [mon, tue, wed, thu, fri], from: "08:00", to: "19:00" }]
+        network:
+          sourceCidrs: ["203.0.113.0/24"]   # relay-observed public address
+
+    - name: no-contractors-on-prod
+      effect: deny
+      who:
+        groups: [contractors]
+      what:
+        appSelector: { matchLabels: { env: prod } }

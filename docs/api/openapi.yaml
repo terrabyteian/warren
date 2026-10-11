@@ -1,0 +1,573 @@
+# The warren control-plane API, versioned under /v1.
+#
+# Three audiences share one specification: clients (link D in
+# docs/protocol.md), relays and connectors (link E), and admins (the admin
+# API, which in M1 listens only on the control plane's local Unix socket).
+# This file is the start of the stable admin API the design promises; it is
+# checked against the routes the control plane serves by
+# crates/warren-control/tests/openapi.rs.
+openapi: 3.1.0
+info:
+  title: warren control plane
+  version: v1
+  description: >-
+    Sign-in, device enrollment, certificates and entitlements for clients;
+    joining, policy bundles, the revocation push channel and decision-log
+    intake for relays and connectors; and the admin API. Every request may
+    carry a Warren-Protocol header; a version the control plane does not
+    speak is refused with reason unsupported_protocol. Errors are RFC 9457
+    problem details with a stable reason code and a human-readable detail.
+  license:
+    name: Apache-2.0
+servers:
+  - url: https://{organization}
+    description: The control plane's HTTPS listener (links D and E).
+    variables:
+      organization:
+        default: warren.example.com
+  - url: http://localhost
+    description: >-
+      The admin API, served on the control plane's local Unix socket
+      (default /var/lib/warren/admin.sock, mode 0600). Remote admin access
+      arrives with the console in M3.
+tags:
+  - name: client
+    description: Link D, used by the warren app.
+  - name: node
+    description: Link E, used by relays and connectors with their infrastructure certificates.
+  - name: admin
+    description: The admin API on the local socket.
+paths:
+  /.well-known/warren:
+    get:
+      tags: [client]
+      operationId: discovery
+      summary: What a client needs to start, given only the organization URL
+      responses:
+        "200":
+          description: Discovery document.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Discovery" }
+  /v1/auth/authorize:
+    get:
+      tags: [client]
+      operationId: authorize
+      summary: Start sign-in in the system browser (RFC 8252, RFC 7636)
+      parameters:
+        - { name: redirect_uri, in: query, required: true, schema: { type: string }, description: "An http loopback URI on 127.0.0.1 or [::1], any port, or a URI the operator configured." }
+        - { name: code_challenge, in: query, required: true, schema: { type: string } }
+        - { name: code_challenge_method, in: query, required: true, schema: { type: string, enum: [S256] } }
+        - { name: state, in: query, required: true, schema: { type: string, maxLength: 512 } }
+      responses:
+        "302": { description: Redirect to the identity provider. }
+        "400": { description: An HTML page explaining why sign-in could not start; never a redirect. }
+        "502": { description: The identity provider is unreachable. }
+  /v1/auth/callback:
+    get:
+      tags: [client]
+      operationId: callback
+      summary: The identity provider's redirect back to the control plane
+      responses:
+        "302":
+          description: >-
+            Redirect to the client's redirect URI with a one-time code and the
+            client's state, or with error and error_description.
+        "400": { description: The sign-in link expired or was already used. }
+  /v1/auth/token:
+    post:
+      tags: [client]
+      operationId: token
+      summary: Exchange the one-time code for a session bound to the device key
+      requestBody:
+        required: true
+        content:
+          application/jose:
+            schema:
+              type: string
+              description: >-
+                A compact JWS, ES256, typ warren-session-request+jws, with the
+                device's public key in the jwk header member and a
+                SessionRequest as payload.
+      responses:
+        "200":
+          description: The session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+  /v1/devices:
+    post:
+      tags: [client]
+      operationId: enroll
+      summary: Enroll the session's device key
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EnrollRequest" }
+      responses:
+        "201":
+          description: Enrolled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+        "200":
+          description: Already enrolled; bound to this user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+        "403": { $ref: "#/components/responses/Problem" }
+  /v1/devices/current:
+    get:
+      tags: [client]
+      operationId: currentDevice
+      summary: The device the session's key belongs to
+      security: [{ session: [] }]
+      responses:
+        "200":
+          description: The device.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+        "404": { $ref: "#/components/responses/Problem" }
+  /v1/certificates:
+    post:
+      tags: [client]
+      operationId: clientCertificate
+      summary: Issue or renew the user+device certificate
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CertificateRequest" }
+      responses:
+        "200":
+          description: The certificate and its issuing CA.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Certificate" }
+        "401": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+  /v1/entitlements:
+    get:
+      tags: [client]
+      operationId: entitlements
+      summary: The apps the user may reach or request, and the relays
+      security: [{ session: [] }]
+      responses:
+        "200":
+          description: Entitlements; never names apps the user may neither reach nor request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Entitlements" }
+  /v1/join:
+    post:
+      tags: [node]
+      operationId: join
+      summary: Exchange a single-use join token for a first infrastructure certificate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/JoinRequest" }
+      responses:
+        "200":
+          description: Joined.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JoinResponse" }
+        "401": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /v1/node/bundle:
+    get:
+      tags: [node]
+      operationId: bundle
+      summary: The latest signed policy bundle for this node's role
+      security: [{ infrastructure: [] }]
+      responses:
+        "200":
+          description: A compact JWS, ES256, typ warren-bundle+jws; the ETag is the version.
+          content:
+            application/jose:
+              schema: { type: string }
+        "403": { $ref: "#/components/responses/Problem" }
+  /v1/node/events:
+    get:
+      tags: [node]
+      operationId: events
+      summary: The revocation push channel
+      security: [{ infrastructure: [] }]
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+          description: Resume after this sequence number; without it the stream starts with a snapshot.
+      responses:
+        "200":
+          description: >-
+            A long-lived stream of JSON lines: events, heartbeats at least
+            every EVENT_HEARTBEAT_INTERVAL, and snapshots (docs/protocol.md
+            section 12).
+          content:
+            application/x-ndjson:
+              schema: { type: string }
+  /v1/node/events/ack:
+    post:
+      tags: [node]
+      operationId: ackEvents
+      summary: Report when events took effect and what they cut
+      security: [{ infrastructure: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AckRequest" }
+      responses:
+        "200": { description: Recorded. }
+  /v1/node/audit:
+    post:
+      tags: [node]
+      operationId: audit
+      summary: Send access-decision and flow records
+      security: [{ infrastructure: [] }]
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema:
+              type: string
+              description: >-
+                One OCSF-shaped JSON object per line, each with integer
+                class_uid and time. The control plane stamps
+                metadata.log_provider with the reporting node and
+                metadata.logged_time; one bad line rejects the request.
+      responses:
+        "202": { description: Accepted. }
+        "400": { $ref: "#/components/responses/Problem" }
+  /v1/node/certificate:
+    post:
+      tags: [node]
+      operationId: nodeCertificate
+      summary: Renew this node's infrastructure certificate for the same key
+      security: [{ infrastructure: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CertificateRequest" }
+      responses:
+        "200":
+          description: The certificate and the infrastructure CA.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Certificate" }
+  /v1/admin/users:
+    get:
+      tags: [admin]
+      operationId: listUsers
+      responses:
+        "200": { description: Every user. }
+  /v1/admin/users/{user}/disable:
+    post:
+      tags: [admin]
+      operationId: disableUser
+      summary: Disable a user; their connections are cut through the push channel
+      parameters: [{ $ref: "#/components/parameters/user" }]
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+  /v1/admin/users/{user}/enable:
+    post:
+      tags: [admin]
+      operationId: enableUser
+      parameters: [{ $ref: "#/components/parameters/user" }]
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+  /v1/admin/users/{user}/sessions:
+    get:
+      tags: [admin]
+      operationId: userSessions
+      parameters: [{ $ref: "#/components/parameters/user" }]
+      responses:
+        "200": { description: The user's sessions, newest first. }
+  /v1/admin/sessions/{session}/revoke:
+    post:
+      tags: [admin]
+      operationId: revokeSession
+      parameters:
+        - { name: session, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+  /v1/admin/devices:
+    get:
+      tags: [admin]
+      operationId: listDevices
+      responses:
+        "200": { description: Every device. }
+  /v1/admin/devices/{device}/approve:
+    post:
+      tags: [admin]
+      operationId: approveDevice
+      parameters: [{ $ref: "#/components/parameters/device" }]
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /v1/admin/devices/{device}/enable:
+    post:
+      tags: [admin]
+      operationId: enableDevice
+      parameters: [{ $ref: "#/components/parameters/device" }]
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /v1/admin/devices/{device}/disable:
+    post:
+      tags: [admin]
+      operationId: disableDevice
+      parameters: [{ $ref: "#/components/parameters/device" }]
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+  /v1/admin/devices/{device}/revoke:
+    post:
+      tags: [admin]
+      operationId: revokeDevice
+      parameters: [{ $ref: "#/components/parameters/device" }]
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+  /v1/admin/certificates/{serial}/revoke:
+    post:
+      tags: [admin]
+      operationId: revokeCertificate
+      parameters:
+        - { name: serial, in: path, required: true, schema: { type: string, pattern: "^[0-9a-fA-F]+$" } }
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+  /v1/admin/policy:
+    get:
+      tags: [admin]
+      operationId: policyStatus
+      summary: The policy in force and the outcome of the last load
+      responses:
+        "200": { description: Policy status. }
+  /v1/admin/policy/reload:
+    post:
+      tags: [admin]
+      operationId: reloadPolicy
+      summary: Reload the policy directory; a policy that does not compile changes nothing
+      responses:
+        "200": { description: Loaded and published. }
+        "422": { description: Rejected, with every error by file and line. }
+  /v1/admin/join-tokens:
+    post:
+      tags: [admin]
+      operationId: createJoinToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { type: string, enum: [relay, connector] }
+                group: { type: string, description: The connector group, for connectors. }
+      responses:
+        "201": { description: "The token, wj1.<secret>.<root CA fingerprint>, valid once for JOIN_TOKEN_LIFETIME." }
+  /v1/admin/nodes:
+    get:
+      tags: [admin]
+      operationId: listNodes
+      responses:
+        "200": { description: Every relay and connector. }
+  /v1/admin/nodes/{node}/revoke:
+    post:
+      tags: [admin]
+      operationId: revokeNode
+      parameters:
+        - { name: node, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+  /v1/admin/revocation-latency:
+    get:
+      tags: [admin]
+      operationId: revocationLatency
+      summary: Commit-to-cut latency measured from node acknowledgements
+      responses:
+        "200": { description: Count, median, 99th percentile, maximum and how many exceeded the deadline. }
+components:
+  securitySchemes:
+    session:
+      type: http
+      scheme: bearer
+      description: The session token from /v1/auth/token. Every call that yields a credential also needs a CSR signed by the session's device key.
+    infrastructure:
+      type: mutualTLS
+      description: An infrastructure certificate from the deployment's infrastructure CA, naming an enabled relay or connector.
+  parameters:
+    user:
+      { name: user, in: path, required: true, schema: { type: string }, description: "User ID, email or IdP subject." }
+    device:
+      { name: device, in: path, required: true, schema: { type: string } }
+  responses:
+    Problem:
+      description: An RFC 9457 problem.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Changed:
+      description: Whether the request changed anything.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              id: { type: string }
+              changed: { type: boolean }
+              what: { type: string }
+  schemas:
+    Problem:
+      type: object
+      required: [status, reason, title, detail]
+      properties:
+        status: { type: integer }
+        reason: { type: string, description: "A stable code, such as device_not_approved, user_disabled, reauth_required, key_mismatch, invalid_grant." }
+        title: { type: string }
+        detail: { type: string, description: What happened and what to do, for people. }
+    Discovery:
+      type: object
+      properties:
+        trust_domain: { type: string }
+        api_base: { type: string }
+        authorize_endpoint: { type: string }
+        token_endpoint: { type: string }
+        trust_bundle: { type: string, description: "PEM: root CA, client CA, infrastructure CA." }
+        protocol_versions: { type: array, items: { type: integer } }
+    SessionRequest:
+      type: object
+      required: [code, code_verifier, redirect_uri, iat]
+      properties:
+        code: { type: string }
+        code_verifier: { type: string }
+        redirect_uri: { type: string }
+        iat: { type: integer, description: Unix seconds; must be within the clock-skew allowance. }
+    Session:
+      type: object
+      properties:
+        session_id: { type: string }
+        token: { type: string }
+        expires_at: { type: integer }
+        user:
+          type: object
+          properties:
+            id: { type: string }
+            email: { type: string }
+            groups: { type: array, items: { type: string } }
+        auth_time: { type: integer }
+        mfa: { type: boolean }
+    EnrollRequest:
+      type: object
+      required: [csr, platform, key_storage]
+      properties:
+        csr: { type: string, description: A PKCS#10 request signed by the device key, DER, base64. }
+        platform:
+          type: object
+          properties:
+            os: { type: string }
+            os_version: { type: string }
+            model: { type: string }
+            hostname: { type: string }
+        key_storage: { type: string, enum: [secure-enclave, software] }
+    Device:
+      type: object
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [pending, approved, disabled, revoked] }
+        tunnel_v4: { type: string }
+        tunnel_v6: { type: string }
+        trust_class: { type: integer, minimum: 1, maximum: 3 }
+    CertificateRequest:
+      type: object
+      required: [csr]
+      properties:
+        csr: { type: string, description: A PKCS#10 request, DER, base64. }
+    Certificate:
+      type: object
+      properties:
+        certificate_chain: { type: string, description: The certificate and its issuing CA, PEM. }
+        serial: { type: string }
+        not_before: { type: integer }
+        not_after: { type: integer }
+        renew_at: { type: integer }
+    Entitlements:
+      type: object
+      properties:
+        version: { type: integer, description: The bundle version the entitlements come from. }
+        apps:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              access: { type: string, enum: [allowed, requestable] }
+              connector_group: { type: string }
+              destinations:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    host: { type: string }
+                    cidr: { type: string }
+                    protocol: { type: string, enum: [tcp, udp, icmp, any] }
+                    ports:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          from: { type: integer }
+                          to: { type: integer }
+        dns_suffixes: { type: array, items: { type: string } }
+        relays:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
+              dns_names: { type: array, items: { type: string } }
+    JoinRequest:
+      type: object
+      required: [token, csr, name]
+      properties:
+        token: { type: string }
+        csr: { type: string }
+        name: { type: string }
+        dns_names: { type: array, items: { type: string } }
+    JoinResponse:
+      type: object
+      properties:
+        node_id: { type: string }
+        role: { type: string, enum: [relay, connector] }
+        group: { type: string }
+        trust_domain: { type: string }
+        certificate: { $ref: "#/components/schemas/Certificate" }
+        trust_bundle: { type: string }
+        policy_key:
+          type: object
+          description: The policy-signing key as a P-256 JWK.
+    AckRequest:
+      type: object
+      required: [acks]
+      properties:
+        acks:
+          type: array
+          items:
+            type: object
+            required: [seq, applied_at_ms, connections_cut]
+            properties:
+              seq: { type: integer }
+              applied_at_ms: { type: integer }
+              connections_cut: { type: integer }

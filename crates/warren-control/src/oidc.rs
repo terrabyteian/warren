@@ -1,0 +1,548 @@
+//! The control plane as an OpenID Connect relying party: authorization code
+//! flow with PKCE (RFC 7636) toward any standard IdP (docs/protocol.md
+//! section 11.1).
+//!
+//! ID tokens are verified here with aws-lc-rs: the algorithm must be on an
+//! asymmetric allowlist and match its key, the issuer must match exactly,
+//! the audience must include warren, the nonce must be the one sent, and
+//! the token must be within its validity with the configured clock skew.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use aws_lc_rs::signature::{self, RsaPublicKeyComponents, UnparsedPublicKey};
+use base64::Engine;
+use bytes::Bytes;
+use http::Method;
+use serde::Deserialize;
+use serde_json::Value;
+use tokio::sync::Mutex;
+use warren_core::clock;
+use warren_core::jose::b64url_decode;
+use zeroize::Zeroizing;
+
+use crate::Error;
+use crate::config;
+use crate::web::Client;
+
+/// What the IdP's discovery document says.
+#[derive(Debug, Clone, Deserialize)]
+struct Metadata {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    jwks_uri: String,
+}
+
+/// A verified sign-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignIn {
+    /// The IdP's subject identifier.
+    pub subject: String,
+    /// The email, if the IdP asserted one it did not mark unverified.
+    pub email: String,
+    /// Groups from the configured claim.
+    pub groups: Vec<String>,
+    /// When the user authenticated, Unix seconds.
+    pub auth_time: i64,
+    /// Whether the authentication used multi-factor authentication.
+    pub mfa: bool,
+}
+
+struct Keys {
+    keys: Vec<Value>,
+    fetched: Option<Instant>,
+}
+
+/// The IdP.
+pub struct Provider {
+    config: config::Idp,
+    secret: Option<Zeroizing<String>>,
+    http: Client,
+    skew: i64,
+    metadata: Mutex<Option<Arc<Metadata>>>,
+    keys: Mutex<Keys>,
+}
+
+/// How often unknown key IDs may trigger a JWKS refetch.
+const JWKS_REFRESH: Duration = Duration::from_secs(60);
+
+impl Provider {
+    /// A provider for `config`. Discovery happens on first use, so the
+    /// control plane starts even while the IdP is unreachable.
+    pub fn new(config: &config::Idp, skew: Duration) -> Result<Provider, Error> {
+        let roots = match &config.ca_file {
+            Some(path) => Client::roots_from_pem(
+                &std::fs::read_to_string(path)
+                    .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?,
+            )?,
+            None => Client::native_roots()?,
+        };
+        let secret = match &config.client_secret_file {
+            Some(path) => Some(Zeroizing::new(
+                std::fs::read_to_string(path)
+                    .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?
+                    .trim()
+                    .to_owned(),
+            )),
+            None => None,
+        };
+        Ok(Provider {
+            config: config.clone(),
+            secret,
+            http: Client::new(roots, None)?,
+            skew: skew.as_secs() as i64,
+            metadata: Mutex::new(None),
+            keys: Mutex::new(Keys {
+                keys: Vec::new(),
+                fetched: None,
+            }),
+        })
+    }
+
+    async fn metadata(&self) -> Result<Arc<Metadata>, Error> {
+        let mut slot = self.metadata.lock().await;
+        if let Some(m) = slot.as_ref() {
+            return Ok(m.clone());
+        }
+        let url = format!("{}/.well-known/openid-configuration", self.config.issuer);
+        let reply = self.http.request(Method::GET, &url, &[], None).await?;
+        if !reply.status.is_success() {
+            return Err(Error::Idp(format!(
+                "discovery at {url} returned {}",
+                reply.status
+            )));
+        }
+        let m: Metadata = reply
+            .json()
+            .map_err(|e| Error::Idp(format!("discovery at {url}: {e}")))?;
+        if m.issuer.trim_end_matches('/') != self.config.issuer {
+            return Err(Error::Idp(format!(
+                "discovery names issuer {}, not the configured {}",
+                m.issuer, self.config.issuer
+            )));
+        }
+        for endpoint in [&m.authorization_endpoint, &m.token_endpoint, &m.jwks_uri] {
+            if !endpoint.starts_with("https://") {
+                return Err(Error::Idp(format!("IdP endpoint {endpoint} is not https")));
+            }
+        }
+        let m = Arc::new(m);
+        *slot = Some(m.clone());
+        Ok(m)
+    }
+
+    /// The URL that starts sign-in at the IdP.
+    pub async fn authorize_url(
+        &self,
+        redirect_uri: &str,
+        state: &str,
+        nonce: &str,
+        challenge: &str,
+    ) -> Result<String, Error> {
+        let m = self.metadata().await?;
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &self.config.client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", &self.config.scopes.join(" "))
+            .append_pair("state", state)
+            .append_pair("nonce", nonce)
+            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge_method", "S256")
+            .finish();
+        let sep = if m.authorization_endpoint.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        Ok(format!("{}{sep}{query}", m.authorization_endpoint))
+    }
+
+    /// Exchanges an authorization code and verifies the ID token.
+    pub async fn exchange(
+        &self,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+        nonce: &str,
+    ) -> Result<SignIn, Error> {
+        let m = self.metadata().await?;
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "authorization_code")
+            .append_pair("code", code)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("code_verifier", verifier)
+            .append_pair("client_id", &self.config.client_id)
+            .finish();
+        let basic = self.secret.as_ref().map(|secret| {
+            let enc = |s: &str| form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+            let pair = format!("{}:{}", enc(&self.config.client_id), enc(secret));
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair)
+            )
+        });
+        let mut headers = vec![
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("accept", "application/json"),
+        ];
+        if let Some(b) = &basic {
+            headers.push(("authorization", b.as_str()));
+        }
+        let reply = self
+            .http
+            .request(
+                Method::POST,
+                &m.token_endpoint,
+                &headers,
+                Some(Bytes::from(body)),
+            )
+            .await?;
+        if !reply.status.is_success() {
+            let detail: Value = reply.json().unwrap_or_default();
+            return Err(Error::Idp(format!(
+                "token endpoint returned {}: {}",
+                reply.status,
+                detail
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no error code")
+            )));
+        }
+        let tokens: Value = reply.json().map_err(|e| Error::Idp(e.to_string()))?;
+        let id_token = tokens
+            .get("id_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Idp("the token response has no id_token".into()))?;
+        self.verify_id_token(id_token, nonce).await
+    }
+
+    async fn key_for(&self, kid: Option<&str>, kty: &str) -> Result<Vec<Value>, Error> {
+        let m = self.metadata().await?;
+        let mut keys = self.keys.lock().await;
+        let matching = |keys: &[Value]| -> Vec<Value> {
+            keys.iter()
+                .filter(|k| k.get("kty").and_then(Value::as_str) == Some(kty))
+                .filter(|k| match kid {
+                    Some(kid) => k.get("kid").and_then(Value::as_str) == Some(kid),
+                    None => true,
+                })
+                .cloned()
+                .collect()
+        };
+        let found = matching(&keys.keys);
+        let stale = keys.fetched.is_none_or(|t| t.elapsed() >= JWKS_REFRESH);
+        if !found.is_empty() || !stale {
+            return Ok(found);
+        }
+        let reply = self
+            .http
+            .request(Method::GET, &m.jwks_uri, &[], None)
+            .await?;
+        if !reply.status.is_success() {
+            return Err(Error::Idp(format!(
+                "JWKS at {} returned {}",
+                m.jwks_uri, reply.status
+            )));
+        }
+        let set: Value = reply.json().map_err(|e| Error::Idp(e.to_string()))?;
+        keys.keys = set
+            .get("keys")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        keys.fetched = Some(Instant::now());
+        Ok(matching(&keys.keys))
+    }
+
+    /// Verifies an ID token's signature and claims.
+    pub async fn verify_id_token(&self, token: &str, nonce: &str) -> Result<SignIn, Error> {
+        let bad = |why: &str| Error::Idp(format!("ID token rejected: {why}"));
+        let mut parts = token.split('.');
+        let (Some(h), Some(p), Some(s), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(bad("not a compact JWS"));
+        };
+        let header: Value = serde_json::from_slice(&b64url_decode(h).map_err(|_| bad("header"))?)
+            .map_err(|_| bad("header is not JSON"))?;
+        let alg = header.get("alg").and_then(Value::as_str).unwrap_or("");
+        let kty = match alg {
+            "RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512" => "RSA",
+            "ES256" | "ES384" => "EC",
+            "EdDSA" => "OKP",
+            _ => return Err(bad(&format!("algorithm {alg:?} is not accepted"))),
+        };
+        if header.get("crit").is_some() {
+            return Err(bad("critical header parameters are not supported"));
+        }
+        let kid = header.get("kid").and_then(Value::as_str);
+        let signature = b64url_decode(s).map_err(|_| bad("signature encoding"))?;
+        let message = format!("{h}.{p}");
+        let candidates = self.key_for(kid, kty).await?;
+        let verified = candidates.iter().any(|jwk| {
+            jwk.get("use")
+                .and_then(Value::as_str)
+                .is_none_or(|u| u == "sig")
+                && jwk
+                    .get("alg")
+                    .and_then(Value::as_str)
+                    .is_none_or(|a| a == alg)
+                && verify(alg, jwk, message.as_bytes(), &signature).is_ok()
+        });
+        if !verified {
+            return Err(bad("no IdP key verifies its signature"));
+        }
+        let claims: Value = serde_json::from_slice(&b64url_decode(p).map_err(|_| bad("payload"))?)
+            .map_err(|_| bad("payload is not JSON"))?;
+        self.check_claims(&claims, nonce, clock::now_secs())
+    }
+
+    fn check_claims(&self, claims: &Value, nonce: &str, now: i64) -> Result<SignIn, Error> {
+        let bad = |why: &str| Error::Idp(format!("ID token rejected: {why}"));
+        let str_claim = |name: &str| claims.get(name).and_then(Value::as_str);
+        let int_claim = |name: &str| claims.get(name).and_then(Value::as_i64);
+        if str_claim("iss").map(|i| i.trim_end_matches('/')) != Some(self.config.issuer.as_str()) {
+            return Err(bad("wrong issuer"));
+        }
+        let audiences: Vec<&str> = match claims.get("aud") {
+            Some(Value::String(a)) => vec![a.as_str()],
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        };
+        if !audiences.contains(&self.config.client_id.as_str()) {
+            return Err(bad("not issued for warren"));
+        }
+        if audiences.len() > 1 && str_claim("azp") != Some(self.config.client_id.as_str()) {
+            return Err(bad(
+                "several audiences but warren is not the authorized party",
+            ));
+        }
+        let exp = int_claim("exp").ok_or_else(|| bad("no exp"))?;
+        let iat = int_claim("iat").ok_or_else(|| bad("no iat"))?;
+        if now >= exp + self.skew {
+            return Err(bad("expired"));
+        }
+        if iat > now + self.skew || int_claim("nbf").is_some_and(|nbf| nbf > now + self.skew) {
+            return Err(bad("issued in the future"));
+        }
+        if str_claim("nonce") != Some(nonce) {
+            return Err(bad("wrong nonce"));
+        }
+        let subject = str_claim("sub")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| bad("no subject"))?;
+        let auth_time = int_claim("auth_time").unwrap_or(iat);
+        if auth_time > now + self.skew {
+            return Err(bad("authentication time in the future"));
+        }
+        let email = match (
+            str_claim("email"),
+            claims.get("email_verified").and_then(Value::as_bool),
+        ) {
+            (Some(e), Some(true) | None) => e.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        let groups = match claims.get(&self.config.groups_claim) {
+            Some(Value::Array(g)) => g
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            Some(Value::String(g)) => vec![g.clone()],
+            _ => Vec::new(),
+        };
+        let amr: Vec<&str> = claims
+            .get("amr")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let mfa = amr
+            .iter()
+            .any(|v| self.config.mfa_amr_values.iter().any(|m| m == v))
+            || str_claim("acr")
+                .is_some_and(|acr| self.config.mfa_acr_values.iter().any(|m| m == acr));
+        Ok(SignIn {
+            subject: subject.to_owned(),
+            email,
+            groups,
+            auth_time,
+            mfa,
+        })
+    }
+}
+
+fn coordinate(jwk: &Value, name: &str) -> Result<Vec<u8>, ()> {
+    jwk.get(name)
+        .and_then(Value::as_str)
+        .ok_or(())
+        .and_then(|v| b64url_decode(v).map_err(|_| ()))
+}
+
+fn verify(alg: &str, jwk: &Value, message: &[u8], sig: &[u8]) -> Result<(), ()> {
+    let unsigned = |v: Vec<u8>| -> Vec<u8> {
+        let first = v.iter().position(|b| *b != 0).unwrap_or(v.len());
+        v[first..].to_vec()
+    };
+    match alg {
+        "RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512" => {
+            let n = unsigned(coordinate(jwk, "n")?);
+            let e = unsigned(coordinate(jwk, "e")?);
+            let params = match alg {
+                "RS256" => &signature::RSA_PKCS1_2048_8192_SHA256,
+                "RS384" => &signature::RSA_PKCS1_2048_8192_SHA384,
+                "RS512" => &signature::RSA_PKCS1_2048_8192_SHA512,
+                "PS256" => &signature::RSA_PSS_2048_8192_SHA256,
+                "PS384" => &signature::RSA_PSS_2048_8192_SHA384,
+                _ => &signature::RSA_PSS_2048_8192_SHA512,
+            };
+            RsaPublicKeyComponents { n: &n, e: &e }
+                .verify(params, message, sig)
+                .map_err(|_| ())
+        }
+        "ES256" | "ES384" => {
+            let (crv, len, algorithm) = if alg == "ES256" {
+                ("P-256", 32, &signature::ECDSA_P256_SHA256_FIXED)
+            } else {
+                ("P-384", 48, &signature::ECDSA_P384_SHA384_FIXED)
+            };
+            if jwk.get("crv").and_then(Value::as_str) != Some(crv) {
+                return Err(());
+            }
+            let (x, y) = (coordinate(jwk, "x")?, coordinate(jwk, "y")?);
+            if x.len() != len || y.len() != len {
+                return Err(());
+            }
+            let mut point = vec![0x04];
+            point.extend(x);
+            point.extend(y);
+            UnparsedPublicKey::new(algorithm, point)
+                .verify(message, sig)
+                .map_err(|_| ())
+        }
+        "EdDSA" => {
+            if jwk.get("crv").and_then(Value::as_str) != Some("Ed25519") {
+                return Err(());
+            }
+            UnparsedPublicKey::new(&signature::ED25519, coordinate(jwk, "x")?)
+                .verify(message, sig)
+                .map_err(|_| ())
+        }
+        _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn provider() -> Provider {
+        Provider {
+            config: config::Idp {
+                issuer: "https://idp.example.com".into(),
+                client_id: "warren".into(),
+                client_secret_file: None,
+                scopes: vec!["openid".into()],
+                groups_claim: "groups".into(),
+                ca_file: None,
+                mfa_amr_values: vec!["mfa".into()],
+                mfa_acr_values: vec!["urn:example:mfa".into()],
+            },
+            secret: None,
+            http: Client::new(rustls::RootCertStore::empty(), None).unwrap(),
+            skew: 120,
+            metadata: Mutex::new(None),
+            keys: Mutex::new(Keys {
+                keys: vec![],
+                fetched: None,
+            }),
+        }
+    }
+
+    fn claims() -> Value {
+        json!({
+            "iss": "https://idp.example.com",
+            "aud": "warren",
+            "sub": "00u1",
+            "exp": 2_000,
+            "iat": 1_000,
+            "nonce": "n",
+            "email": "Ada@Example.com",
+            "groups": ["engineering"],
+            "amr": ["pwd", "mfa"],
+        })
+    }
+
+    #[test]
+    fn valid_claims() {
+        let s = provider().check_claims(&claims(), "n", 1_500).unwrap();
+        assert_eq!(s.subject, "00u1");
+        assert_eq!(s.email, "ada@example.com");
+        assert_eq!(s.groups, ["engineering"]);
+        assert_eq!(s.auth_time, 1_000);
+        assert!(s.mfa);
+    }
+
+    #[test]
+    fn each_claim_is_checked() {
+        let p = provider();
+        let reject = |change: &dyn Fn(&mut Value), now: i64| {
+            let mut c = claims();
+            change(&mut c);
+            assert!(p.check_claims(&c, "n", now).is_err(), "{c}");
+        };
+        reject(&|c| c["iss"] = json!("https://evil.example.com"), 1_500);
+        reject(&|c| c["aud"] = json!("other"), 1_500);
+        reject(&|c| c["aud"] = json!(["warren", "other"]), 1_500);
+        reject(&|c| c["nonce"] = json!("x"), 1_500);
+        reject(&|c| c["sub"] = json!(""), 1_500);
+        reject(&|_| {}, 2_120);
+        reject(&|_| {}, 870);
+        reject(
+            &|c| {
+                c.as_object_mut().unwrap().remove("exp");
+            },
+            1_500,
+        );
+        // Within the skew allowance both ways is fine.
+        assert!(p.check_claims(&claims(), "n", 2_119).is_ok());
+        assert!(p.check_claims(&claims(), "n", 881).is_ok());
+        let mut c = claims();
+        c["aud"] = json!(["warren", "other"]);
+        c["azp"] = json!("warren");
+        assert!(p.check_claims(&c, "n", 1_500).is_ok());
+    }
+
+    #[test]
+    fn unverified_email_and_mfa_sources() {
+        let p = provider();
+        let mut c = claims();
+        c["email_verified"] = json!(false);
+        c["amr"] = json!(["pwd"]);
+        let s = p.check_claims(&c, "n", 1_500).unwrap();
+        assert_eq!(s.email, "");
+        assert!(!s.mfa);
+        c["acr"] = json!("urn:example:mfa");
+        assert!(p.check_claims(&c, "n", 1_500).unwrap().mfa);
+    }
+
+    #[test]
+    fn signatures_by_algorithm() {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+        let pair = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
+        let point = pair.public_key().as_ref();
+        let jwk = json!({
+            "kty": "EC", "crv": "P-256",
+            "x": warren_core::jose::b64url(&point[1..33]),
+            "y": warren_core::jose::b64url(&point[33..]),
+        });
+        let sig = pair.sign(&SystemRandom::new(), b"msg").unwrap();
+        assert!(verify("ES256", &jwk, b"msg", sig.as_ref()).is_ok());
+        assert!(verify("ES256", &jwk, b"msG", sig.as_ref()).is_err());
+        assert!(verify("ES384", &jwk, b"msg", sig.as_ref()).is_err());
+        assert!(verify("HS256", &jwk, b"msg", sig.as_ref()).is_err());
+    }
+}

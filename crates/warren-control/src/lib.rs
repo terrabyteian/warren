@@ -4,8 +4,402 @@
 //! approval, certificate issuance, policy compilation and distribution,
 //! revocation push, audit, and the admin API that serves the console.
 //!
-//! Placeholder: milestone M1 fills this crate.
+//! [`ControlPlane::start`] runs everything on the current tokio runtime;
+//! [`run`] is the blocking entry point behind `warren control-plane`.
+
+pub mod admin;
+pub mod api;
+pub mod app;
+pub mod audit;
+pub mod authority;
+pub mod config;
+pub mod log;
+pub mod oidc;
+pub mod store;
+mod stream;
+pub mod web;
+
+use std::fmt;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use warren_core::clock;
+use warren_core::identity::{Principal, Role};
+use warren_core::keys::SigningKey;
+use warren_core::params::INFRA_CERT_LIFETIME;
+
+use crate::app::App;
+use crate::audit::Actor;
+use crate::authority::{Authority, Kek};
+use crate::config::Config;
+use crate::store::Store;
+use crate::web::ServerCert;
 
 /// One-line description of the role, shown by `warren control-plane --help`.
 pub const ABOUT: &str =
     "Run the control plane: identity, devices, certificates, policy, revocation";
+
+/// A control-plane error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /// The configuration is wrong.
+    Config(String),
+    /// The database failed.
+    Store(String),
+    /// TLS setup failed.
+    Tls(String),
+    /// The IdP failed or answered with something unacceptable.
+    Idp(String),
+    /// A request was malformed.
+    BadRequest(String),
+    /// A request conflicts with existing state.
+    Conflict(String),
+    /// Something needed is unavailable.
+    Unavailable(String),
+    /// A bug or an unexpected failure.
+    Internal(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Config(e) => write!(f, "configuration: {e}"),
+            Error::Store(e) => write!(f, "database: {e}"),
+            Error::Tls(e) => write!(f, "TLS: {e}"),
+            Error::Idp(e) => write!(f, "identity provider: {e}"),
+            Error::BadRequest(e) => write!(f, "bad request: {e}"),
+            Error::Conflict(e) => write!(f, "conflict: {e}"),
+            Error::Unavailable(e) => write!(f, "unavailable: {e}"),
+            Error::Internal(e) => write!(f, "internal error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// A running control plane.
+pub struct ControlPlane {
+    /// Where the HTTPS API listens.
+    pub addr: SocketAddr,
+    /// The admin socket.
+    pub admin_socket: PathBuf,
+    app: Arc<App>,
+    shutdown: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+/// How long revocation events are kept for nodes to resume from.
+const EVENT_RETENTION: Duration = Duration::from_secs(7 * 86_400);
+
+fn issue_own_cert(
+    app_authority: &Authority,
+    config: &Config,
+    id: &str,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), Error> {
+    let key = SigningKey::generate().map_err(|e| Error::Internal(e.to_string()))?;
+    let mut names = vec![config.public_host.clone()];
+    names.extend(config.dns_names.iter().cloned());
+    names.dedup();
+    let issued = app_authority.issue_node(
+        key.public_key(),
+        &Principal::Node {
+            role: Role::ControlPlane,
+            id: id.into(),
+        },
+        &names,
+        INFRA_CERT_LIFETIME.as_secs() as i64,
+        config.clock_skew.as_secs() as i64,
+    )?;
+    let pkcs8 = key.to_pkcs8().map_err(|e| Error::Internal(e.to_string()))?;
+    Ok((
+        vec![issued.der, app_authority.infra.der.clone()],
+        pkcs8.to_vec(),
+    ))
+}
+
+impl ControlPlane {
+    /// Starts the control plane on the current tokio runtime: opens the
+    /// database, loads or creates the keys, compiles policy (refusing to
+    /// start on a policy that does not compile), publishes a bundle, and
+    /// starts the HTTPS and admin listeners.
+    pub async fn start(config: Config) -> Result<ControlPlane, Error> {
+        ControlPlane::start_with_audit(config, None).await
+    }
+
+    /// Like [`ControlPlane::start`], writing audit records to `sink` instead
+    /// of the configured destination.
+    pub async fn start_with_audit(
+        config: Config,
+        sink: Option<audit::Sink>,
+    ) -> Result<ControlPlane, Error> {
+        if config.public_host.parse::<std::net::IpAddr>().is_ok() {
+            return Err(Error::Config("publicUrl must use a DNS name".into()));
+        }
+        std::fs::create_dir_all(&config.data_dir)
+            .map_err(|e| Error::Config(format!("{}: {e}", config.data_dir.display())))?;
+        let kek = Kek::load_or_create(&config.kek_file)?;
+        let store = Store::open(&config.database).await?;
+        let authority = Authority::load_or_create(&store, &kek, &config.trust_domain).await?;
+        drop(kek);
+        let idp = oidc::Provider::new(&config.idp, config.clock_skew)?;
+        let sink = match (sink, &config.audit_file) {
+            (Some(sink), _) => sink,
+            (None, Some(path)) => audit::Sink::file(path)?,
+            (None, None) => audit::Sink::stdout(),
+        };
+        let id = store
+            .init_setting("control_plane_id", &store::new_id("cp")?)
+            .await?;
+        let (latest, _) = store.event_bounds().await?;
+        let app = Arc::new(App::new(config, store, authority, idp, sink, id, latest));
+        ControlPlane::serve(app).await
+    }
+
+    async fn serve(app: Arc<App>) -> Result<ControlPlane, Error> {
+        let config = &app.config;
+        if let Err(errors) = app.load_policy(&Actor::System).await {
+            return Err(Error::Config(format!(
+                "the policy in {} does not compile:\n{}",
+                config.policy_dir.display(),
+                errors.join("\n")
+            )));
+        }
+        app.publish().await?;
+
+        let (chain, pkcs8) = issue_own_cert(&app.authority, config, &app.id)?;
+        let server_cert = Arc::new(ServerCert::new(chain, &pkcs8)?);
+        let tls = web::server_config(
+            server_cert.clone(),
+            &[
+                app.authority.client.der.clone(),
+                app.authority.infra.der.clone(),
+            ],
+        )?;
+        let listener = tokio::net::TcpListener::bind(config.listen)
+            .await
+            .map_err(|e| Error::Config(format!("cannot listen on {}: {e}", config.listen)))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        let (shutdown, rx) = watch::channel(false);
+        let mut tasks = Vec::new();
+        tasks.push(tokio::spawn(web::serve_tls(
+            listener,
+            tls,
+            Arc::new(api::Api(app.clone())),
+            rx.clone(),
+        )));
+
+        let admin_socket = config.admin_socket.clone();
+        #[cfg(unix)]
+        {
+            let unix = bind_admin_socket(&admin_socket)?;
+            tasks.push(tokio::spawn(web::serve_unix(
+                unix,
+                Arc::new(admin::Admin(app.clone())),
+                rx.clone(),
+            )));
+        }
+
+        tasks.push(tokio::spawn(app.clone().publisher()));
+        // Renew the control plane's own certificate at half-life, and prune
+        // the event log.
+        let maintenance = app.clone();
+        tasks.push(tokio::spawn(async move {
+            let half = INFRA_CERT_LIFETIME / 2;
+            let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
+            let mut prune = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                tokio::select! {
+                    _ = renew.tick() => {
+                        match issue_own_cert(&maintenance.authority, &maintenance.config, &maintenance.id)
+                            .and_then(|(chain, key)| server_cert.replace(chain, &key))
+                        {
+                            Ok(()) => log::info("tls", "renewed the control plane's certificate"),
+                            Err(e) => log::error("tls", &format!("cannot renew the control plane's certificate: {e}")),
+                        }
+                    }
+                    _ = prune.tick() => {
+                        let before = clock::now_millis() - EVENT_RETENTION.as_millis() as i64;
+                        if let Err(e) = maintenance.store.prune_events(before).await {
+                            log::error("events", &format!("cannot prune events: {e}"));
+                        }
+                        if let Err(e) = maintenance.store.prune_auth().await {
+                            log::error("sign-in", &format!("cannot prune expired sign-ins: {e}"));
+                        }
+                    }
+                }
+            }
+        }));
+        log::info_with(
+            "control-plane",
+            "listening",
+            &[
+                ("address", &addr.to_string()),
+                ("admin_socket", &admin_socket.display().to_string()),
+                ("trust_domain", &app.config.trust_domain),
+            ],
+        );
+        Ok(ControlPlane {
+            addr,
+            admin_socket,
+            app,
+            shutdown,
+            tasks,
+        })
+    }
+
+    /// The shared state.
+    pub fn app(&self) -> &Arc<App> {
+        &self.app
+    }
+
+    /// Stops listening and closes the database.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+        for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.tasks {
+            let _ = task.await;
+        }
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&self.admin_socket);
+        self.app.store.close().await;
+    }
+}
+
+/// Creates the admin socket so that nobody but the control plane's own user
+/// can ever connect to it: it is bound inside a fresh directory only that
+/// user can enter, restricted to mode 0600, and only then moved into place.
+#[cfg(unix)]
+fn bind_admin_socket(path: &Path) -> Result<tokio::net::UnixListener, Error> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let err = |e: std::io::Error| Error::Config(format!("{}: {e}", path.display()));
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Config(format!("{}: no parent directory", path.display())))?;
+    std::fs::create_dir_all(dir).map_err(err)?;
+    let staging = dir.join(format!(
+        ".a{}",
+        warren_core::keys::hex(
+            &warren_core::keys::random_bytes::<3>().map_err(|e| Error::Internal(e.to_string()))?
+        )
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .map_err(err)?;
+    // Short names: socket paths are limited to about 100 bytes, and the
+    // staged path is no longer than the final one.
+    let staged = staging.join("s");
+    let result = (|| {
+        let listener = tokio::net::UnixListener::bind(&staged).map_err(err)?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).map_err(err)?;
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&staged, path).map_err(err)?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_dir(&staging);
+    result
+}
+
+/// Runs the control plane with the configuration at `config_path` until
+/// SIGINT or SIGTERM. SIGHUP reloads policy.
+pub fn run(config_path: &Path) -> Result<(), Error> {
+    let mut config = Config::load(config_path)?;
+    if let Some(dir) = config_path.parent() {
+        config.resolve_paths(dir);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    runtime.block_on(async move {
+        let cp = ControlPlane::start(config).await?;
+        wait_for_signals(cp.app()).await;
+        log::info("control-plane", "shutting down");
+        cp.shutdown().await;
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+async fn wait_for_signals(app: &Arc<App>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::hangup()),
+    ) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    loop {
+        tokio::select! {
+            _ = term.recv() => return,
+            _ = int.recv() => return,
+            _ = hup.recv() => {
+                match app.load_policy(&Actor::System).await {
+                    Ok(_) => log::info("policy", "policy reloaded"),
+                    Err(errors) => log::error("policy", &format!("policy rejected; the previous policy stays in force: {}", errors.join("; "))),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signals(_app: &Arc<App>) {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Sends one admin request over the local socket (`warren admin`).
+#[cfg(unix)]
+pub fn admin_request(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<(u16, String), Error> {
+    let method = http::Method::from_bytes(method.as_bytes())
+        .map_err(|e| Error::BadRequest(e.to_string()))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    runtime.block_on(admin::request(socket, method, path, body))
+}
+
+/// Sends one admin request over the local socket (`warren admin`). The
+/// admin socket is a Unix socket, so other platforms have no admin API yet.
+#[cfg(not(unix))]
+pub fn admin_request(
+    _socket: &Path,
+    _method: &str,
+    _path: &str,
+    _body: Option<String>,
+) -> Result<(u16, String), Error> {
+    Err(Error::Unavailable(
+        "the admin socket needs a Unix platform".into(),
+    ))
+}
+
+/// Compiles a policy directory and returns the compiled Cedar policy set,
+/// or every diagnostic (`warren policy check`). Warnings are returned with
+/// the compiled set.
+pub fn check_policy(dir: &Path, reserved: &[String]) -> Result<(String, Vec<String>), Vec<String>> {
+    let (objects, diags) =
+        warren_policy::model::load_dir(dir).map_err(|e| vec![format!("{}: {e}", dir.display())])?;
+    let compiled = warren_policy::compile::compile(objects, diags, reserved)
+        .map_err(|d| d.iter().map(|d| d.to_string()).collect::<Vec<_>>())?;
+    Ok((
+        compiled.policy.policies.clone(),
+        compiled.warnings.iter().map(|w| w.to_string()).collect(),
+    ))
+}

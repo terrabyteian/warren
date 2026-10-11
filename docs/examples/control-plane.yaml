@@ -1,0 +1,55 @@
+# An example control-plane configuration. Start the control plane with
+#   warren control-plane --config control-plane.yaml
+# Relative paths are resolved from this file's directory.
+# crates/warren-control/tests/examples.rs keeps this file valid.
+
+# The deployment's name in every identity URI (warren://example.com/...).
+trustDomain: example.com
+
+# The organization URL clients are given. Its host is reserved: no app can
+# claim it. Clients pin the deployment's trust bundle (from an MDM profile in
+# managed fleets), because the control plane's certificate comes from the
+# deployment's own infrastructure CA.
+publicUrl: https://warren.example.com
+listen: "[::]:443"
+
+# State: the SQLite database, the admin socket and, by default, the
+# key-encryption key. Keep the key-encryption key on separate storage in
+# production (a mounted secret, for example) and back it up: without it the
+# CA and signing keys in the database cannot be opened.
+dataDir: /var/lib/warren
+keyEncryptionKeyFile: /etc/warren/kek
+
+# The policy directory (see policy/ next to this file and docs/policy.md).
+# Reload it with `warren admin policy reload` or SIGHUP; a policy that does
+# not compile changes nothing.
+policyDir: /etc/warren/policy
+
+# Any OpenID Connect identity provider. Register warren with the redirect
+# URI https://warren.example.com/v1/auth/callback.
+idp:
+  issuer: https://idp.example.com
+  clientId: warren
+  clientSecretFile: /etc/warren/idp-client-secret   # omit for a public client (PKCE only)
+  scopes: [openid, email, profile, groups]
+  groupsClaim: groups
+  mfaAmrValues: [mfa]
+  # caFile: /etc/warren/idp-ca.pem                  # for a privately signed IdP
+
+signIn:
+  sessionMaxLifetime: 7d
+
+devices:
+  approval: manual          # or automatic
+  poolV4: 100.96.0.0/16
+  poolV6: fd77:6172:7265:6e00::/64
+
+certificates:
+  clientLifetime: 4h        # at most 4h (G4)
+  clockSkewAllowance: 2m    # at most 2m
+
+audit:
+  file: /var/log/warren/audit.jsonl   # omit for standard output
+
+# Names no app may claim besides the control plane, the IdP and the relays.
+reservedNames: []

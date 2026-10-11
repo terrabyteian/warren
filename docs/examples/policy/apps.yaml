@@ -1,0 +1,54 @@
+apiVersion: warren.dev/v1alpha1
+kind: App
+metadata:
+  name: grafana
+  labels: { env: prod, team: observability }
+spec:
+  connectorGroup: homelab
+  destinations:
+    - host: grafana.lab.example.com
+      ports: [443]
+      protocol: tcp
+  discoverable: true          # visible in the portal and requestable; default false
+  clientless:                 # optional, HTTP(S) only in v1
+    url: https://grafana.access.example.com
+    upstream: https://grafana.lab.example.com
+---
+apiVersion: warren.dev/v1alpha1
+kind: App
+metadata:
+  name: lab-network
+spec:
+  connectorGroup: homelab
+  destinations:
+    - cidr: 10.20.0.0/24
+      ports: ["22", "8000-8100"]
+      protocol: tcp
+    - cidr: 10.20.0.0/24
+      protocol: icmp
+---
+apiVersion: warren.dev/v1alpha1
+kind: App
+metadata:
+  name: lab-web
+spec:
+  connectorGroup: homelab
+  destinations:
+    - host: "*.lab.example.com"
+      ports: [80, 443]
+      protocol: tcp
+  serverInitiatedFlows: false # default; true lets servers open flows to clients
+---
+apiVersion: warren.dev/v1alpha1
+kind: App
+metadata:
+  name: prod-db
+  labels: { env: prod }
+spec:
+  connectorGroup: homelab
+  destinations:
+    - host: prod-db.lab.example.com
+      target: 10.20.5.10
+      ports: [5432]
+      protocol: tcp
+  discoverable: true

@@ -1,0 +1,508 @@
+//! The control plane's keys: the deployment's certificate authorities and
+//! signing keys, sealed at rest under the key-encryption key (docs/design.md
+//! section 12, docs/protocol.md section 10).
+//!
+//! The hierarchy is a root CA and two issuing CAs under it, the client CA
+//! (user+device certificates) and the infrastructure CA (control plane,
+//! relays, connectors), so a certificate from one can never stand in for the
+//! other. Bundles, posture statements and clientless session assertions are
+//! each signed with their own key.
+
+use std::io::Write;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
+
+use aws_lc_rs::aead::{AES_256_GCM, Aad, Nonce, RandomizedNonceKey};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use warren_core::clock;
+use warren_core::identity::Principal;
+use warren_core::jose::Jwk;
+use warren_core::keys::{PublicKey, SigningKey, random_bytes};
+use warren_core::x509::{
+    self, Certificate, CertificateSpec, EMPTY_NAME, Identity, IssuerInfo, Usage,
+};
+use zeroize::Zeroizing;
+
+use crate::Error;
+use crate::store::Store;
+
+/// The deployment key-encryption key. CA and signing keys are stored only
+/// sealed under it (AES-256-GCM, with the key's role as associated data, so
+/// a sealed key cannot be swapped into another role).
+pub struct Kek(RandomizedNonceKey);
+
+impl Kek {
+    /// Loads the key from `path`, creating it (mode 0600) if the file does
+    /// not exist. The file holds 32 random bytes as base64.
+    pub fn load_or_create(path: &Path) -> Result<Kek, Error> {
+        let io = |e: std::io::Error| Error::Config(format!("{}: {e}", path.display()));
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(path)
+                        && meta.permissions().mode() & 0o077 != 0
+                    {
+                        crate::log::warn(
+                            "keys",
+                            &format!(
+                                "{} is readable by other users; restrict it to its owner (mode 0600)",
+                                path.display()
+                            ),
+                        );
+                    }
+                }
+                Zeroizing::new(text)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let key: Zeroizing<[u8; 32]> =
+                    Zeroizing::new(random_bytes().map_err(|e| Error::Internal(e.to_string()))?);
+                let text = Zeroizing::new(STANDARD.encode(*key));
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).map_err(io)?;
+                }
+                let mut file = create_private(path).map_err(io)?;
+                file.write_all(text.as_bytes()).map_err(io)?;
+                file.sync_all().map_err(io)?;
+                text
+            }
+            Err(e) => return Err(io(e)),
+        };
+        let bytes = Zeroizing::new(
+            STANDARD
+                .decode(text.trim())
+                .map_err(|_| Error::Config(format!("{}: not base64", path.display())))?,
+        );
+        if bytes.len() != 32 {
+            return Err(Error::Config(format!(
+                "{}: the key-encryption key must be 32 bytes",
+                path.display()
+            )));
+        }
+        RandomizedNonceKey::new(&AES_256_GCM, &bytes)
+            .map(Kek)
+            .map_err(|_| Error::Internal("cannot load the key-encryption key".into()))
+    }
+
+    fn aad(name: &str) -> String {
+        format!("warren-sealed-key:{name}")
+    }
+
+    /// Seals `plaintext` for the key role `name`: base64 of nonce, then
+    /// ciphertext and tag.
+    pub fn seal(&self, name: &str, plaintext: &[u8]) -> Result<String, Error> {
+        let mut buf = plaintext.to_vec();
+        let nonce = self
+            .0
+            .seal_in_place_append_tag(Aad::from(Self::aad(name).as_bytes()), &mut buf)
+            .map_err(|_| Error::Internal("sealing failed".into()))?;
+        let mut out = nonce.as_ref().to_vec();
+        out.extend_from_slice(&buf);
+        Ok(STANDARD.encode(out))
+    }
+
+    /// Opens a sealed value for the key role `name`.
+    pub fn open(&self, name: &str, sealed: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let bad = || {
+            Error::Config(format!(
+                "cannot unseal {name}: the key-encryption key does not match this database"
+            ))
+        };
+        let mut data = Zeroizing::new(STANDARD.decode(sealed).map_err(|_| bad())?);
+        if data.len() < 12 + 16 {
+            return Err(bad());
+        }
+        let nonce = Nonce::try_assume_unique_for_key(&data[..12]).map_err(|_| bad())?;
+        let mut body = Zeroizing::new(data[12..].to_vec());
+        data.fill(0);
+        let plain = self
+            .0
+            .open_in_place(nonce, Aad::from(Self::aad(name).as_bytes()), &mut body)
+            .map_err(|_| bad())?;
+        Ok(Zeroizing::new(plain.to_vec()))
+    }
+}
+
+#[cfg(unix)]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// A certificate authority: its key and certificate.
+pub struct Ca {
+    key: SigningKey,
+    /// The CA certificate, DER.
+    pub der: Vec<u8>,
+    /// The CA certificate, parsed.
+    pub cert: Certificate,
+}
+
+impl Ca {
+    fn issuer(&self) -> IssuerInfo {
+        IssuerInfo {
+            name: self.cert.subject.clone(),
+            key_id: self.key.public_key().key_id(),
+        }
+    }
+
+    /// The CA's public key.
+    pub fn public_key(&self) -> &PublicKey {
+        self.key.public_key()
+    }
+
+    /// Whether `cert` was signed by this CA.
+    pub fn issued(&self, cert: &Certificate) -> bool {
+        cert.issuer == self.cert.subject && cert.verify_signature(self.public_key()).is_ok()
+    }
+}
+
+/// An issued leaf certificate.
+#[derive(Debug, Clone)]
+pub struct Issued {
+    /// The certificate, DER.
+    pub der: Vec<u8>,
+    /// The serial, lowercase hex.
+    pub serial: String,
+    /// Start of validity, Unix seconds.
+    pub not_before: i64,
+    /// End of validity, Unix seconds.
+    pub not_after: i64,
+}
+
+/// Every key the control plane holds.
+pub struct Authority {
+    trust_domain: String,
+    /// The root CA.
+    pub root: Ca,
+    /// The client CA.
+    pub client: Ca,
+    /// The infrastructure CA.
+    pub infra: Ca,
+    /// Signs policy bundles.
+    pub policy_key: SigningKey,
+    /// Signs posture statements.
+    pub posture_key: SigningKey,
+    /// Signs clientless session assertions.
+    pub assertion_key: SigningKey,
+}
+
+const ROOT_LIFETIME: i64 = 10 * 365 * 86_400;
+const ISSUING_LIFETIME: i64 = 5 * 365 * 86_400;
+
+fn serial() -> Result<[u8; 16], Error> {
+    let mut serial: [u8; 16] = random_bytes().map_err(|e| Error::Internal(e.to_string()))?;
+    // Positive and non-zero, with at least 120 random bits left.
+    serial[0] = (serial[0] & 0x7f) | 0x40;
+    Ok(serial)
+}
+
+impl Authority {
+    /// Loads every key from the store, creating the hierarchy and keys on
+    /// first start.
+    pub async fn load_or_create(
+        store: &Store,
+        kek: &Kek,
+        trust_domain: &str,
+    ) -> Result<Authority, Error> {
+        let bound = store.init_setting("trust_domain", trust_domain).await?;
+        if bound != trust_domain {
+            return Err(Error::Config(format!(
+                "this database belongs to trust domain {bound}, not {trust_domain}"
+            )));
+        }
+        let root = load_ca(
+            store,
+            kek,
+            "root-ca",
+            &format!("warren root CA {trust_domain}"),
+            None,
+        )
+        .await?;
+        let client = load_ca(
+            store,
+            kek,
+            "client-ca",
+            &format!("warren client CA {trust_domain}"),
+            Some(&root),
+        )
+        .await?;
+        let infra = load_ca(
+            store,
+            kek,
+            "infrastructure-ca",
+            &format!("warren infrastructure CA {trust_domain}"),
+            Some(&root),
+        )
+        .await?;
+        Ok(Authority {
+            trust_domain: trust_domain.to_owned(),
+            root,
+            client,
+            infra,
+            policy_key: load_key(store, kek, "policy-signing").await?,
+            posture_key: load_key(store, kek, "posture-signing").await?,
+            assertion_key: load_key(store, kek, "session-assertion-signing").await?,
+        })
+    }
+
+    /// The trust domain.
+    pub fn trust_domain(&self) -> &str {
+        &self.trust_domain
+    }
+
+    /// The deployment trust bundle, PEM: root, client CA, infrastructure CA.
+    pub fn trust_bundle(&self) -> String {
+        [&self.root, &self.client, &self.infra]
+            .iter()
+            .map(|ca| x509::pem_encode("CERTIFICATE", &ca.der))
+            .collect()
+    }
+
+    /// The policy-signing key as a JWK, for nodes to verify bundles with.
+    pub fn policy_jwk(&self) -> Jwk {
+        Jwk::from_key(self.policy_key.public_key())
+    }
+
+    /// Issues a user+device certificate (docs/protocol.md section 10.2).
+    pub fn issue_client(
+        &self,
+        key: &PublicKey,
+        user_id: &str,
+        device_id: &str,
+        identity: Identity,
+        lifetime_secs: i64,
+        skew_secs: i64,
+    ) -> Result<Issued, Error> {
+        let now = clock::now_secs();
+        let spec = CertificateSpec {
+            serial: serial()?,
+            not_before: now - skew_secs,
+            not_after: now + lifetime_secs,
+            subject: EMPTY_NAME.to_vec(),
+            public_key: key,
+            usage: Usage::Leaf {
+                server_auth: false,
+                client_auth: true,
+            },
+            uris: vec![
+                Principal::User(user_id.into()).to_uri(&self.trust_domain),
+                Principal::Device(device_id.into()).to_uri(&self.trust_domain),
+            ],
+            dns_names: vec![],
+            identity: Some(identity),
+        };
+        issue(&spec, &self.client)
+    }
+
+    /// Issues an infrastructure certificate (docs/protocol.md section 10.3).
+    /// Connectors and relays get both server and client authentication;
+    /// they listen on one link and dial out on another.
+    pub fn issue_node(
+        &self,
+        key: &PublicKey,
+        principal: &Principal,
+        dns_names: &[String],
+        lifetime_secs: i64,
+        skew_secs: i64,
+    ) -> Result<Issued, Error> {
+        let now = clock::now_secs();
+        let spec = CertificateSpec {
+            serial: serial()?,
+            not_before: now - skew_secs,
+            not_after: now + lifetime_secs,
+            subject: EMPTY_NAME.to_vec(),
+            public_key: key,
+            usage: Usage::Leaf {
+                server_auth: true,
+                client_auth: true,
+            },
+            uris: vec![principal.to_uri(&self.trust_domain)],
+            dns_names: dns_names.to_vec(),
+            identity: None,
+        };
+        issue(&spec, &self.infra)
+    }
+
+    /// A certificate chain as PEM: the leaf, then its issuing CA.
+    pub fn chain_pem(&self, leaf: &[u8], issuer: &Ca) -> String {
+        x509::pem_encode("CERTIFICATE", leaf) + &x509::pem_encode("CERTIFICATE", &issuer.der)
+    }
+}
+
+fn issue(spec: &CertificateSpec<'_>, ca: &Ca) -> Result<Issued, Error> {
+    let der = x509::build_certificate(spec, &ca.issuer(), |tbs| ca.key.sign_der(tbs))
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    let parsed = Certificate::parse(&der).map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(Issued {
+        serial: parsed.serial_hex(),
+        not_before: spec.not_before,
+        not_after: spec.not_after,
+        der,
+    })
+}
+
+async fn load_key(store: &Store, kek: &Kek, name: &str) -> Result<SigningKey, Error> {
+    if let Some((sealed, _)) = store.signing_key(name).await? {
+        let pkcs8 = kek.open(name, &sealed)?;
+        return SigningKey::from_pkcs8(&pkcs8).map_err(|e| Error::Internal(e.to_string()));
+    }
+    let key = SigningKey::generate().map_err(|e| Error::Internal(e.to_string()))?;
+    let pkcs8 = key.to_pkcs8().map_err(|e| Error::Internal(e.to_string()))?;
+    store
+        .insert_signing_key(name, &kek.seal(name, &pkcs8)?, None)
+        .await?;
+    Ok(key)
+}
+
+async fn load_ca(
+    store: &Store,
+    kek: &Kek,
+    name: &str,
+    cn: &str,
+    parent: Option<&Ca>,
+) -> Result<Ca, Error> {
+    if let Some((sealed, Some(pem))) = store.signing_key(name).await? {
+        let pkcs8 = kek.open(name, &sealed)?;
+        let key = SigningKey::from_pkcs8(&pkcs8).map_err(|e| Error::Internal(e.to_string()))?;
+        let der = x509::pem_decode("CERTIFICATE", &pem)
+            .ok()
+            .and_then(|mut v| v.pop())
+            .ok_or_else(|| Error::Internal(format!("{name} certificate is unreadable")))?;
+        let cert = Certificate::parse(&der).map_err(|e| Error::Internal(e.to_string()))?;
+        if cert.public_key != *key.public_key() {
+            return Err(Error::Internal(format!(
+                "{name} certificate does not match its key"
+            )));
+        }
+        return Ok(Ca { key, der, cert });
+    }
+    let key = SigningKey::generate().map_err(|e| Error::Internal(e.to_string()))?;
+    let now = clock::now_secs();
+    let subject = x509::common_name(cn);
+    let (usage, lifetime) = match parent {
+        None => (Usage::Ca { path_len: 1 }, ROOT_LIFETIME),
+        Some(_) => (Usage::Ca { path_len: 0 }, ISSUING_LIFETIME),
+    };
+    let spec = CertificateSpec {
+        serial: serial()?,
+        not_before: now - 3600,
+        not_after: now + lifetime,
+        subject: subject.clone(),
+        public_key: key.public_key(),
+        usage,
+        uris: vec![],
+        dns_names: vec![],
+        identity: None,
+    };
+    let der = match parent {
+        None => x509::build_certificate(
+            &spec,
+            &IssuerInfo {
+                name: subject,
+                key_id: key.public_key().key_id(),
+            },
+            |tbs| key.sign_der(tbs),
+        ),
+        Some(parent) => {
+            x509::build_certificate(&spec, &parent.issuer(), |tbs| parent.key.sign_der(tbs))
+        }
+    }
+    .map_err(|e| Error::Internal(e.to_string()))?;
+    let pkcs8 = key.to_pkcs8().map_err(|e| Error::Internal(e.to_string()))?;
+    store
+        .insert_signing_key(
+            name,
+            &kek.seal(name, &pkcs8)?,
+            Some(&x509::pem_encode("CERTIFICATE", &der)),
+        )
+        .await?;
+    let cert = Certificate::parse(&der).map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(Ca { key, der, cert })
+}
+
+/// Device tunnel addresses for allocation index `index`: the index-th
+/// address of each pool, skipping the network address.
+pub fn tunnel_addresses(
+    pool_v4: &warren_policy::names::Cidr,
+    pool_v6: &warren_policy::names::Cidr,
+    index: i64,
+) -> Result<(Ipv4Addr, Ipv6Addr), Error> {
+    let exhausted = || Error::Unavailable("the device address pool is exhausted".into());
+    let n = u128::try_from(index).map_err(|_| exhausted())?;
+    let v4 = match pool_v4.nth(n).ok_or_else(exhausted)? {
+        std::net::IpAddr::V4(a) => a,
+        _ => return Err(exhausted()),
+    };
+    // Keep the broadcast address of the IPv4 pool free as well.
+    if pool_v4.nth(n + 1).is_none() {
+        return Err(exhausted());
+    }
+    let v6 = match pool_v6.nth(n).ok_or_else(exhausted)? {
+        std::net::IpAddr::V6(a) => a,
+        _ => return Err(exhausted()),
+    };
+    Ok((v4, v6))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "warren-authority-{name}-{}",
+            warren_core::keys::hex(&random_bytes::<6>().unwrap())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sealing_binds_the_role() {
+        let dir = temp_dir("kek");
+        let kek = Kek::load_or_create(&dir.join("kek")).unwrap();
+        let sealed = kek.seal("root-ca", b"secret").unwrap();
+        assert_eq!(&*kek.open("root-ca", &sealed).unwrap(), b"secret");
+        assert!(kek.open("client-ca", &sealed).is_err());
+        let again = Kek::load_or_create(&dir.join("kek")).unwrap();
+        assert_eq!(&*again.open("root-ca", &sealed).unwrap(), b"secret");
+        let other = Kek::load_or_create(&dir.join("kek2")).unwrap();
+        assert!(other.open("root-ca", &sealed).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("kek"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn address_allocation() {
+        let v4 = warren_policy::names::Cidr::parse("100.96.0.0/30").unwrap();
+        let v6 = warren_policy::names::Cidr::parse("fd77::/64").unwrap();
+        let (a, b) = tunnel_addresses(&v4, &v6, 1).unwrap();
+        assert_eq!(a.to_string(), "100.96.0.1");
+        assert_eq!(b.to_string(), "fd77::1");
+        assert!(tunnel_addresses(&v4, &v6, 2).is_ok());
+        assert!(tunnel_addresses(&v4, &v6, 3).is_err());
+    }
+}

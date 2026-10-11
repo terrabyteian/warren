@@ -1,0 +1,1326 @@
+//! The control plane's state, behind the one SQL layer (sqlx).
+//!
+//! SQLite is embedded today; PostgreSQL follows for high availability with
+//! the same queries and the same migration set, so the SQL here keeps to
+//! what both engines accept (see `migrations/0001_initial.sql`). Changes
+//! that reduce access commit together with the revocation event that
+//! announces them, so an event exists exactly when the change does.
+
+use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
+
+use sqlx::migrate::{Migration, MigrationType, Migrator};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{Row, SqlSafeStr, Sqlite, SqlitePool, Transaction};
+use warren_core::api::Platform;
+use warren_core::clock;
+use warren_core::events::{Event, EventBody};
+use warren_core::keys::{hex, random_bytes};
+use warren_core::policy_bundle::{Revocations, RevokedCertificate};
+
+use crate::Error;
+
+type Tx<'a> = Transaction<'a, Sqlite>;
+
+fn db(e: sqlx::Error) -> Error {
+    Error::Store(e.to_string())
+}
+
+/// A new random ID with a type prefix, for example `u-3f9c0d2a71b4e8a6c5d1`.
+pub fn new_id(prefix: &str) -> Result<String, Error> {
+    let bytes: [u8; 10] = random_bytes().map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(format!("{prefix}-{}", hex(&bytes)))
+}
+
+/// A user, as the IdP last described them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct User {
+    /// The warren user ID.
+    pub id: String,
+    /// The IdP's issuer.
+    pub issuer: String,
+    /// The IdP's subject identifier.
+    pub subject: String,
+    /// The verified email, or empty.
+    pub email: String,
+    /// IdP groups.
+    pub groups: Vec<String>,
+    /// Disabled users can do nothing.
+    pub disabled: bool,
+    /// When the user last signed in, Unix seconds.
+    pub last_auth_at: i64,
+}
+
+/// A device's approval state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceStatus {
+    /// Waiting for an admin.
+    Pending,
+    /// May be issued certificates.
+    Approved,
+    /// Temporarily refused; can be re-enabled.
+    Disabled,
+    /// Permanently refused.
+    Revoked,
+}
+
+impl DeviceStatus {
+    /// The status name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeviceStatus::Pending => "pending",
+            DeviceStatus::Approved => "approved",
+            DeviceStatus::Disabled => "disabled",
+            DeviceStatus::Revoked => "revoked",
+        }
+    }
+
+    fn parse(s: &str) -> DeviceStatus {
+        match s {
+            "approved" => DeviceStatus::Approved,
+            "disabled" => DeviceStatus::Disabled,
+            "revoked" => DeviceStatus::Revoked,
+            _ => DeviceStatus::Pending,
+        }
+    }
+}
+
+/// An enrolled device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    /// The device ID.
+    pub id: String,
+    /// Its key, as base64url of the uncompressed P-256 point.
+    pub public_key: String,
+    /// Approval state.
+    pub status: DeviceStatus,
+    /// Enrollment trust class, 1 to 3.
+    pub trust_class: u8,
+    /// Where the client says the key lives.
+    pub key_storage: String,
+    /// Platform facts from enrollment.
+    pub platform: Platform,
+    /// IPv4 tunnel address.
+    pub tunnel_v4: String,
+    /// IPv6 tunnel address.
+    pub tunnel_v6: String,
+    /// Users bound to the device.
+    pub users: Vec<String>,
+    /// When it enrolled, Unix seconds.
+    pub created_at: i64,
+}
+
+/// A sign-in session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    /// The session ID.
+    pub id: String,
+    /// The user.
+    pub user_id: String,
+    /// The device key the session is bound to (base64url point).
+    pub public_key: String,
+    /// IdP authentication time, Unix seconds.
+    pub auth_time: i64,
+    /// Whether the sign-in used MFA.
+    pub mfa: bool,
+    /// When the session ends, Unix seconds.
+    pub expires_at: i64,
+    /// When it was revoked, if it was.
+    pub revoked_at: Option<i64>,
+}
+
+/// A relay or connector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    /// The node ID.
+    pub id: String,
+    /// `relay` or `connector`.
+    pub role: String,
+    /// The connector group, for connectors.
+    pub group: Option<String>,
+    /// The node's name.
+    pub name: String,
+    /// DNS names it listens on.
+    pub dns_names: Vec<String>,
+    /// Its key, base64url point.
+    pub public_key: String,
+    /// When it joined, Unix seconds.
+    pub created_at: i64,
+    /// When it was revoked, if it was.
+    pub revoked_at: Option<i64>,
+}
+
+/// A sign-in waiting for the IdP's callback.
+#[derive(Debug, Clone)]
+pub struct AuthRequest {
+    /// Where the client wants the code.
+    pub client_redirect_uri: String,
+    /// The client's state, returned unchanged.
+    pub client_state: String,
+    /// The client's PKCE challenge.
+    pub client_challenge: String,
+    /// The nonce sent to the IdP.
+    pub nonce: String,
+    /// The control plane's own PKCE verifier toward the IdP.
+    pub idp_verifier: String,
+}
+
+/// A one-time sign-in code.
+#[derive(Debug, Clone)]
+pub struct AuthCode {
+    /// The user.
+    pub user_id: String,
+    /// The client's PKCE challenge.
+    pub client_challenge: String,
+    /// The redirect URI the code was sent to.
+    pub client_redirect_uri: String,
+    /// IdP authentication time.
+    pub auth_time: i64,
+    /// Whether the sign-in used MFA.
+    pub mfa: bool,
+}
+
+/// A stored bundle version.
+#[derive(Debug, Clone)]
+pub struct StoredBundle {
+    /// The version.
+    pub version: u64,
+    /// The policy digest.
+    pub digest: String,
+    /// The connector view, signed.
+    pub connector_jws: String,
+    /// The relay view, signed.
+    pub relay_jws: String,
+}
+
+/// Commit-to-cut latency, from node acknowledgements.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LatencySummary {
+    /// How many acknowledgements were counted.
+    pub count: u64,
+    /// Median latency, milliseconds.
+    pub p50_ms: i64,
+    /// 99th percentile latency, milliseconds.
+    pub p99_ms: i64,
+    /// Largest latency, milliseconds.
+    pub max_ms: i64,
+    /// Acknowledgements slower than `REVOCATION_DEADLINE`.
+    pub over_deadline: u64,
+}
+
+/// The database.
+#[derive(Debug, Clone)]
+pub struct Store {
+    pool: SqlitePool,
+}
+
+fn migrator() -> Migrator {
+    Migrator::with_migrations(vec![Migration::new(
+        1,
+        "initial".into(),
+        MigrationType::Simple,
+        include_str!("../migrations/0001_initial.sql").into_sql_str(),
+        false,
+    )])
+}
+
+impl Store {
+    /// Opens (creating if needed) the SQLite database at `path` and applies
+    /// migrations.
+    pub async fn open(path: &Path) -> Result<Store, Error> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_with(options)
+            .await
+            .map_err(db)?;
+        migrator()
+            .run(&pool)
+            .await
+            .map_err(|e| Error::Store(format!("migration failed: {e}")))?;
+        Ok(Store { pool })
+    }
+
+    /// Begins a write transaction. SQLite takes its single write lock up
+    /// front (`BEGIN IMMEDIATE`), so a transaction that reads before it
+    /// writes waits for other writers instead of failing when another
+    /// connection wrote in between; the PostgreSQL backend will use a plain
+    /// `BEGIN` and row locks.
+    async fn begin(&self) -> Result<Tx<'static>, Error> {
+        self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)
+    }
+
+    // Settings and keys.
+
+    /// Reads a setting.
+    pub async fn setting(&self, name: &str) -> Result<Option<String>, Error> {
+        sqlx::query_scalar("SELECT value FROM settings WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)
+    }
+
+    /// Writes a setting unless it exists; returns the stored value.
+    pub async fn init_setting(&self, name: &str, value: &str) -> Result<String, Error> {
+        sqlx::query(
+            "INSERT INTO settings (name, value) VALUES (?, ?) ON CONFLICT (name) DO NOTHING",
+        )
+        .bind(name)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(self.setting(name).await?.unwrap_or_default())
+    }
+
+    /// A sealed key and its certificate.
+    pub async fn signing_key(&self, name: &str) -> Result<Option<(String, Option<String>)>, Error> {
+        sqlx::query_as("SELECT sealed_key, certificate FROM signing_keys WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)
+    }
+
+    /// Stores a sealed key; refuses to replace one.
+    pub async fn insert_signing_key(
+        &self,
+        name: &str,
+        sealed: &str,
+        certificate: Option<&str>,
+    ) -> Result<(), Error> {
+        sqlx::query("INSERT INTO signing_keys (name, sealed_key, certificate, created_at) VALUES (?, ?, ?, ?)")
+            .bind(name)
+            .bind(sealed)
+            .bind(certificate)
+            .bind(clock::now_secs())
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+
+    async fn next_counter(tx: &mut Tx<'_>, name: &str) -> Result<i64, Error> {
+        sqlx::query_scalar("UPDATE counters SET value = value + 1 WHERE name = ? RETURNING value")
+            .bind(name)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(db)
+    }
+
+    // Events.
+
+    async fn append_event(tx: &mut Tx<'_>, body: EventBody) -> Result<Event, Error> {
+        let seq = Self::next_counter(tx, "event_seq").await?;
+        let committed_at_ms = clock::now_millis();
+        let payload = serde_json::to_string(&body).map_err(|e| Error::Internal(e.to_string()))?;
+        sqlx::query("INSERT INTO events (seq, kind, payload, committed_at_ms) VALUES (?, ?, ?, ?)")
+            .bind(seq)
+            .bind(body.kind())
+            .bind(payload)
+            .bind(committed_at_ms)
+            .execute(&mut **tx)
+            .await
+            .map_err(db)?;
+        Ok(Event {
+            seq: seq as u64,
+            committed_at_ms,
+            body,
+        })
+    }
+
+    /// Commits an event on its own.
+    pub async fn emit(&self, body: EventBody) -> Result<Event, Error> {
+        let mut tx = self.begin().await?;
+        let event = Self::append_event(&mut tx, body).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(event)
+    }
+
+    /// Events after `seq`, oldest first, at most `limit`.
+    pub async fn events_after(&self, seq: u64, limit: i64) -> Result<Vec<Event>, Error> {
+        let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+            "SELECT seq, payload, committed_at_ms FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
+        )
+        .bind(seq as i64)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.into_iter()
+            .map(|(seq, payload, committed_at_ms)| {
+                Ok(Event {
+                    seq: seq as u64,
+                    committed_at_ms,
+                    body: serde_json::from_str(&payload)
+                        .map_err(|e| Error::Internal(e.to_string()))?,
+                })
+            })
+            .collect()
+    }
+
+    /// The latest committed sequence number and the oldest retained one
+    /// (0 when nothing has been pruned).
+    pub async fn event_bounds(&self) -> Result<(u64, u64), Error> {
+        let latest: i64 = sqlx::query_scalar("SELECT value FROM counters WHERE name = 'event_seq'")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)?;
+        let oldest: Option<i64> = sqlx::query_scalar("SELECT MIN(seq) FROM events")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok((latest as u64, oldest.unwrap_or(latest + 1) as u64))
+    }
+
+    /// Drops events committed before `before_ms`, keeping at least the last
+    /// one so resumption can tell how far back the log goes.
+    pub async fn prune_events(&self, before_ms: i64) -> Result<u64, Error> {
+        let r = sqlx::query(
+            "DELETE FROM events WHERE committed_at_ms < ? AND seq < (SELECT MAX(seq) FROM events)",
+        )
+        .bind(before_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        sqlx::query("DELETE FROM event_acks WHERE received_at_ms < ?")
+            .bind(before_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(r.rows_affected())
+    }
+
+    /// Records acknowledgements from a node and returns the commit-to-cut
+    /// latency of each new one, in milliseconds.
+    pub async fn record_acks(
+        &self,
+        node_id: &str,
+        acks: &[warren_core::events::Ack],
+    ) -> Result<Vec<(u64, i64)>, Error> {
+        let mut tx = self.begin().await?;
+        let mut out = Vec::new();
+        let now = clock::now_millis();
+        for ack in acks {
+            let committed: Option<i64> =
+                sqlx::query_scalar("SELECT committed_at_ms FROM events WHERE seq = ?")
+                    .bind(ack.seq as i64)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db)?;
+            let Some(committed) = committed else { continue };
+            let inserted = sqlx::query(
+                "INSERT INTO event_acks (seq, node_id, applied_at_ms, received_at_ms, connections_cut) \
+                 VALUES (?, ?, ?, ?, ?) ON CONFLICT (seq, node_id) DO NOTHING",
+            )
+            .bind(ack.seq as i64)
+            .bind(node_id)
+            .bind(ack.applied_at_ms)
+            .bind(now)
+            .bind(ack.connections_cut as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+            if inserted.rows_affected() == 1 {
+                out.push((ack.seq, ack.applied_at_ms - committed));
+            }
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(out)
+    }
+
+    /// Commit-to-cut latency over every retained acknowledgement.
+    pub async fn latency_summary(&self, deadline_ms: i64) -> Result<LatencySummary, Error> {
+        let mut values: Vec<i64> = sqlx::query_scalar(
+            "SELECT a.applied_at_ms - e.committed_at_ms FROM event_acks a JOIN events e ON e.seq = a.seq",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        if values.is_empty() {
+            return Ok(LatencySummary::default());
+        }
+        values.sort_unstable();
+        let at = |q: f64| values[((values.len() - 1) as f64 * q).round() as usize];
+        Ok(LatencySummary {
+            count: values.len() as u64,
+            p50_ms: at(0.5),
+            p99_ms: at(0.99),
+            max_ms: values[values.len() - 1],
+            over_deadline: values.iter().filter(|v| **v > deadline_ms).count() as u64,
+        })
+    }
+
+    // Users.
+
+    fn user_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<User, Error> {
+        let groups: String = row.try_get("groups_json").map_err(db)?;
+        Ok(User {
+            id: row.try_get("id").map_err(db)?,
+            issuer: row.try_get("issuer").map_err(db)?,
+            subject: row.try_get("subject").map_err(db)?,
+            email: row.try_get("email").map_err(db)?,
+            groups: serde_json::from_str(&groups).unwrap_or_default(),
+            disabled: row.try_get("disabled").map_err(db)?,
+            last_auth_at: row.try_get("last_auth_at").map_err(db)?,
+        })
+    }
+
+    /// Records a sign-in: creates the user or updates their email and
+    /// groups. Returns the user and whether anything policy depends on
+    /// changed. A sign-in that removes groups also emits `bundle_updated`
+    /// later, through the publisher.
+    pub async fn record_sign_in(
+        &self,
+        issuer: &str,
+        subject: &str,
+        email: &str,
+        groups: &[String],
+        auth_time: i64,
+    ) -> Result<(User, bool), Error> {
+        let mut tx = self.begin().await?;
+        let now = clock::now_secs();
+        let groups_json =
+            serde_json::to_string(groups).map_err(|e| Error::Internal(e.to_string()))?;
+        let existing = sqlx::query("SELECT * FROM users WHERE issuer = ? AND subject = ?")
+            .bind(issuer)
+            .bind(subject)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+        let (id, changed) = match existing {
+            Some(row) => {
+                let user = Self::user_from_row(&row)?;
+                let changed = user.email != email || user.groups != groups;
+                sqlx::query("UPDATE users SET email = ?, groups_json = ?, updated_at = ?, last_auth_at = ? WHERE id = ?")
+                    .bind(email)
+                    .bind(&groups_json)
+                    .bind(now)
+                    .bind(auth_time)
+                    .bind(&user.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                (user.id, changed)
+            }
+            None => {
+                let id = new_id("u")?;
+                sqlx::query(
+                    "INSERT INTO users (id, issuer, subject, email, groups_json, disabled, created_at, updated_at, last_auth_at) \
+                     VALUES (?, ?, ?, ?, ?, FALSE, ?, ?, ?)",
+                )
+                .bind(&id)
+                .bind(issuer)
+                .bind(subject)
+                .bind(email)
+                .bind(&groups_json)
+                .bind(now)
+                .bind(now)
+                .bind(auth_time)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+                (id, true)
+            }
+        };
+        tx.commit().await.map_err(db)?;
+        let user = self
+            .user(&id)
+            .await?
+            .ok_or_else(|| Error::Internal("user vanished".into()))?;
+        Ok((user, changed))
+    }
+
+    /// A user by ID.
+    pub async fn user(&self, id: &str) -> Result<Option<User>, Error> {
+        let row = sqlx::query("SELECT * FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        row.as_ref().map(Self::user_from_row).transpose()
+    }
+
+    /// A user by ID, else by email, else by IdP subject. An email or subject
+    /// shared by several users matches none of them.
+    pub async fn find_user(&self, key: &str) -> Result<Option<User>, Error> {
+        if let Some(user) = self.user(key).await? {
+            return Ok(Some(user));
+        }
+        let by_email = sqlx::query("SELECT * FROM users WHERE email = ? AND email <> '' LIMIT 2")
+            .bind(key.to_ascii_lowercase())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        if let [row] = by_email.as_slice() {
+            return Self::user_from_row(row).map(Some);
+        }
+        let by_subject = sqlx::query("SELECT * FROM users WHERE subject = ? LIMIT 2")
+            .bind(key)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        match by_subject.as_slice() {
+            [row] => Self::user_from_row(row).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Deletes sign-ins and one-time codes that expired unused.
+    pub async fn prune_auth(&self) -> Result<(), Error> {
+        let now = clock::now_secs();
+        for sql in [
+            "DELETE FROM auth_requests WHERE expires_at <= ?",
+            "DELETE FROM auth_codes WHERE expires_at <= ?",
+        ] {
+            sqlx::query(sql)
+                .bind(now)
+                .execute(&self.pool)
+                .await
+                .map_err(db)?;
+        }
+        Ok(())
+    }
+
+    /// Every user.
+    pub async fn users(&self) -> Result<Vec<User>, Error> {
+        let rows = sqlx::query("SELECT * FROM users ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        rows.iter().map(Self::user_from_row).collect()
+    }
+
+    /// Disables or enables a user. Disabling commits a `user_disabled`
+    /// event in the same transaction. Returns the event, if one was
+    /// emitted, and whether the user changed.
+    pub async fn set_user_disabled(
+        &self,
+        id: &str,
+        disabled: bool,
+    ) -> Result<(bool, Option<Event>), Error> {
+        let mut tx = self.begin().await?;
+        let r = sqlx::query(
+            "UPDATE users SET disabled = ?, updated_at = ? WHERE id = ? AND disabled <> ?",
+        )
+        .bind(disabled)
+        .bind(clock::now_secs())
+        .bind(id)
+        .bind(disabled)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        let changed = r.rows_affected() == 1;
+        let event = if changed && disabled {
+            Some(Self::append_event(&mut tx, EventBody::UserDisabled { user_id: id.into() }).await?)
+        } else {
+            None
+        };
+        tx.commit().await.map_err(db)?;
+        Ok((changed, event))
+    }
+
+    // Sign-in.
+
+    /// Stores a sign-in in flight.
+    pub async fn insert_auth_request(
+        &self,
+        state_hash: &str,
+        r: &AuthRequest,
+        expires_at: i64,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO auth_requests (state_hash, client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(state_hash)
+        .bind(&r.client_redirect_uri)
+        .bind(&r.client_state)
+        .bind(&r.client_challenge)
+        .bind(&r.nonce)
+        .bind(&r.idp_verifier)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// Takes (and deletes) an unexpired sign-in in flight: each one is
+    /// usable once.
+    pub async fn take_auth_request(&self, state_hash: &str) -> Result<Option<AuthRequest>, Error> {
+        let row: Option<(String, String, String, String, String)> = sqlx::query_as(
+            "DELETE FROM auth_requests WHERE state_hash = ? AND expires_at > ? \
+             RETURNING client_redirect_uri, client_state, client_challenge, nonce, idp_verifier",
+        )
+        .bind(state_hash)
+        .bind(clock::now_secs())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        sqlx::query("DELETE FROM auth_requests WHERE expires_at <= ?")
+            .bind(clock::now_secs())
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(row.map(
+            |(client_redirect_uri, client_state, client_challenge, nonce, idp_verifier)| {
+                AuthRequest {
+                    client_redirect_uri,
+                    client_state,
+                    client_challenge,
+                    nonce,
+                    idp_verifier,
+                }
+            },
+        ))
+    }
+
+    /// Stores a one-time sign-in code.
+    pub async fn insert_auth_code(
+        &self,
+        code_hash: &str,
+        c: &AuthCode,
+        expires_at: i64,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO auth_codes (code_hash, user_id, client_challenge, client_redirect_uri, auth_time, mfa, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(code_hash)
+        .bind(&c.user_id)
+        .bind(&c.client_challenge)
+        .bind(&c.client_redirect_uri)
+        .bind(c.auth_time)
+        .bind(c.mfa)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// Takes (and deletes) an unexpired one-time code.
+    pub async fn take_auth_code(&self, code_hash: &str) -> Result<Option<AuthCode>, Error> {
+        let row: Option<(String, String, String, i64, bool)> = sqlx::query_as(
+            "DELETE FROM auth_codes WHERE code_hash = ? AND expires_at > ? \
+             RETURNING user_id, client_challenge, client_redirect_uri, auth_time, mfa",
+        )
+        .bind(code_hash)
+        .bind(clock::now_secs())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        sqlx::query("DELETE FROM auth_codes WHERE expires_at <= ?")
+            .bind(clock::now_secs())
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(row.map(
+            |(user_id, client_challenge, client_redirect_uri, auth_time, mfa)| AuthCode {
+                user_id,
+                client_challenge,
+                client_redirect_uri,
+                auth_time,
+                mfa,
+            },
+        ))
+    }
+
+    // Sessions.
+
+    /// Creates a session.
+    pub async fn insert_session(&self, s: &Session, token_hash: &str) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO sessions (id, token_hash, user_id, public_key, auth_time, mfa, created_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&s.id)
+        .bind(token_hash)
+        .bind(&s.user_id)
+        .bind(&s.public_key)
+        .bind(s.auth_time)
+        .bind(s.mfa)
+        .bind(clock::now_secs())
+        .bind(s.expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Session, Error> {
+        Ok(Session {
+            id: row.try_get("id").map_err(db)?,
+            user_id: row.try_get("user_id").map_err(db)?,
+            public_key: row.try_get("public_key").map_err(db)?,
+            auth_time: row.try_get("auth_time").map_err(db)?,
+            mfa: row.try_get("mfa").map_err(db)?,
+            expires_at: row.try_get("expires_at").map_err(db)?,
+            revoked_at: row.try_get("revoked_at").map_err(db)?,
+        })
+    }
+
+    /// A session by its token's hash.
+    pub async fn session_by_token(&self, token_hash: &str) -> Result<Option<Session>, Error> {
+        let row = sqlx::query("SELECT * FROM sessions WHERE token_hash = ?")
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        row.as_ref().map(Self::session_from_row).transpose()
+    }
+
+    /// Sessions of a user, newest first.
+    pub async fn sessions_of(&self, user_id: &str) -> Result<Vec<Session>, Error> {
+        let rows = sqlx::query("SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at DESC")
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        rows.iter().map(Self::session_from_row).collect()
+    }
+
+    /// Revokes a session, committing a `session_revoked` event with it.
+    pub async fn revoke_session(&self, id: &str) -> Result<Option<Event>, Error> {
+        let mut tx = self.begin().await?;
+        let r =
+            sqlx::query("UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+                .bind(clock::now_secs())
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        let event = if r.rows_affected() == 1 {
+            Some(
+                Self::append_event(
+                    &mut tx,
+                    EventBody::SessionRevoked {
+                        session_id: id.into(),
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(event)
+    }
+
+    // Devices.
+
+    fn device_from_row(row: &sqlx::sqlite::SqliteRow, users: Vec<String>) -> Result<Device, Error> {
+        let status: String = row.try_get("status").map_err(db)?;
+        let platform: String = row.try_get("platform_json").map_err(db)?;
+        let trust_class: i64 = row.try_get("trust_class").map_err(db)?;
+        Ok(Device {
+            id: row.try_get("id").map_err(db)?,
+            public_key: row.try_get("public_key").map_err(db)?,
+            status: DeviceStatus::parse(&status),
+            trust_class: u8::try_from(trust_class).unwrap_or(1),
+            key_storage: row.try_get("key_storage").map_err(db)?,
+            platform: serde_json::from_str(&platform).unwrap_or_default(),
+            tunnel_v4: row.try_get("tunnel_v4").map_err(db)?,
+            tunnel_v6: row.try_get("tunnel_v6").map_err(db)?,
+            users,
+            created_at: row.try_get("created_at").map_err(db)?,
+        })
+    }
+
+    async fn device_users(&self, id: &str) -> Result<Vec<String>, Error> {
+        sqlx::query_scalar("SELECT user_id FROM device_users WHERE device_id = ? ORDER BY user_id")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)
+    }
+
+    /// A device by ID.
+    pub async fn device(&self, id: &str) -> Result<Option<Device>, Error> {
+        let row = sqlx::query("SELECT * FROM devices WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        match row {
+            Some(row) => {
+                let users = self.device_users(id).await?;
+                Ok(Some(Self::device_from_row(&row, users)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// A device by its key.
+    pub async fn device_by_key(&self, public_key: &str) -> Result<Option<Device>, Error> {
+        let id: Option<String> = sqlx::query_scalar("SELECT id FROM devices WHERE public_key = ?")
+            .bind(public_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        match id {
+            Some(id) => self.device(&id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Every device.
+    pub async fn devices(&self) -> Result<Vec<Device>, Error> {
+        let rows = sqlx::query("SELECT * FROM devices ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        let links: Vec<(String, String)> = sqlx::query_as(
+            "SELECT device_id, user_id FROM device_users ORDER BY device_id, user_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("id").map_err(db)?;
+                let users = links
+                    .iter()
+                    .filter(|(d, _)| *d == id)
+                    .map(|(_, u)| u.clone())
+                    .collect();
+                Self::device_from_row(row, users)
+            })
+            .collect()
+    }
+
+    /// Enrolls a device for a user, or binds an already enrolled key to
+    /// another user. Addresses are allocated from the pools with
+    /// `allocate`, given a fresh index.
+    pub async fn enroll_device(
+        &self,
+        user_id: &str,
+        public_key: &str,
+        status: DeviceStatus,
+        key_storage: &str,
+        platform: &Platform,
+        allocate: impl FnOnce(i64) -> Result<(String, String), Error>,
+    ) -> Result<(Device, bool), Error> {
+        let mut tx = self.begin().await?;
+        let now = clock::now_secs();
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT id FROM devices WHERE public_key = ?")
+                .bind(public_key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?;
+        let (id, created) = match existing {
+            Some(id) => (id, false),
+            None => {
+                let id = new_id("d")?;
+                let index = Self::next_counter(&mut tx, "device_address").await?;
+                let (v4, v6) = allocate(index)?;
+                let platform_json =
+                    serde_json::to_string(platform).map_err(|e| Error::Internal(e.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO devices (id, public_key, status, trust_class, key_storage, platform_json, address_index, tunnel_v4, tunnel_v6, created_at, updated_at) \
+                     VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&id)
+                .bind(public_key)
+                .bind(status.as_str())
+                .bind(key_storage)
+                .bind(platform_json)
+                .bind(index)
+                .bind(v4)
+                .bind(v6)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+                (id, true)
+            }
+        };
+        sqlx::query("INSERT INTO device_users (device_id, user_id, created_at) VALUES (?, ?, ?) ON CONFLICT (device_id, user_id) DO NOTHING")
+            .bind(&id)
+            .bind(user_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        let device = self
+            .device(&id)
+            .await?
+            .ok_or_else(|| Error::Internal("device vanished".into()))?;
+        Ok((device, created))
+    }
+
+    /// Moves a device to a new status. Disabling or revoking commits a
+    /// `device_disabled` event with it. A revoked device never changes
+    /// again. Returns whether the status changed and the event.
+    pub async fn set_device_status(
+        &self,
+        id: &str,
+        status: DeviceStatus,
+    ) -> Result<(bool, Option<Event>), Error> {
+        let mut tx = self.begin().await?;
+        let r = sqlx::query("UPDATE devices SET status = ?, updated_at = ? WHERE id = ? AND status <> ? AND status <> 'revoked'")
+            .bind(status.as_str())
+            .bind(clock::now_secs())
+            .bind(id)
+            .bind(status.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let changed = r.rows_affected() == 1;
+        let event = match status {
+            DeviceStatus::Disabled | DeviceStatus::Revoked if changed => Some(
+                Self::append_event(
+                    &mut tx,
+                    EventBody::DeviceDisabled {
+                        device_id: id.into(),
+                        revoked: status == DeviceStatus::Revoked,
+                    },
+                )
+                .await?,
+            ),
+            _ => None,
+        };
+        tx.commit().await.map_err(db)?;
+        Ok((changed, event))
+    }
+
+    // Certificates.
+
+    /// Records an issued certificate.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_certificate(
+        &self,
+        serial: &str,
+        kind: &str,
+        subject_id: &str,
+        user_id: Option<&str>,
+        session_id: Option<&str>,
+        not_before: i64,
+        not_after: i64,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO certificates (serial, kind, subject_id, user_id, session_id, not_before, not_after) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(serial)
+        .bind(kind)
+        .bind(subject_id)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(not_before)
+        .bind(not_after)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// Whether a certificate has been revoked.
+    pub async fn certificate_revoked(&self, serial: &str) -> Result<bool, Error> {
+        let revoked: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT revoked_at FROM certificates WHERE serial = ?")
+                .bind(serial)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?;
+        // An unknown serial was not issued by this control plane.
+        Ok(revoked.is_none_or(|r| r.is_some()))
+    }
+
+    /// Revokes a certificate, committing a `certificate_revoked` event with
+    /// it.
+    pub async fn revoke_certificate(&self, serial: &str) -> Result<Option<Event>, Error> {
+        let mut tx = self.begin().await?;
+        let not_after: Option<i64> = sqlx::query_scalar(
+            "UPDATE certificates SET revoked_at = ? WHERE serial = ? AND revoked_at IS NULL RETURNING not_after",
+        )
+        .bind(clock::now_secs())
+        .bind(serial)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let event = match not_after {
+            Some(not_after) => Some(
+                Self::append_event(
+                    &mut tx,
+                    EventBody::CertificateRevoked {
+                        serial: serial.into(),
+                        not_after,
+                    },
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(event)
+    }
+
+    // Nodes and join tokens.
+
+    /// Stores a join token's hash.
+    pub async fn insert_join_token(
+        &self,
+        token_hash: &str,
+        role: &str,
+        group: Option<&str>,
+        expires_at: i64,
+    ) -> Result<(), Error> {
+        sqlx::query("INSERT INTO join_tokens (token_hash, role, connector_group, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(token_hash)
+            .bind(role)
+            .bind(group)
+            .bind(clock::now_secs())
+            .bind(expires_at)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+
+    /// Spends a join token and creates the node it admits, atomically, so
+    /// a token admits exactly one node. Returns `None` if the token is
+    /// unknown, used or expired, and an error if the name is taken.
+    pub async fn join(&self, token_hash: &str, node: &Node) -> Result<Option<Node>, Error> {
+        let mut tx = self.begin().await?;
+        let now = clock::now_secs();
+        let scope: Option<(String, Option<String>)> = sqlx::query_as(
+            "UPDATE join_tokens SET used_at = ?, used_by = ? \
+             WHERE token_hash = ? AND used_at IS NULL AND expires_at > ? RETURNING role, connector_group",
+        )
+        .bind(now)
+        .bind(&node.id)
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let Some((role, group)) = scope else {
+            return Ok(None);
+        };
+        let taken: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM nodes WHERE role = ? AND name = ? AND revoked_at IS NULL",
+        )
+        .bind(&role)
+        .bind(&node.name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if taken.is_some() {
+            return Err(Error::Conflict(format!(
+                "a {role} named {} has already joined",
+                node.name
+            )));
+        }
+        // A revoked node's name may be reused by a new node.
+        sqlx::query("DELETE FROM nodes WHERE role = ? AND name = ? AND revoked_at IS NOT NULL")
+            .bind(&role)
+            .bind(&node.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let dns =
+            serde_json::to_string(&node.dns_names).map_err(|e| Error::Internal(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO nodes (id, role, connector_group, name, dns_names_json, public_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&node.id)
+        .bind(&role)
+        .bind(&group)
+        .bind(&node.name)
+        .bind(dns)
+        .bind(&node.public_key)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(Some(Node {
+            role,
+            group,
+            created_at: now,
+            ..node.clone()
+        }))
+    }
+
+    fn node_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Node, Error> {
+        let dns: String = row.try_get("dns_names_json").map_err(db)?;
+        Ok(Node {
+            id: row.try_get("id").map_err(db)?,
+            role: row.try_get("role").map_err(db)?,
+            group: row.try_get("connector_group").map_err(db)?,
+            name: row.try_get("name").map_err(db)?,
+            dns_names: serde_json::from_str(&dns).unwrap_or_default(),
+            public_key: row.try_get("public_key").map_err(db)?,
+            created_at: row.try_get("created_at").map_err(db)?,
+            revoked_at: row.try_get("revoked_at").map_err(db)?,
+        })
+    }
+
+    /// A node by ID.
+    pub async fn node(&self, id: &str) -> Result<Option<Node>, Error> {
+        let row = sqlx::query("SELECT * FROM nodes WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        row.as_ref().map(Self::node_from_row).transpose()
+    }
+
+    /// Every node.
+    pub async fn nodes(&self) -> Result<Vec<Node>, Error> {
+        let rows = sqlx::query("SELECT * FROM nodes ORDER BY role, name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        rows.iter().map(Self::node_from_row).collect()
+    }
+
+    /// Revokes a node, committing a `node_revoked` event with it.
+    pub async fn revoke_node(&self, id: &str) -> Result<Option<Event>, Error> {
+        let mut tx = self.begin().await?;
+        let r = sqlx::query("UPDATE nodes SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+            .bind(clock::now_secs())
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let event = if r.rows_affected() == 1 {
+            Some(Self::append_event(&mut tx, EventBody::NodeRevoked { node_id: id.into() }).await?)
+        } else {
+            None
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(event)
+    }
+
+    // Revocation state and bundles.
+
+    /// The full revocation state: disabled users, disabled or revoked
+    /// devices, revoked unexpired sessions and certificates, revoked nodes.
+    pub async fn revocations(&self) -> Result<Revocations, Error> {
+        let now = clock::now_secs();
+        let users = sqlx::query_scalar("SELECT id FROM users WHERE disabled = TRUE ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        let devices = sqlx::query_scalar(
+            "SELECT id FROM devices WHERE status IN ('disabled', 'revoked') ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let sessions = sqlx::query_scalar(
+            "SELECT id FROM sessions WHERE revoked_at IS NOT NULL AND expires_at > ? ORDER BY id",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let certificates: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT serial, not_after FROM certificates WHERE revoked_at IS NOT NULL AND not_after > ? ORDER BY serial",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let nodes =
+            sqlx::query_scalar("SELECT id FROM nodes WHERE revoked_at IS NOT NULL ORDER BY id")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db)?;
+        Ok(Revocations {
+            users,
+            devices,
+            sessions,
+            certificates: certificates
+                .into_iter()
+                .map(|(serial, not_after)| RevokedCertificate { serial, not_after })
+                .collect(),
+            nodes,
+        })
+    }
+
+    /// Takes the next bundle version.
+    pub async fn next_bundle_version(&self) -> Result<u64, Error> {
+        let mut tx = self.begin().await?;
+        let v = Self::next_counter(&mut tx, "bundle_version").await?;
+        tx.commit().await.map_err(db)?;
+        Ok(v as u64)
+    }
+
+    /// Stores a signed bundle and commits its `bundle_updated` event, then
+    /// prunes all but the latest few versions.
+    pub async fn insert_bundle(&self, b: &StoredBundle) -> Result<Event, Error> {
+        let mut tx = self.begin().await?;
+        sqlx::query("INSERT INTO bundles (version, digest, connector_jws, relay_jws, created_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(b.version as i64)
+            .bind(&b.digest)
+            .bind(&b.connector_jws)
+            .bind(&b.relay_jws)
+            .bind(clock::now_secs())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let event = Self::append_event(
+            &mut tx,
+            EventBody::BundleUpdated {
+                version: b.version,
+                digest: b.digest.clone(),
+            },
+        )
+        .await?;
+        sqlx::query("DELETE FROM bundles WHERE version < ?")
+            .bind(b.version as i64 - 4)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(event)
+    }
+
+    /// The latest signed bundle.
+    pub async fn latest_bundle(&self) -> Result<Option<StoredBundle>, Error> {
+        let row: Option<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT version, digest, connector_jws, relay_jws FROM bundles ORDER BY version DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(
+            row.map(|(version, digest, connector_jws, relay_jws)| StoredBundle {
+                version: version as u64,
+                digest,
+                connector_jws,
+                relay_jws,
+            }),
+        )
+    }
+
+    /// Closes the pool.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+}
+
+impl FromStr for DeviceStatus {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" | "approved" | "disabled" | "revoked" => Ok(DeviceStatus::parse(s)),
+            other => Err(Error::BadRequest(format!("unknown device status {other}"))),
+        }
+    }
+}
