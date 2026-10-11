@@ -223,6 +223,8 @@ pub struct Options {
     pub connector_transport: TransportMode,
     /// Connector transport tuning (link B).
     pub connector_tuning: TransportTuning,
+    /// How many relays (the connector attaches to all of them).
+    pub relays: usize,
 }
 
 impl Default for Options {
@@ -232,6 +234,7 @@ impl Default for Options {
             bundle: test_bundle(1),
             connector_transport: TransportMode::QuicOnly,
             connector_tuning: TransportTuning::default(),
+            relays: 1,
         }
     }
 }
@@ -243,8 +246,8 @@ pub struct Deployment {
     pub pki: TestPki,
     /// The trust bundle.
     pub trust: Arc<TrustBundle>,
-    /// The relay.
-    pub relay: Relay,
+    /// The relays.
+    pub relays: Vec<Relay>,
     /// The connector.
     pub connector: Connector,
     /// The test backend.
@@ -262,21 +265,25 @@ impl Deployment {
         let pki = TestPki::new(TRUST_DOMAIN);
         let trust = Arc::new(pki.bundle());
         let state = NodeState::new(compile(&opts.bundle));
-        let relay = Relay::start(RelayConfig {
-            listen_quic: "127.0.0.1:0".parse().expect("valid"),
-            listen_tcp: opts
-                .relay_tcp
-                .then(|| "127.0.0.1:0".parse().expect("valid")),
-            credentials: pki.relay("r1", &[RELAY_NAME]),
-            trust: trust.clone(),
-            state: state.clone(),
-            name: "warren-relay-r1".into(),
-            peer_prefix: None,
-            max_splices_per_client: 64,
-            tuning: TransportTuning::default(),
-        })
-        .await
-        .expect("relay starts");
+        let mut relays = Vec::new();
+        for i in 0..opts.relays.max(1) {
+            let relay = Relay::start(RelayConfig {
+                listen_quic: "127.0.0.1:0".parse().expect("valid"),
+                listen_tcp: opts
+                    .relay_tcp
+                    .then(|| "127.0.0.1:0".parse().expect("valid")),
+                credentials: pki.relay(&format!("r{i}"), &[RELAY_NAME]),
+                trust: trust.clone(),
+                state: state.clone(),
+                name: format!("warren-relay-r{i}"),
+                peer_prefix: None,
+                max_splices_per_client: 64,
+                tuning: TransportTuning::default(),
+            })
+            .await
+            .expect("relay starts");
+            relays.push(relay);
+        }
         let echo = udp_echo().await;
         let targets: HashMap<SocketAddr, SocketAddr> = [
             ("10.77.0.10:7".parse().expect("valid"), echo),
@@ -312,7 +319,7 @@ impl Deployment {
         let connector = Connector::start(
             ConnectorConfig {
                 group: GROUP.into(),
-                relays: vec![relay_address(&relay)],
+                relays: relays.iter().map(relay_address).collect(),
                 transport: opts.connector_transport,
                 credentials: pki.connector(GROUP, "c1"),
                 trust: trust.clone(),
@@ -330,7 +337,7 @@ impl Deployment {
         )
         .expect("connector starts");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while relay.metrics().attachments.get() == 0 {
+        while relays.iter().any(|r| r.metrics().attachments.get() == 0) {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "connector never attached"
@@ -340,7 +347,7 @@ impl Deployment {
         Deployment {
             pki,
             trust,
-            relay,
+            relays,
             connector,
             backend,
             audit: records,
@@ -352,7 +359,7 @@ impl Deployment {
     pub fn client(&self, cert: &ClientCert, transport: TransportMode) -> ClientConfig {
         ClientConfig {
             group: GROUP.into(),
-            relays: vec![relay_address(&self.relay)],
+            relays: self.relays.iter().map(relay_address).collect(),
             transport,
             credentials: self.pki.client(cert),
             trust: self.trust.clone(),
@@ -360,6 +367,11 @@ impl Deployment {
             fallback_delay: params::FALLBACK_DELAY,
             tuning: TransportTuning::default(),
         }
+    }
+
+    /// The first relay.
+    pub fn relay(&self) -> &Relay {
+        &self.relays[0]
     }
 
     /// Audit records written so far.

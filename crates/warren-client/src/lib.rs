@@ -77,6 +77,8 @@ pub enum ConnectError {
     Session(String),
     /// The client's own credentials are unusable.
     Credentials(String),
+    /// The relay rejected this device's certificate as revoked or expired.
+    Rejected(String),
 }
 
 impl std::fmt::Display for ConnectError {
@@ -89,6 +91,7 @@ impl std::fmt::Display for ConnectError {
             }
             ConnectError::Session(m) => write!(f, "connector session failed: {m}"),
             ConnectError::Credentials(m) => write!(f, "credentials: {m}"),
+            ConnectError::Rejected(m) => write!(f, "access revoked or certificate expired: {m}"),
         }
     }
 }
@@ -121,6 +124,9 @@ pub struct BindRejected {
     /// Human-readable message.
     pub message: String,
 }
+
+/// Name binds waiting for the connector's answer.
+type PendingBinds = Arc<Mutex<HashMap<IpAddr, oneshot::Sender<Result<(), BindRejected>>>>>;
 
 /// Facts about the established tunnel.
 #[derive(Debug, Clone)]
@@ -181,12 +187,12 @@ pub struct Tunnel {
     packets: mpsc::Receiver<Bytes>,
     local: mpsc::Sender<Bytes>,
     events: Option<mpsc::Receiver<ClientEvent>>,
-    binds: Arc<Mutex<HashMap<IpAddr, oneshot::Sender<Result<(), BindRejected>>>>>,
+    binds: PendingBinds,
     inner: quinn::Connection,
     outer: Arc<OuterPath>,
     carrier: watch::Receiver<Option<CarrierKind>>,
     _endpoint: quinn::Endpoint,
-    shutdown: watch::Sender<bool>,
+    shutdown: Arc<watch::Sender<bool>>,
 }
 
 impl Tunnel {
@@ -359,6 +365,8 @@ struct Outer {
     rx: warren_masque::tunnel::TunnelReceiver,
     conn: OuterConn,
     relay: String,
+    /// Position in the relay list, so a re-dial starts with the next one.
+    index: usize,
 }
 
 async fn dial_outer(
@@ -366,10 +374,15 @@ async fn dial_outer(
     endpoint: &quinn::Endpoint,
     quic_config: &quinn::ClientConfig,
     h2_tls: &Arc<rustls::ClientConfig>,
+    first: usize,
 ) -> Result<Outer, ConnectError> {
     let mut errors = Vec::new();
     let mut refusal = None;
-    for relay in &config.relays {
+    let mut rejected = false;
+    let n = config.relays.len();
+    for i in 0..n {
+        let index = (first + i) % n;
+        let relay = &config.relays[index];
         let conn = match carrier::dial(
             config.transport,
             endpoint,
@@ -382,6 +395,7 @@ async fn dial_outer(
         {
             Ok(c) => c,
             Err(e) => {
+                rejected |= e.credentials_rejected;
                 errors.push(e.to_string());
                 continue;
             }
@@ -397,6 +411,7 @@ async fn dial_outer(
                     rx,
                     conn,
                     relay: relay.name.clone(),
+                    index,
                 });
             }
             Err(OpenError::Refused(r)) => {
@@ -410,6 +425,9 @@ async fn dial_outer(
                 errors.push(e.to_string());
             }
         }
+    }
+    if rejected {
+        return Err(ConnectError::Rejected(errors.join("; ")));
     }
     Err(refusal.unwrap_or_else(|| ConnectError::Unreachable(errors.join("; "))))
 }
@@ -457,7 +475,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
             .ok_or_else(|| ConnectError::Unreachable("no async runtime".into()))?,
     )
     .map_err(|e| ConnectError::Unreachable(e.to_string()))?;
-    let outer = dial_outer(&config, &outer_endpoint, &outer_quic, &h2_tls).await?;
+    let outer = dial_outer(&config, &outer_endpoint, &outer_quic, &h2_tls, 0).await?;
     info!(relay = %outer.relay, carrier = ?outer.conn.carrier(), "spliced through relay");
 
     // Inner session over the outer stream.
@@ -472,6 +490,8 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
     let connector_addr: SocketAddr = CONNECTOR_VIRTUAL.parse().expect("valid");
     let (carrier_tx, carrier_rx) = watch::channel(Some(outer.conn.carrier()));
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let shutdown = Arc::new(shutdown);
+    let inner_slot: Arc<Mutex<Option<quinn::Connection>>> = Arc::default();
     let (events_tx, events_rx) = mpsc::channel(256);
     tokio::spawn(supervise_outer(
         config.clone(),
@@ -485,6 +505,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
         carrier_tx,
         events_tx.clone(),
         shutdown_rx,
+        inner_slot.clone(),
     ));
 
     let inner_verifier = Arc::new(WarrenServerVerifier::new(
@@ -503,6 +524,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
         .map_err(|e| ConnectError::Session(e.to_string()))?
         .await
         .map_err(|e| ConnectError::Session(format!("handshake with the connector: {e}")))?;
+    *inner_slot.lock().expect("inner lock") = Some(inner.clone());
     let h3 = H3Connection::new(inner.clone(), false)
         .await
         .map_err(|e| ConnectError::Session(e.to_string()))?;
@@ -578,12 +600,13 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
     }
 
     let (packets_tx, packets) = mpsc::channel(4096);
-    let binds: Arc<Mutex<HashMap<IpAddr, oneshot::Sender<Result<(), BindRejected>>>>> =
-        Arc::default();
+    let binds: PendingBinds = Arc::default();
     {
         let binds = binds.clone();
         let packets_tx = packets_tx.clone();
         let events_tx = events_tx.clone();
+        let shutdown = shutdown.clone();
+        let inner = inner.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -622,6 +645,9 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
                 .clone()
                 .unwrap_or_else(|| "closed".into());
             let _ = events_tx.try_send(ClientEvent::Closed(reason));
+            // The session is over: close it and drop the outer path too.
+            inner.close(quinn::VarInt::from_u32(0x100), b"session ended");
+            let _ = shutdown.send(true);
         });
     }
 
@@ -660,7 +686,15 @@ async fn supervise_outer(
     carrier: watch::Sender<Option<CarrierKind>>,
     events: mpsc::Sender<ClientEvent>,
     mut shutdown: watch::Receiver<bool>,
+    inner: Arc<Mutex<Option<quinn::Connection>>>,
 ) {
+    let end = |why: String| {
+        info!(reason = %why, "tunnel ended");
+        if let Some(c) = inner.lock().expect("inner lock").take() {
+            c.close(quinn::VarInt::from_u32(0x10b), why.as_bytes());
+        }
+        let _ = events.try_send(ClientEvent::Closed(why));
+    };
     loop {
         loop {
             tokio::select! {
@@ -680,6 +714,18 @@ async fn supervise_outer(
             }
         }
         debug!(relay = %outer.relay, "outer path lost");
+        // A relay that cut us for revocation or expiry will not take us
+        // back with the same certificate.
+        if let OuterConn::H3(h3) = &outer.conn
+            && let Some(quinn::ConnectionError::ApplicationClosed(close)) = h3.quic().close_reason()
+            && matches!(&close.reason[..], b"revoked" | b"certificate expired")
+        {
+            end(format!(
+                "the relay closed the connection: {}",
+                String::from_utf8_lossy(&close.reason)
+            ));
+            return;
+        }
         outer.conn.close("path lost");
         *path.tx.write().expect("path lock") = None;
         carrier.send_replace(None);
@@ -688,8 +734,15 @@ async fn supervise_outer(
             if *shutdown.borrow() {
                 return;
             }
-            match dial_outer(&config, &endpoint, &quic_config, &h2_tls).await {
+            // Start with the next relay: the one that just failed is the
+            // least likely to work.
+            let next = (outer.index + 1) % config.relays.len().max(1);
+            match dial_outer(&config, &endpoint, &quic_config, &h2_tls, next).await {
                 Ok(o) => break o,
+                Err(ConnectError::Rejected(e)) => {
+                    end(format!("access revoked or certificate expired: {e}"));
+                    return;
+                }
                 Err(e) => {
                     warn!(error = %e, "re-dial failed");
                     tokio::select! {

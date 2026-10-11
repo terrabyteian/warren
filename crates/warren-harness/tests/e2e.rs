@@ -205,3 +205,343 @@ async fn names_bind_to_their_owning_app_and_translate() {
     let _ = recv(&mut t).await;
     assert_eq!(next_denial(&mut events).await.reason, "out_of_scope");
 }
+
+async fn echo_ok(t: &mut warren_client::Tunnel, port: u16, payload: &[u8]) {
+    let src = SocketAddr::new(v4(t), port);
+    let dst: SocketAddr = "10.77.0.10:7".parse().unwrap();
+    t.send(&packet::udp(src, dst, payload));
+    let reply = recv(t).await;
+    let p = packet::parse(&reply).unwrap();
+    assert_eq!(p.src_sock(), dst);
+    assert_eq!(packet::udp_payload(&reply, &p).unwrap(), payload);
+}
+
+/// A UDP address that swallows everything, like a network blocking UDP 443.
+fn udp_blackhole() -> SocketAddr {
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = s.local_addr().unwrap();
+    std::mem::forget(s);
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http2_fallback_when_udp_is_blocked() {
+    let d = Deployment::start(Options::default()).await;
+    let mut config = d.client(&alice(), TransportMode::Auto);
+    config.relays[0].quic = udp_blackhole();
+    config.fallback_delay = Duration::from_millis(100);
+    let started = std::time::Instant::now();
+    let mut t = warren_client::connect(config)
+        .await
+        .expect("falls back to HTTP/2");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "fallback took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        t.stats().carrier,
+        Some(warren_masque::tunnel::CarrierKind::Http2)
+    );
+    echo_ok(&mut t, 41_000, b"over TCP 443").await;
+    // A 1280-byte packet crosses the HTTP/2 hop and the QUIC hop.
+    let src = SocketAddr::new(v4(&t), 41_001);
+    let big = packet::udp(src, "10.77.0.10:7".parse().unwrap(), &[0x5a; 1252]);
+    assert_eq!(big.len(), 1280);
+    t.send(&big);
+    assert_eq!(recv(&mut t).await.len(), 1280);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connectors_attach_over_http2_too() {
+    let d = Deployment::start(Options {
+        connector_transport: TransportMode::Http2Only,
+        ..Options::default()
+    })
+    .await;
+    // A QUIC client spliced to an HTTP/2-attached connector.
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    echo_ok(&mut t, 41_100, b"mixed carriers").await;
+    // And an HTTP/2 client to the same connector.
+    let mut t2 = warren_client::connect(d.client(&alice(), TransportMode::Http2Only))
+        .await
+        .unwrap();
+    echo_ok(&mut t2, 41_101, b"both on TCP").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mtu_floor_is_enforced_and_always_delivered() {
+    let d = Deployment::start(Options {
+        connector_tuning: warren_core::quic::TransportTuning {
+            fixed_outer_mtu: Some(1200),
+        },
+        ..Options::default()
+    })
+    .await;
+
+    // A tunnel MTU below the floor is refused outright.
+    let mut low = d.client(&alice(), TransportMode::QuicOnly);
+    low.tunnel_mtu = 1200;
+    match warren_client::connect(low).await {
+        Err(warren_client::ConnectError::MtuFloor(_)) => {}
+        other => panic!("expected an MTU floor error, got {other:?}"),
+    }
+
+    // Both outer hops pinned to QUIC's 1200-byte minimum: full-size inner
+    // packets cannot ride in DATAGRAM frames, yet 1280-byte IP packets
+    // still arrive, carried on the streams instead.
+    let mut config = d.client(&alice(), TransportMode::QuicOnly);
+    config.tuning.fixed_outer_mtu = Some(1200);
+    let mut t = warren_client::connect(config)
+        .await
+        .expect("tunnel on a constrained path");
+    let src = SocketAddr::new(v4(&t), 42_000);
+    let dst: SocketAddr = "10.77.0.10:7".parse().unwrap();
+    let floor = packet::udp(src, dst, &[0xa5; 1252]);
+    assert_eq!(floor.len(), 1280);
+    t.send(&floor);
+    let reply = recv(&mut t).await;
+    assert_eq!(reply.len(), 1280);
+    assert!(t.stats().constrained(), "{:?}", t.stats());
+
+    // Bigger than the tunnel MTU: answered at the client ingress.
+    let over = packet::udp(src, dst, &[1; 1400]);
+    t.send(&over);
+    let icmp = packet::parse(&recv(&mut t).await).unwrap();
+    assert_eq!(icmp.icmp, Some((3, 4)), "fragmentation needed");
+    let over6 = packet::udp(
+        SocketAddr::new(v6(&t), 42_001),
+        "[fd77:7761::10]:7".parse().unwrap(),
+        &[1; 1400],
+    );
+    t.send(&over6);
+    let icmp6 = packet::parse(&recv(&mut t).await).unwrap();
+    assert_eq!(icmp6.icmp, Some((2, 0)), "packet too big");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spoofed_sources_are_dropped() {
+    let d = Deployment::start(Options::default()).await;
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let before = d.connector.metrics().dropped.get();
+    let spoofed: SocketAddr = "100.96.0.77:5000".parse().unwrap();
+    t.send(&packet::udp(
+        spoofed,
+        "10.77.0.10:7".parse().unwrap(),
+        b"not me",
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(d.connector.metrics().dropped.get() > before);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), t.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_initiated_flows_need_an_opt_in() {
+    let d = Deployment::start(Options::default()).await;
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let device = SocketAddr::new(v4(&t), 5555);
+    // "secret" did not opt in.
+    d.backend.inject(packet::udp(
+        "10.77.0.20:9999".parse().unwrap(),
+        device,
+        b"knock",
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), t.recv())
+            .await
+            .is_err()
+    );
+    let refusal = d
+        .backend
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| packet::parse(s).ok())
+        .any(|p| p.icmp == Some((3, 13)) && p.dst == "10.77.0.20".parse::<IpAddr>().unwrap());
+    assert!(refusal, "the server was told no");
+    // "pusher" opted in, and alice may reach it.
+    d.backend.inject(packet::udp(
+        "10.77.0.40:9999".parse().unwrap(),
+        device,
+        b"notify",
+    ));
+    let got = recv(&mut t).await;
+    assert_eq!(
+        packet::parse(&got).unwrap().src_sock(),
+        "10.77.0.40:9999".parse().unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let records = d.audit_records();
+    let r = find_record(&records, |r| r["status_code"] == "server_initiated_blocked");
+    assert_eq!(r["connection_info"]["direction"], "Inbound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn devices_must_be_approved() {
+    let d = Deployment::start(Options::default()).await;
+    let cert = warren_harness::pki::ClientCert::new(
+        "alice",
+        "unapproved-mac",
+        "100.96.0.9",
+        "fd00:7761:7272:6e00::9",
+    );
+    let mut t = warren_client::connect(d.client(&cert, TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut events = t.events();
+    t.send(&packet::udp(
+        SocketAddr::new(v4(&t), 1),
+        "10.77.0.10:7".parse().unwrap(),
+        b"x",
+    ));
+    let _ = recv(&mut t).await;
+    assert_eq!(next_denial(&mut events).await.reason, "device_not_approved");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_groups_are_refused_with_a_reason() {
+    let d = Deployment::start(Options::default()).await;
+    let mut config = d.client(&alice(), TransportMode::QuicOnly);
+    config.group = "nowhere".into();
+    match warren_client::connect(config).await {
+        Err(warren_client::ConnectError::Refused { error, details }) => {
+            assert_eq!(error, "destination_unavailable");
+            assert!(details.contains("nowhere"), "{details}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connector_revocation_cuts_the_session_with_a_notice() {
+    let d = Deployment::start(Options::default()).await;
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut events = t.events();
+    echo_ok(&mut t, 43_000, b"before").await;
+    let mut v2 = warren_harness::deploy::test_bundle(2);
+    v2["revoked"] = serde_json::json!({ "devices": ["mac-1"] });
+    let started = std::time::Instant::now();
+    d.connector
+        .reload(warren_harness::deploy::compile(&v2))
+        .unwrap();
+    let mut saw_notice = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Some(warren_client::ClientEvent::Notice(n))) => {
+                assert_eq!(n.reason, "revoked");
+                saw_notice = true;
+            }
+            Ok(Some(warren_client::ClientEvent::Closed(_))) => break,
+            Ok(Some(_)) => {}
+            other => panic!("session not cut: {other:?}"),
+        }
+    }
+    assert!(saw_notice, "the connector explained the cut");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "cut within the revocation deadline"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let records = d.audit_records();
+    let flow = find_record(&records, |r| r["metadata"]["log_name"] == "flow");
+    assert_eq!(flow["unmapped"]["warren"]["end_reason"], "revoked");
+    assert!(flow["traffic"]["packets"].as_u64().unwrap() >= 2);
+    // Older bundles are refused.
+    assert!(
+        d.connector
+            .reload(warren_harness::deploy::compile(
+                &warren_harness::deploy::test_bundle(1)
+            ))
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_revocation_cuts_the_outer_connection_for_good() {
+    let d = Deployment::start(Options::default()).await;
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut events = t.events();
+    echo_ok(&mut t, 43_100, b"before").await;
+    let mut v2 = warren_harness::deploy::test_bundle(2);
+    v2["revoked"] = serde_json::json!({ "users": ["alice"] });
+    let cut = d
+        .relay()
+        .reload(warren_harness::deploy::compile(&v2))
+        .unwrap();
+    assert_eq!(cut, 1, "the relay closed the client's outer connection");
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Some(warren_client::ClientEvent::Closed(reason))) => {
+                assert!(reason.contains("revoked"), "{reason}");
+                break;
+            }
+            Ok(Some(_)) => {}
+            other => panic!("client kept retrying: {other:?}"),
+        }
+    }
+    // A new connection is refused during the handshake.
+    match warren_client::connect(d.client(&alice(), TransportMode::Auto)).await {
+        Err(warren_client::ConnectError::Rejected(_)) => {}
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn losing_a_relay_migrates_the_inner_session() {
+    let d = Deployment::start(Options {
+        relays: 2,
+        ..Options::default()
+    })
+    .await;
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut events = t.events();
+    echo_ok(&mut t, 44_000, b"via the first relay").await;
+    d.relays[0].shutdown();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), events.recv()).await {
+            Ok(Some(warren_client::ClientEvent::PathChanged { .. })) => break,
+            Ok(Some(warren_client::ClientEvent::Closed(r))) => panic!("session closed: {r}"),
+            Ok(Some(_)) => {}
+            other => panic!("no path change: {other:?}"),
+        }
+    }
+    // Same inner session, same flow, new path.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let src = SocketAddr::new(v4(&t), 44_000);
+        t.send(&packet::udp(src, "10.77.0.10:7".parse().unwrap(), b"after"));
+        match tokio::time::timeout(Duration::from_millis(500), t.recv()).await {
+            Ok(Some(reply)) => {
+                let p = packet::parse(&reply).unwrap();
+                assert_eq!(packet::udp_payload(&reply, &p).unwrap(), b"after");
+                break;
+            }
+            _ => assert!(
+                std::time::Instant::now() < deadline,
+                "no traffic after migration"
+            ),
+        }
+    }
+    assert_eq!(
+        d.connector.metrics().sessions_total.get(),
+        1,
+        "the inner session was not re-established"
+    );
+}

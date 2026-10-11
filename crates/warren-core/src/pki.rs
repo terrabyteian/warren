@@ -195,6 +195,19 @@ pub struct Extension<'a> {
     pub value: &'a [u8],
 }
 
+/// The names in a subjectAltName extension.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AltNames {
+    /// URIs.
+    pub uris: Vec<String>,
+    /// DNS names.
+    pub dns: Vec<String>,
+    /// IP addresses.
+    pub ips: Vec<IpAddr>,
+    /// Whether the extension was critical.
+    pub critical: bool,
+}
+
 /// The fields of a certificate warren's profiles look at.
 #[derive(Debug, Clone)]
 pub struct ParsedCert<'a> {
@@ -316,10 +329,8 @@ impl ParsedCert<'_> {
         self.extensions.iter().find(|e| e.oid == oid)
     }
 
-    /// URIs and DNS names in the SAN, and whether it was critical.
-    pub fn subject_alt_names(
-        &self,
-    ) -> Result<(Vec<String>, Vec<String>, Vec<IpAddr>, bool), CertError> {
+    /// The names in the subjectAltName extension.
+    pub fn subject_alt_names(&self) -> Result<AltNames, CertError> {
         let Some(ext) = self.extension(oid::SAN) else {
             return profile("missing subjectAltName");
         };
@@ -349,7 +360,12 @@ impl ParsedCert<'_> {
                 _ => return profile("unsupported subjectAltName type"),
             }
         }
-        Ok((uris, dns, ips, ext.critical))
+        Ok(AltNames {
+            uris,
+            dns,
+            ips,
+            critical: ext.critical,
+        })
     }
 
     /// The extended key usage OIDs.
@@ -473,7 +489,12 @@ pub fn check_client_profile(leaf: &[u8], trust_domain: &str) -> Result<ClientIde
     if lifetime <= 0 || lifetime > max {
         return profile("validity exceeds the 4-hour lifetime plus clock skew");
     }
-    let (uris, dns, ips, critical) = c.subject_alt_names()?;
+    let AltNames {
+        uris,
+        dns,
+        ips,
+        critical,
+    } = c.subject_alt_names()?;
     if !critical {
         return profile("subjectAltName must be critical");
     }
@@ -546,7 +567,7 @@ pub fn check_infra_profile(leaf: &[u8], trust_domain: &str) -> Result<NodeIdenti
     if c.is_ca()? == Some(true) {
         return profile("a CA certificate cannot identify a node");
     }
-    let (uris, dns, _ips, _) = c.subject_alt_names()?;
+    let AltNames { uris, dns, .. } = c.subject_alt_names()?;
     let mut node = None;
     for u in &uris {
         match WarrenUri::parse(u) {

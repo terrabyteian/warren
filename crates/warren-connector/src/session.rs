@@ -96,6 +96,15 @@ struct Binding {
 
 type FlowKey = (u8, SocketAddr, SocketAddr);
 
+/// What a decision record is about, beyond the packet.
+#[derive(Debug, Clone, Copy)]
+struct About<'a> {
+    app: Option<&'a str>,
+    hostname: Option<&'a str>,
+    translated: Option<SocketAddr>,
+    server_initiated: bool,
+}
+
 #[derive(Debug)]
 struct Flow {
     id: String,
@@ -218,6 +227,11 @@ pub(crate) async fn run(
     }
     s.shared.metrics.sessions.dec();
     info!(user = %s.client.user, device = %s.client.device, session = s.id, reason = end, "inner session ended");
+    if matches!(end, "revoked" | "certificate expired") {
+        // Give the notice a moment to reach the client before the close
+        // discards anything still in flight.
+        let _ = tokio::time::timeout(Duration::from_millis(250), s.conn.closed()).await;
+    }
     s.conn.close(quinn::VarInt::from_u32(0x100), end.as_bytes());
 }
 
@@ -831,16 +845,13 @@ impl Session {
         })
     }
 
-    fn record(
-        &self,
-        id: &str,
-        p: &Parsed,
-        app: Option<&str>,
-        hostname: Option<&str>,
-        translated: Option<SocketAddr>,
-        d: &Decision,
-        server_initiated: bool,
-    ) {
+    fn record(&self, id: &str, p: &Parsed, about: About<'_>, d: &Decision) {
+        let About {
+            app,
+            hostname,
+            translated,
+            server_initiated,
+        } = about;
         self.shared.config.audit.decision(&DecisionRecord {
             id,
             subject: self.subject(),
@@ -901,11 +912,13 @@ impl Session {
         self.record(
             &id,
             p,
-            Some(&app),
-            hostname.as_deref(),
-            translated,
+            About {
+                app: Some(&app),
+                hostname: hostname.as_deref(),
+                translated,
+                server_initiated: false,
+            },
             d,
-            false,
         );
         self.shared.metrics.flows_allowed.inc();
         self.shared.metrics.flows.inc();
@@ -949,11 +962,13 @@ impl Session {
         self.record(
             &id,
             p,
-            app.map(|a| a.name.as_str()),
-            hostname,
-            translated,
+            About {
+                app: app.map(|a| a.name.as_str()),
+                hostname,
+                translated,
+                server_initiated: false,
+            },
             d,
-            false,
         );
         self.shared.metrics.flows_denied.inc();
         // Fail fast: a reset for TCP, administratively prohibited for the
@@ -988,7 +1003,7 @@ impl Session {
         if p.fragment.is_some_and(|(_, first)| !first) {
             // Return fragments: the kernel reassembles before NAT, so these
             // only arrive for flows it already matched.
-            self.to_client(buf, &p);
+            self.deliver(buf, &p);
             return;
         }
         if p.is_icmp_error() {
@@ -1010,7 +1025,7 @@ impl Session {
             let Ok(p2) = packet::parse(&buf) else { return };
             let mtu = self.shared.config.tunnel_mtu;
             packet::clamp_mss(&mut buf, &p2, packet::mss_for(mtu, p2.src.is_ipv4()));
-            self.to_client(buf, &p2);
+            self.deliver(buf, &p2);
             return;
         }
         self.server_initiated(buf, &p);
@@ -1031,13 +1046,13 @@ impl Session {
             return;
         }
         if let Ok(p2) = packet::parse(&buf) {
-            self.to_client(buf, &p2);
+            self.deliver(buf, &p2);
         }
     }
 
     /// Sends a packet to the client, answering oversized ones at this
     /// ingress (docs/protocol.md section 9).
-    fn to_client(&mut self, buf: Vec<u8>, p: &Parsed) {
+    fn deliver(&mut self, buf: Vec<u8>, p: &Parsed) {
         let mtu = self.shared.config.tunnel_mtu;
         if p.len > usize::from(mtu) {
             if let Some(frags) = packet::fragment_v4(&buf, p, mtu) {
@@ -1082,11 +1097,13 @@ impl Session {
         self.record(
             &id,
             p,
-            app.as_ref().map(|a| a.name.as_str()),
-            None,
-            None,
+            About {
+                app: app.as_ref().map(|a| a.name.as_str()),
+                hostname: None,
+                translated: None,
+                server_initiated: true,
+            },
             &d,
-            true,
         );
         if !d.allowed {
             self.shared.metrics.flows_denied.inc();
@@ -1123,7 +1140,7 @@ impl Session {
             },
         );
         self.by_client.insert(fk, fk);
-        self.to_client(buf, p);
+        self.deliver(buf, p);
     }
 
     // ----- lifecycle -----

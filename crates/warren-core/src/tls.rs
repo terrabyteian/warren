@@ -150,10 +150,12 @@ pub fn verify_client(
     if !accept.nodes.is_empty() {
         bundle.verify_chain(leaf, Issuer::Infrastructure, false, now)?;
         let id = pki::check_infra_profile(leaf, &bundle.trust_domain)?;
-        let allowed = accept.nodes.iter().any(|m| match (m, &id.role) {
-            (NodeRoleMatch::AnyConnector, NodeRole::Connector { .. }) => true,
-            (NodeRoleMatch::ControlPlane, NodeRole::ControlPlane) => true,
-            _ => false,
+        let allowed = accept.nodes.iter().any(|m| {
+            matches!(
+                (m, &id.role),
+                (NodeRoleMatch::AnyConnector, NodeRole::Connector { .. })
+                    | (NodeRoleMatch::ControlPlane, NodeRole::ControlPlane)
+            )
         });
         if !allowed {
             return Err(CertError::Profile(format!(

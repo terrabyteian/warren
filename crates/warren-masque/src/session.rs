@@ -169,15 +169,57 @@ pub enum TransportMode {
 
 /// A dial error.
 #[derive(Debug)]
-pub struct DialError(pub String);
+pub struct DialError {
+    /// What went wrong.
+    pub message: String,
+    /// The relay rejected this client's certificate as revoked or expired:
+    /// retrying with the same credentials cannot succeed.
+    pub credentials_rejected: bool,
+}
 
-impl std::fmt::Display for DialError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+impl DialError {
+    fn new(message: impl Into<String>) -> DialError {
+        DialError {
+            message: message.into(),
+            credentials_rejected: false,
+        }
     }
 }
 
+impl std::fmt::Display for DialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// TLS alerts that mean the peer rejected our certificate for good.
+const ALERT_CERTIFICATE_REVOKED: u8 = 0x2c;
+const ALERT_CERTIFICATE_EXPIRED: u8 = 0x2d;
+
+fn quic_rejected(e: &quinn::ConnectionError) -> bool {
+    match e {
+        quinn::ConnectionError::ConnectionClosed(c) => {
+            c.error_code == quinn::TransportErrorCode::crypto(ALERT_CERTIFICATE_REVOKED)
+                || c.error_code == quinn::TransportErrorCode::crypto(ALERT_CERTIFICATE_EXPIRED)
+        }
+        _ => false,
+    }
+}
+
+fn tls_rejected(e: &std::io::Error) -> bool {
+    matches!(
+        e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::CertificateRevoked
+                | rustls::AlertDescription::CertificateExpired
+        ))
+    )
+}
+
 impl std::error::Error for DialError {}
+
+/// How long a QUIC handshake may take before the dial gives up.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Dials over QUIC and starts HTTP/3, checking the peer supports MASQUE.
 pub async fn dial_quic(
@@ -187,17 +229,25 @@ pub async fn dial_quic(
 ) -> Result<(Arc<H3Connection>, Vec<CertificateDer<'static>>), DialError> {
     let connecting = endpoint
         .connect_with(config, relay.quic, &relay.name)
-        .map_err(|e| DialError(format!("QUIC connect: {e}")))?;
-    let conn = connecting
+        .map_err(|e| DialError::new(format!("QUIC connect: {e}")))?;
+    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
         .await
-        .map_err(|e| DialError(format!("QUIC handshake with {}: {e}", relay.name)))?;
+        .map_err(|_| DialError::new(format!("QUIC handshake with {} timed out", relay.name)))?
+        .map_err(|e| DialError {
+            message: format!("QUIC handshake with {}: {e}", relay.name),
+            credentials_rejected: quic_rejected(&e),
+        })?;
     let certs = peer_certificates(&conn);
-    let h3 = H3Connection::new(conn, false)
-        .await
-        .map_err(|e| DialError(e.to_string()))?;
+    // TLS 1.3 servers check the client certificate after the client has
+    // finished its handshake, so a rejection can surface here.
+    let h3_error = |e: H3Error| DialError {
+        credentials_rejected: matches!(&e, H3Error::Connection(c) if quic_rejected(c)),
+        message: e.to_string(),
+    };
+    let h3 = H3Connection::new(conn, false).await.map_err(h3_error)?;
     if let Err(e) = h3.require_masque().await {
         h3.close(crate::h3::code::SETTINGS_ERROR, "MASQUE unsupported");
-        return Err(DialError(e.to_string()));
+        return Err(h3_error(e));
     }
     Ok((h3, certs))
 }
@@ -217,22 +267,38 @@ pub async fn dial_h2(
 ) -> Result<H2Client, DialError> {
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(relay.tcp))
         .await
-        .map_err(|_| DialError(format!("TCP connect to {} timed out", relay.tcp)))?
-        .map_err(|e| DialError(format!("TCP connect to {}: {e}", relay.tcp)))?;
-    let name = ServerName::try_from(relay.name.clone()).map_err(|e| DialError(e.to_string()))?;
+        .map_err(|_| DialError::new(format!("TCP connect to {} timed out", relay.tcp)))?
+        .map_err(|e| DialError::new(format!("TCP connect to {}: {e}", relay.tcp)))?;
+    let name =
+        ServerName::try_from(relay.name.clone()).map_err(|e| DialError::new(e.to_string()))?;
     let (client, _) = H2Client::connect(tcp, tls, name).await.map_err(|e| match e {
+        H2Error::Io(io) if tls_rejected(&io) => DialError {
+            message: format!("TLS to {}: {io}", relay.name),
+            credentials_rejected: true,
+        },
+        H2Error::Http2(e) if e.get_io().is_some_and(tls_rejected) => DialError {
+            message: format!("HTTP/2 to {}: {e}", relay.name),
+            credentials_rejected: true,
+        },
         H2Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidData => {
             // rustls reports certificate failures as invalid data; a pinned
             // trust bundle failing on a reachable relay usually means the
             // network intercepts TLS (docs/protocol.md section 8).
-            DialError(format!(
+            DialError::new(format!(
                 "TLS to {} failed certificate verification (is the network intercepting TLS?): {io}",
                 relay.name
             ))
         }
-        e => DialError(format!("HTTP/2 to {}: {e}", relay.name)),
+        e => DialError::new(format!("HTTP/2 to {}: {e}", relay.name)),
     })?;
     Ok(client)
+}
+
+fn combine(quic: DialError, h2: DialError) -> DialError {
+    DialError {
+        message: format!("{quic}; {h2}"),
+        credentials_rejected: quic.credentials_rejected || h2.credentials_rejected,
+    }
 }
 
 /// Dials a relay: QUIC first, and HTTP/2 in parallel if no QUIC handshake
@@ -265,10 +331,7 @@ pub async fn dial(
             let h2 = dial_h2(relay, h2_tls);
             tokio::pin!(h2);
             if let Some(qe) = quic_err {
-                return h2
-                    .await
-                    .map(OuterConn::H2)
-                    .map_err(|he| DialError(format!("{qe}; {he}")));
+                return h2.await.map(OuterConn::H2).map_err(|he| combine(qe, he));
             }
             let mut h2_err = None;
             loop {
@@ -278,8 +341,8 @@ pub async fn dial(
                         Ok((c, _)) => return Ok(OuterConn::H3(c)),
                         Err(qe) => {
                             return match h2_err {
-                                Some(he) => Err(DialError(format!("{qe}; {he}"))),
-                                None => h2.await.map(OuterConn::H2).map_err(|he| DialError(format!("{qe}; {he}"))),
+                                Some(he) => Err(combine(qe, he)),
+                                None => h2.await.map(OuterConn::H2).map_err(|he| combine(qe, he)),
                             };
                         }
                     },

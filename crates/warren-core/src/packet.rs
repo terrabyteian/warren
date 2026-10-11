@@ -219,11 +219,11 @@ pub fn parse(b: &[u8]) -> Result<Parsed, PacketError> {
 /// The Internet checksum of `data` (RFC 1071), folded and complemented.
 pub fn checksum(data: &[u8], initial: u32) -> u16 {
     let mut sum = initial;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+    let (pairs, rest) = data.as_chunks::<2>();
+    for c in pairs {
+        sum += u32::from(u16::from_be_bytes(*c));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         sum += u32::from(*last) << 8;
     }
     while sum > 0xffff {

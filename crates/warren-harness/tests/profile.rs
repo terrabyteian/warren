@@ -98,11 +98,14 @@ fn another_deployment_is_not_trusted() {
     assert!(verify_client_leaf(&ours, &creds.chain[0], &users_only()).is_err());
 }
 
+/// A change that breaks the client certificate profile.
+type Mutation = Box<dyn Fn(&mut CertSpec)>;
+
 #[test]
 fn profile_violations_are_rejected() {
     let pki = TestPki::new("example.test");
     let base = pki.client_spec(&alice());
-    let mutations: Vec<(&str, Box<dyn Fn(&mut CertSpec)>)> = vec![
+    let mutations: Vec<(&str, Mutation)> = vec![
         (
             "lifetime over 4 h",
             Box::new(|s| s.not_after = s.not_before + 5 * 3600),
@@ -171,8 +174,7 @@ fn profile_violations_are_rejected() {
         mutate(&mut spec);
         let creds = pki.issue_client(&spec);
         let result = verify_client_leaf(&pki, &creds.chain[0], &users_only());
-        eprintln!("{what}: {result:?}");
-        assert!(result.is_err(), "accepted a certificate with: {what}");
+        assert!(result.is_err(), "accepted a certificate with {what}: {result:?}");
     }
 }
 
