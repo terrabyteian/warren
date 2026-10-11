@@ -97,6 +97,13 @@ fn be16(b: &[u8], at: usize) -> u16 {
 
 /// Parses an IPv4 or IPv6 packet.
 pub fn parse(b: &[u8]) -> Result<Parsed, PacketError> {
+    parse_headers(b, false)
+}
+
+/// Parses headers; a `quote` (the packet inside an ICMP error, as short as
+/// the IP header plus 8 bytes) needs only the TCP or UDP ports and never
+/// sets `tcp_flags`.
+fn parse_headers(b: &[u8], quote: bool) -> Result<Parsed, PacketError> {
     let version = b.first().ok_or(PacketError("empty packet"))? >> 4;
     let (src, dst, protocol, l4, len, fragment, dont_fragment) = match version {
         4 => {
@@ -183,6 +190,7 @@ pub fn parse(b: &[u8]) -> Result<Parsed, PacketError> {
         return Ok(p);
     }
     let need = match protocol {
+        proto::TCP | proto::UDP if quote => 4,
         proto::TCP => 20,
         proto::UDP => 8,
         proto::ICMP | proto::ICMPV6 => 8,
@@ -197,7 +205,9 @@ pub fn parse(b: &[u8]) -> Result<Parsed, PacketError> {
         proto::TCP => {
             p.src_port = be16(b, l4);
             p.dst_port = be16(b, l4 + 2);
-            p.tcp_flags = b[l4 + 13];
+            if !quote {
+                p.tcp_flags = b[l4 + 13];
+            }
         }
         proto::UDP => {
             p.src_port = be16(b, l4);
@@ -540,7 +550,7 @@ pub fn quoted(b: &[u8], p: &Parsed) -> Option<(Parsed, usize)> {
         }
         _ => return None,
     }
-    let q = parse(&tmp).ok()?;
+    let q = parse_headers(&tmp, true).ok()?;
     Some((q, at))
 }
 
@@ -795,6 +805,34 @@ mod tests {
             assert_eq!(ep.src, synthetic);
             let (q, _) = quoted(&err, &ep).unwrap();
             assert_eq!(q.dst, synthetic);
+        }
+    }
+
+    #[test]
+    fn minimal_quotes_of_tcp_packets_are_understood() {
+        for (client, real, synthetic, header) in [
+            ("100.96.0.2:40000", "10.20.0.5:443", "100.80.0.7", 20),
+            ("[fd00::2]:40000", "[fd00:20::5]:443", "fd00:80::7", 40),
+        ] {
+            let (client, real): (SocketAddr, SocketAddr) =
+                (client.parse().unwrap(), real.parse().unwrap());
+            let synthetic: IpAddr = synthetic.parse().unwrap();
+            let syn = tcp_syn(client, real, 1460);
+            let mut p = parse(&syn).unwrap();
+            // An error quoting only the IP header and 8 bytes (RFC 792).
+            p.len = header + 8;
+            let mut err = icmp_error(&syn, &p, IcmpError::TooBig(1280), real.ip()).unwrap();
+            let ep = parse(&err).unwrap();
+            let (q, _) = quoted(&err, &ep).unwrap();
+            assert_eq!(
+                (q.protocol, q.src_sock(), q.dst_sock()),
+                (proto::TCP, client, real)
+            );
+            rewrite_icmp_error(&mut err, &ep, real.ip(), synthetic).unwrap();
+            assert!(checksums_valid(&err));
+            let ep = parse(&err).unwrap();
+            let (q, _) = quoted(&err, &ep).unwrap();
+            assert_eq!(q.dst_sock(), SocketAddr::new(synthetic, real.port()));
         }
     }
 

@@ -10,6 +10,8 @@ use warren_relay::{Relay, RelayConfig};
 use crate::node::{self, Signal};
 
 pub fn run(m: &ArgMatches) -> Result<(), String> {
+    let runtime = node::runtime()?;
+    let mut signals = node::Signals::new(&runtime)?;
     let setup = node::setup(m)?;
     let listen: SocketAddr = parse(m, "listen")?;
     let listen_tcp = if m.get_flag("no-tcp") {
@@ -51,11 +53,11 @@ pub fn run(m: &ArgMatches) -> Result<(), String> {
         tuning: TransportTuning::default(),
     };
     let bundle_path = setup.bundle_path;
-    node::runtime()?.block_on(async move {
+    runtime.block_on(async move {
         let relay = Relay::start(config).await.map_err(|e| e.to_string())?;
         node::serve_metrics(m, relay.metrics().registry.clone()).await?;
         loop {
-            match node::next_signal().await {
+            match signals.next().await {
                 Signal::Reload => match node::reload(&bundle_path).and_then(|b| relay.reload(b)) {
                     Ok(cut) => info!(cut, "bundle reloaded"),
                     Err(e) => warn!(error = %e, "bundle reload failed; keeping the current bundle"),

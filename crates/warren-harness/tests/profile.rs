@@ -61,17 +61,29 @@ fn issuing_cas_are_not_interchangeable() {
         name: pki.infra_ca.name.clone(),
     };
     let leaf = issue(&pki.client_spec(&alice()), &key, Some(&infra));
-    assert!(verify_client_leaf(&pki, &leaf, &users_only()).is_err());
+    assert_rejected(
+        &verify_client_leaf(&pki, &leaf, &users_only()),
+        &CertError::Chain("UnknownIssuer".into()),
+        "a client certificate from the infrastructure CA",
+    );
     // A leaf straight from the root.
     let root = Issuer {
         key: &pki.root.key,
         name: pki.root.name.clone(),
     };
     let leaf = issue(&pki.client_spec(&alice()), &key, Some(&root));
-    assert!(verify_client_leaf(&pki, &leaf, &users_only()).is_err());
+    assert_rejected(
+        &verify_client_leaf(&pki, &leaf, &users_only()),
+        &CertError::Chain("the chain must pass through exactly one issuing CA".into()),
+        "a client certificate from the root",
+    );
     // A connector certificate where a user is required, and vice versa.
     let conn = pki.connector("homelab", "c1");
-    assert!(verify_client_leaf(&pki, &conn.chain[0], &users_only()).is_err());
+    assert_rejected(
+        &verify_client_leaf(&pki, &conn.chain[0], &users_only()),
+        &CertError::Chain("UnknownIssuer".into()),
+        "a connector where a user is required",
+    );
     let nodes = AcceptClients {
         users: false,
         nodes: vec![NodeRoleMatch::AnyConnector],
@@ -84,10 +96,18 @@ fn issuing_cas_are_not_interchangeable() {
         })
     ));
     let user = pki.client(&alice());
-    assert!(verify_client_leaf(&pki, &user.chain[0], &nodes).is_err());
+    assert_rejected(
+        &verify_client_leaf(&pki, &user.chain[0], &nodes),
+        &CertError::Chain("UnknownIssuer".into()),
+        "a user where a connector is required",
+    );
     // A relay certificate is not a connector.
     let relay = pki.relay("r1", &["relay.example.test"]);
-    assert!(verify_client_leaf(&pki, &relay.chain[0], &nodes).is_err());
+    assert_rejected(
+        &verify_client_leaf(&pki, &relay.chain[0], &nodes),
+        &profile("role relay may not connect here"),
+        "a relay where a connector is required",
+    );
 }
 
 #[test]
@@ -95,64 +115,120 @@ fn another_deployment_is_not_trusted() {
     let ours = TestPki::new("example.test");
     let theirs = TestPki::new("example.test");
     let creds = theirs.client(&alice());
-    assert!(verify_client_leaf(&ours, &creds.chain[0], &users_only()).is_err());
+    assert_rejected(
+        &verify_client_leaf(&ours, &creds.chain[0], &users_only()),
+        &CertError::Chain("InvalidSignatureForPublicKey".into()),
+        "a client certificate from another deployment",
+    );
 }
 
 /// A change that breaks the client certificate profile.
 type Mutation = Box<dyn Fn(&mut CertSpec)>;
 
+fn profile(msg: &str) -> CertError {
+    CertError::Profile(msg.into())
+}
+
+/// Chain errors carry the verifier's detail after its error name, so only
+/// their prefix is compared.
+fn assert_rejected<T: std::fmt::Debug>(
+    result: &Result<T, CertError>,
+    expected: &CertError,
+    what: &str,
+) {
+    let matched = match (result, expected) {
+        (Err(CertError::Chain(got)), CertError::Chain(want)) => got.starts_with(want.as_str()),
+        (Err(got), want) => got == want,
+        (Ok(_), _) => false,
+    };
+    assert!(matched, "{what}: expected {expected:?}, got {result:?}");
+}
+
 #[test]
 fn profile_violations_are_rejected() {
     let pki = TestPki::new("example.test");
     let base = pki.client_spec(&alice());
-    let mutations: Vec<(&str, Mutation)> = vec![
+    let sans = "subjectAltName must hold exactly one user and one device URI";
+    let key_usage = "keyUsage must be critical digitalSignature";
+    let eku = "extKeyUsage must be clientAuth only";
+    let mutations: Vec<(&str, Mutation, CertError)> = vec![
         (
             "lifetime over 4 h",
             Box::new(|s| s.not_after = s.not_before + 5 * 3600),
+            profile("validity exceeds the 4-hour lifetime plus clock skew"),
         ),
-        ("SAN not critical", Box::new(|s| s.san_critical = false)),
+        (
+            "SAN not critical",
+            Box::new(|s| s.san_critical = false),
+            profile("subjectAltName must be critical"),
+        ),
         (
             "extra DNS SAN",
             Box::new(|s| s.san_dns = vec!["x.example.test".into()]),
+            profile(sans),
         ),
         (
             "no device URI",
             Box::new(|s| {
                 s.san_uris.pop();
             }),
+            profile(sans),
         ),
         (
             "two users",
             Box::new(|s| s.san_uris[1] = "warren://example.test/user/bob".into()),
+            profile("unexpected SAN URI warren://example.test/user/bob"),
         ),
         (
             "foreign trust domain",
             Box::new(|s| s.san_uris[0] = "warren://other.test/user/alice".into()),
+            profile("unexpected SAN URI warren://other.test/user/alice"),
         ),
         (
             "serverAuth too",
             Box::new(|s| s.eku.push(oid::SERVER_AUTH.to_vec())),
+            profile(eku),
         ),
-        ("no EKU", Box::new(|s| s.eku.clear())),
+        ("no EKU", Box::new(|s| s.eku.clear()), profile(eku)),
         (
             "keyUsage not critical",
             Box::new(|s| s.key_usage = Some((0x80, false))),
+            profile(key_usage),
         ),
         (
             "keyCertSign",
             Box::new(|s| s.key_usage = Some((0x84, true))),
+            profile(key_usage),
         ),
-        ("no basicConstraints", Box::new(|s| s.ca = None)),
-        ("no key identifiers", Box::new(|s| s.key_ids = false)),
+        (
+            "no basicConstraints",
+            Box::new(|s| s.ca = None),
+            profile("basicConstraints must be present with CA:FALSE"),
+        ),
+        (
+            "no key identifiers",
+            Box::new(|s| s.key_ids = false),
+            profile("authority and subject key identifiers are required"),
+        ),
         (
             "subject not empty",
             Box::new(|s| s.subject_cn = Some("alice".into())),
+            profile("subject must be empty"),
         ),
-        ("short serial", Box::new(|s| s.serial = vec![1, 2, 3])),
-        ("no identity extension", Box::new(|s| s.extra.clear())),
+        (
+            "short serial",
+            Box::new(|s| s.serial = vec![1, 2, 3]),
+            profile("serial number shorter than 64 bits"),
+        ),
+        (
+            "no identity extension",
+            Box::new(|s| s.extra.clear()),
+            profile("missing warren identity extension"),
+        ),
         (
             "critical identity extension",
             Box::new(|s| s.extra[0].1 = true),
+            CertError::Chain("UnsupportedCriticalExtension".into()),
         ),
         (
             "CRL pointer",
@@ -160,6 +236,7 @@ fn profile_violations_are_rejected() {
                 s.extra
                     .push((oid::CRL_DP.to_vec(), false, vec![0x30, 0x00]))
             }),
+            profile("revocation pointers are not allowed; revocation is pushed"),
         ),
         (
             "expired",
@@ -167,17 +244,15 @@ fn profile_violations_are_rejected() {
                 s.not_before -= 7200;
                 s.not_after = s.not_before + 3600;
             }),
+            CertError::Chain("CertExpired ".into()),
         ),
     ];
-    for (what, mutate) in mutations {
+    for (what, mutate, expected) in mutations {
         let mut spec = base.clone();
         mutate(&mut spec);
         let creds = pki.issue_client(&spec);
         let result = verify_client_leaf(&pki, &creds.chain[0], &users_only());
-        assert!(
-            result.is_err(),
-            "accepted a certificate with {what}: {result:?}"
-        );
+        assert_rejected(&result, &expected, &format!("a certificate with {what}"));
     }
 }
 
@@ -197,16 +272,17 @@ fn server_verification_checks_names_and_groups() {
         tls::now(),
     );
     assert!(ok.is_ok());
-    assert!(
-        tls::verify_server(
+    assert_rejected(
+        &tls::verify_server(
             &bundle,
             &ExpectServer::Relay,
             &NoRevocations,
             &relay.chain[0],
             &other,
-            tls::now()
-        )
-        .is_err()
+            tls::now(),
+        ),
+        &CertError::Chain("relay name: CertNotValidForName".into()),
+        "a relay under another name",
     );
 
     let conn = pki.connector("homelab", "c1");
@@ -228,52 +304,58 @@ fn server_verification_checks_names_and_groups() {
         )
         .is_ok()
     );
-    assert!(
-        tls::verify_server(
+    assert_rejected(
+        &tls::verify_server(
             &bundle,
             &office,
             &NoRevocations,
             &conn.chain[0],
             &inner,
-            tls::now()
-        )
-        .is_err()
+            tls::now(),
+        ),
+        &profile(
+            "expected Connector { group: \"office\" }, the certificate names connector/homelab",
+        ),
+        "a connector of another group",
     );
     // A relay cannot stand in for a connector, nor a connector for a relay.
-    assert!(
-        tls::verify_server(
+    assert_rejected(
+        &tls::verify_server(
             &bundle,
             &homelab,
             &NoRevocations,
             &relay.chain[0],
             &inner,
-            tls::now()
-        )
-        .is_err()
+            tls::now(),
+        ),
+        &profile("expected Connector { group: \"homelab\" }, the certificate names relay"),
+        "a relay where a connector is expected",
     );
-    assert!(
-        tls::verify_server(
+    assert_rejected(
+        &tls::verify_server(
             &bundle,
             &ExpectServer::Relay,
             &NoRevocations,
             &conn.chain[0],
             &name,
-            tls::now()
-        )
-        .is_err()
+            tls::now(),
+        ),
+        &profile("expected Relay, the certificate names connector/homelab"),
+        "a connector where a relay is expected",
     );
     // Client certificates never serve.
     let user = pki.client(&alice());
-    assert!(
-        tls::verify_server(
+    assert_rejected(
+        &tls::verify_server(
             &bundle,
             &homelab,
             &NoRevocations,
             &user.chain[0],
             &inner,
-            tls::now()
-        )
-        .is_err()
+            tls::now(),
+        ),
+        &CertError::Chain("RequiredEkuNotFound".into()),
+        "a client certificate serving",
     );
 }
 

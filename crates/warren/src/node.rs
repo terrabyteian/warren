@@ -51,37 +51,61 @@ fn join_into(
     let joined = runtime()?
         .block_on(warren_masque::join::join(&token, &node_key))
         .map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&trust).map_err(|e| format!("{}: {e}", trust.display()))?;
+    let mut dirs = std::fs::DirBuilder::new();
+    dirs.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        dirs.mode(0o700);
+    }
+    dirs.create(&trust)
+        .map_err(|e| format!("{}: {e}", trust.display()))?;
     let pem = |certs: &[rustls::pki_types::CertificateDer<'_>]| -> String {
         certs
             .iter()
             .map(|c| warren_core::base64::pem("CERTIFICATE", c))
             .collect()
     };
-    let write = |p: &Path, text: String| {
-        std::fs::write(p, text).map_err(|e| format!("{}: {e}", p.display()))
+    let write = |p: &Path, text: String, mode: u32| {
+        use std::io::Write;
+        let tmp = p.with_extension("pem.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        options
+            .open(&tmp)
+            .and_then(|mut f| {
+                f.write_all(text.as_bytes())?;
+                f.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, p))
+            .map_err(|e| format!("{}: {e}", p.display()))
     };
     write(
         &trust.join(pki::ROOT_CA_FILE),
         pem(std::slice::from_ref(&joined.trust.root)),
+        0o644,
     )?;
     write(
         &trust.join(pki::CLIENT_CA_FILE),
         pem(&joined.trust.client_cas),
+        0o644,
     )?;
     write(
         &trust.join(pki::INFRA_CA_FILE),
         pem(&joined.trust.infra_cas),
+        0o644,
     )?;
-    write(&key, node_key.private_key_pem())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-    }
+    write(&key, node_key.private_key_pem(), 0o600)?;
     // The certificate last: its presence marks a completed join.
-    write(&cert, pem(&joined.credentials.chain))?;
+    write(&cert, pem(&joined.credentials.chain), 0o644)?;
     tracing::info!(role = %joined.identity.role, id = %joined.identity.id, "joined the deployment");
     Ok((cert, key, trust))
 }
@@ -136,29 +160,49 @@ pub enum Signal {
     Stop,
 }
 
-/// Waits for the next signal.
-pub async fn next_signal() -> Signal {
+/// The signals a node listens for, registered once at start.
+pub struct Signals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let (Ok(mut hup), Ok(mut term), Ok(mut int)) = (
-            signal(SignalKind::hangup()),
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) else {
-            std::future::pending::<()>().await;
-            unreachable!();
-        };
-        tokio::select! {
-            _ = hup.recv() => Signal::Reload,
-            _ = term.recv() => Signal::Stop,
-            _ = int.recv() => Signal::Stop,
+    hup: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    int: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    /// Registers the signal handlers on `runtime`.
+    pub fn new(runtime: &tokio::runtime::Runtime) -> Result<Self, String> {
+        let _guard = runtime.enter();
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let listen = |kind| signal(kind).map_err(|e| format!("signals: {e}"));
+            Ok(Self {
+                hup: listen(SignalKind::hangup())?,
+                term: listen(SignalKind::terminate())?,
+                int: listen(SignalKind::interrupt())?,
+            })
         }
+        #[cfg(not(unix))]
+        Ok(Self {})
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        Signal::Stop
+
+    /// Waits for the next signal.
+    pub async fn next(&mut self) -> Signal {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.hup.recv() => Signal::Reload,
+                _ = self.term.recv() => Signal::Stop,
+                _ = self.int.recv() => Signal::Stop,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            Signal::Stop
+        }
     }
 }
 

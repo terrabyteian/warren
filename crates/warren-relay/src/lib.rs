@@ -11,12 +11,12 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tracing::{debug, info};
 use warren_core::bundle::{CompiledBundle, NodeState};
 use warren_core::identity::NodeRole;
@@ -126,10 +126,15 @@ impl RelayMetrics {
 struct Attachment {
     id: u64,
     node: String,
+    /// The connector's node ID, which clients name to keep their inner
+    /// session on this replica.
+    node_id: String,
     tx: TunnelSender,
     contexts: Mutex<Contexts>,
     draining: AtomicBool,
-    load: AtomicUsize,
+    /// Notified when every context ID is spent and the last one ends, so the
+    /// bind stream closes and the connector re-attaches with fresh IDs.
+    retire: Notify,
     /// Set once the bind stream is gone.
     gone: watch::Sender<bool>,
 }
@@ -138,7 +143,39 @@ struct Attachment {
 struct Contexts {
     /// The next context ID to assign; IDs are never reused on a stream.
     next: u64,
+    /// Contexts assigned and not yet released: the replica's load.
+    open: usize,
     live: HashMap<u64, TunnelSender>,
+}
+
+impl Attachment {
+    /// Assigns the next odd context ID (RFC 9298), if any is left.
+    fn assign(&self) -> Option<u64> {
+        let mut c = self.contexts.lock().expect("contexts lock");
+        if c.next > params::MAX_BIND_CONTEXT_ID {
+            return None;
+        }
+        let ctx = c.next;
+        c.next += 2;
+        c.open += 1;
+        Some(ctx)
+    }
+
+    /// Ends a context assigned by [`Attachment::assign`].
+    fn release(&self, ctx: u64) {
+        let mut c = self.contexts.lock().expect("contexts lock");
+        c.live.remove(&ctx);
+        c.open -= 1;
+        if c.open == 0 && c.next > params::MAX_BIND_CONTEXT_ID {
+            self.retire.notify_one();
+        }
+    }
+
+    /// The load if the replica can take another client.
+    fn free_load(&self) -> Option<usize> {
+        let c = self.contexts.lock().expect("contexts lock");
+        (c.next <= params::MAX_BIND_CONTEXT_ID).then_some(c.open)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -294,16 +331,19 @@ impl Relay {
 }
 
 impl Shared {
-    fn enforce_revocations(&self) -> usize {
+    fn revoked(&self, peer: &PeerIdentity) -> bool {
         let state = &self.config.state;
+        match peer {
+            PeerIdentity::Client(c) => state.check_client(c).is_err(),
+            PeerIdentity::Node(n) => state.check_node(n).is_err(),
+        }
+    }
+
+    fn enforce_revocations(&self) -> usize {
         let live = self.live.lock().expect("live lock");
         let mut cut = 0;
         for l in live.values() {
-            let revoked = match &l.peer {
-                PeerIdentity::Client(c) => state.check_client(c).is_err(),
-                PeerIdentity::Node(n) => state.check_node(n).is_err(),
-            };
-            if revoked {
+            if self.revoked(&l.peer) {
                 (l.close)();
                 cut += 1;
             }
@@ -315,13 +355,18 @@ impl Shared {
         cut
     }
 
-    fn track(&self, peer: PeerIdentity, close: Box<dyn Fn() + Send + Sync>) -> u64 {
+    /// Tracks a connection so revocations can cut it. The bundle is checked
+    /// again once tracked, so a reload that ran after the peer was
+    /// identified but before it was tracked still covers it; `None` means
+    /// the peer is no longer permitted.
+    fn track(&self, peer: PeerIdentity, close: Box<dyn Fn() + Send + Sync>) -> Option<u64> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.live
-            .lock()
-            .expect("live lock")
-            .insert(id, Live { peer, close });
-        id
+        let mut live = self.live.lock().expect("live lock");
+        if self.revoked(&peer) {
+            return None;
+        }
+        live.insert(id, Live { peer, close });
+        Some(id)
     }
 
     fn untrack(&self, id: u64) {
@@ -390,18 +435,23 @@ async fn serve_quic(
                 conn.close(quinn::VarInt::from_u32(0x102), b"unidentified peer");
                 return;
             };
-            let h3 = match H3Connection::new(conn.clone(), true).await {
-                Ok(h) => h,
-                Err(e) => {
-                    debug!(%remote, error = %e, "HTTP/3 setup failed");
-                    return;
-                }
-            };
             let closer = {
                 let conn = conn.clone();
                 Box::new(move || conn.close(quinn::VarInt::from_u32(0x10b), b"revoked"))
             };
-            let live = shared.track(peer.clone(), closer);
+            let Some(live) = shared.track(peer.clone(), closer) else {
+                shared.metrics.cut.inc();
+                conn.close(quinn::VarInt::from_u32(0x10b), b"revoked");
+                return;
+            };
+            let h3 = match H3Connection::new(conn.clone(), true).await {
+                Ok(h) => h,
+                Err(e) => {
+                    debug!(%remote, error = %e, "HTTP/3 setup failed");
+                    shared.untrack(live);
+                    return;
+                }
+            };
             // A connection never outlives the certificate that
             // authenticated it (docs/protocol.md section 4.3).
             let expiry = {
@@ -416,23 +466,13 @@ async fn serve_quic(
                 })
             };
             debug!(%remote, peer = %describe(&peer), "outer connection");
-            let goaway = h3.goaway();
             loop {
                 match h3.accept_request().await {
                     Ok(Some((head, stream))) => {
                         let shared = shared.clone();
                         let peer = peer.clone();
-                        let goaway = goaway.clone();
                         tokio::spawn(async move {
-                            handle(
-                                shared,
-                                peer,
-                                remote,
-                                head,
-                                Incoming::H3(stream),
-                                Some(goaway),
-                            )
-                            .await;
+                            handle(shared, peer, remote, head, Incoming::H3(stream)).await;
                         });
                     }
                     Ok(None) => break,
@@ -492,15 +532,35 @@ async fn serve_tcp_conn(
         .map(|c| c.iter().map(|c| c.clone().into_owned()).collect())
         .unwrap_or_default();
     let peer = shared.identify(&certs).ok_or("unidentified peer")?;
-    let mut h2 = H2Server::handshake(tls).await.map_err(|e| e.to_string())?;
     let (cut_tx, mut cut_rx) = watch::channel(false);
-    let live = shared.track(
+    let Some(live) = shared.track(
         peer.clone(),
         Box::new(move || {
             let _ = cut_tx.send(true);
         }),
-    );
-    let until = not_after(&peer);
+    ) else {
+        shared.metrics.cut.inc();
+        return Err("revoked".into());
+    };
+    let served = serve_h2(&shared, tls, &peer, remote, &mut cut_rx).await;
+    shared.untrack(live);
+    served
+}
+
+async fn serve_h2(
+    shared: &Arc<Shared>,
+    tls: warren_masque::tokio_rustls::server::TlsStream<TcpStream>,
+    peer: &PeerIdentity,
+    remote: SocketAddr,
+    cut_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut h2 = tokio::select! {
+        h = tokio::time::timeout(Duration::from_secs(10), H2Server::handshake(tls)) => h
+            .map_err(|_| "HTTP/2 handshake timed out".to_owned())?
+            .map_err(|e| e.to_string())?,
+        _ = cut_rx.changed() => return Ok(()),
+    };
+    let until = not_after(peer);
     let expiry = tokio::time::sleep(until.duration_since(SystemTime::now()).unwrap_or_default());
     tokio::pin!(expiry);
     loop {
@@ -511,24 +571,19 @@ async fn serve_tcp_conn(
                     let peer = peer.clone();
                     let head = req.head.clone();
                     tokio::spawn(async move {
-                        handle(shared, peer, remote, head, Incoming::H2(req), None).await;
+                        handle(shared, peer, remote, head, Incoming::H2(req)).await;
                     });
                 }
-                Some(Err(e)) => {
-                    shared.untrack(live);
-                    return Err(e.to_string());
-                }
-                None => break,
+                Some(Err(e)) => return Err(e.to_string()),
+                None => return Ok(()),
             },
-            _ = cut_rx.changed() => break,
+            _ = cut_rx.changed() => return Ok(()),
             () = &mut expiry => {
                 shared.metrics.cut.inc();
-                break;
+                return Ok(());
             }
         }
     }
-    shared.untrack(live);
-    Ok(())
 }
 
 async fn handle(
@@ -537,7 +592,6 @@ async fn handle(
     remote: SocketAddr,
     head: RequestHead,
     incoming: Incoming,
-    goaway: Option<watch::Receiver<Option<u64>>>,
 ) {
     let name = shared.config.name.clone();
     let request = match connect::parse_relay_request(&head) {
@@ -550,12 +604,13 @@ async fn handle(
     };
     match (request, &peer) {
         (Request::UdpToGroup { group }, PeerIdentity::Client(client)) => {
-            splice(shared, client.clone(), remote, group, incoming).await;
+            let connector = head.header(connect::WARREN_CONNECTOR).map(str::to_owned);
+            splice(shared, client.clone(), remote, group, connector, incoming).await;
         }
         (Request::UdpBind, PeerIdentity::Node(node)) => {
             if let NodeRole::Connector { group } = &node.role {
                 let group = group.clone();
-                attach(shared, node.clone(), group, incoming, goaway).await;
+                attach(shared, node.clone(), group, incoming).await;
             } else {
                 shared.metrics.refusals.inc();
                 incoming
@@ -585,13 +640,7 @@ fn deliver_limit(context: u64) -> usize {
     warren_masque::varint::len(context) + usize::from(params::QUIC_MIN_UDP_PAYLOAD)
 }
 
-async fn attach(
-    shared: Arc<Shared>,
-    node: NodeIdentity,
-    group: String,
-    incoming: Incoming,
-    goaway: Option<watch::Receiver<Option<u64>>>,
-) {
+async fn attach(shared: Arc<Shared>, node: NodeIdentity, group: String, incoming: Incoming) {
     let resp = ResponseHead::new(200)
         .with(CONNECT_UDP_BIND, "?1")
         .with(PROXY_PUBLIC_ADDRESS, format!("\"[{}]:443\"", shared.prefix));
@@ -608,13 +657,15 @@ async fn attach(
     let attachment = Arc::new(Attachment {
         id: shared.next_id.fetch_add(1, Ordering::Relaxed),
         node: format!("{}/{}", node.role, node.id),
+        node_id: node.id.clone(),
         tx,
         contexts: Mutex::new(Contexts {
             next: 1,
+            open: 0,
             live: HashMap::new(),
         }),
         draining: AtomicBool::new(false),
-        load: AtomicUsize::new(0),
+        retire: Notify::new(),
         gone: watch::channel(false).0,
     });
     shared
@@ -627,16 +678,6 @@ async fn attach(
         .push(attachment.clone());
     shared.metrics.attachments.inc();
     info!(connector = %attachment.node, group = %group, attachment = attachment.id, "connector attached");
-
-    if let Some(mut goaway) = goaway {
-        let a = attachment.clone();
-        tokio::spawn(async move {
-            if goaway.wait_for(Option::is_some).await.is_ok() {
-                info!(connector = %a.node, "connector draining");
-                a.draining.store(true, Ordering::Relaxed);
-            }
-        });
-    }
 
     serve_bind(&shared, &attachment, &mut rx).await;
 
@@ -691,39 +732,44 @@ async fn serve_bind(shared: &Shared, a: &Attachment, rx: &mut TunnelReceiver) {
                         // Only the relay registers peers on a bind stream.
                         let _ = a.tx.send_capsule(&Capsule::CompressionClose(context_id)).await;
                     }
+                    Capsule::Notice(n) if n.reason == "draining" => {
+                        info!(connector = %a.node, "connector draining");
+                        a.draining.store(true, Ordering::Relaxed);
+                    }
                     _ => {}
                 }
+            }
+            () = a.retire.notified() => {
+                info!(connector = %a.node, "context IDs spent; closing the bind stream so the connector re-attaches");
+                return;
             }
         }
     }
 }
 
-fn pick_replica(shared: &Shared, group: &str) -> Option<(Arc<Attachment>, u64)> {
+fn pick_replica(
+    shared: &Shared,
+    group: &str,
+    connector: Option<&str>,
+) -> Option<(Arc<Attachment>, u64)> {
     let registry = shared.registry.lock().expect("registry lock");
     let candidates = registry.groups.get(group)?;
-    // REPLICA_SELECTION: least loaded among those not draining with a free
-    // context ID.
-    let mut best: Option<&Arc<Attachment>> = None;
-    for a in candidates {
-        if a.draining.load(Ordering::Relaxed) {
-            continue;
-        }
-        let next = a.contexts.lock().expect("contexts lock").next;
-        if next > params::MAX_BIND_CONTEXT_ID {
-            continue;
-        }
-        if best.is_none_or(|b| a.load.load(Ordering::Relaxed) < b.load.load(Ordering::Relaxed)) {
-            best = Some(a);
-        }
-    }
-    let a = best?.clone();
-    let ctx = {
-        let mut c = a.contexts.lock().expect("contexts lock");
-        let ctx = c.next;
-        // Relays allocate odd context IDs (RFC 9298).
-        c.next += 2;
-        ctx
+    let least_loaded = |eligible: &dyn Fn(&Attachment) -> bool| {
+        candidates
+            .iter()
+            .filter(|a| eligible(a))
+            .filter_map(|a| a.free_load().map(|load| (load, a)))
+            .min_by_key(|(load, _)| *load)
+            .map(|(_, a)| a)
     };
+    // The replica holding the client's inner session while it is attached
+    // here; otherwise REPLICA_SELECTION: least loaded among those not
+    // draining with a free context ID.
+    let a = connector
+        .and_then(|id| least_loaded(&|a| a.node_id == id))
+        .or_else(|| least_loaded(&|a| !a.draining.load(Ordering::Relaxed)))?
+        .clone();
+    let ctx = a.assign()?;
     Some((a, ctx))
 }
 
@@ -732,6 +778,7 @@ async fn splice(
     client: ClientIdentity,
     remote: SocketAddr,
     group: String,
+    connector: Option<String>,
     incoming: Incoming,
 ) {
     let name = shared.config.name.clone();
@@ -775,7 +822,7 @@ async fn splice(
             }
         }
     };
-    let Some((attachment, ctx)) = pick_replica(&shared, &group) else {
+    let Some((attachment, ctx)) = pick_replica(&shared, &group, connector.as_deref()) else {
         release();
         shared.metrics.refusals.inc();
         let r = Refusal::new(
@@ -806,6 +853,7 @@ async fn splice(
             .await
             .is_ok();
     if !announced {
+        attachment.release(ctx);
         release();
         let r = Refusal::new(
             503,
@@ -821,11 +869,12 @@ async fn splice(
     {
         Ok(t) => t,
         Err(_) => {
-            release();
             let _ = attachment
                 .tx
                 .send_capsule(&Capsule::CompressionClose(ctx))
                 .await;
+            attachment.release(ctx);
+            release();
             return;
         }
     };
@@ -835,7 +884,6 @@ async fn splice(
         .expect("contexts lock")
         .live
         .insert(ctx, client_tx);
-    attachment.load.fetch_add(1, Ordering::Relaxed);
     shared.metrics.splices.inc();
     shared.metrics.splices_total.inc();
     debug!(user = %client.user, device = %client.device, group = %group, connector = %attachment.node, context = ctx, "spliced");
@@ -863,17 +911,11 @@ async fn splice(
             _ = gone.wait_for(|g| *g) => break,
         }
     }
-    attachment
-        .contexts
-        .lock()
-        .expect("contexts lock")
-        .live
-        .remove(&ctx);
-    attachment.load.fetch_sub(1, Ordering::Relaxed);
     let _ = attachment
         .tx
         .send_capsule(&Capsule::CompressionClose(ctx))
         .await;
+    attachment.release(ctx);
     shared.metrics.splices.dec();
     release();
 }

@@ -32,7 +32,7 @@ use warren_core::tls::{
     WarrenServerVerifier,
 };
 use warren_core::vsock::{self, Inbound, PacketSink, VirtualSocket};
-use warren_masque::capsule::{Capsule, split_context};
+use warren_masque::capsule::{Capsule, Notice, split_context};
 use warren_masque::connect::{self, Refusal};
 use warren_masque::h3::H3Connection;
 use warren_masque::http::ResponseHead;
@@ -187,17 +187,6 @@ impl Routes {
             .get(addr)
             .map(|(_, tx)| tx.clone())
     }
-
-    fn all(&self) -> Vec<mpsc::Sender<session::Event>> {
-        let mut seen = std::collections::HashSet::new();
-        self.by_addr
-            .read()
-            .expect("routes lock")
-            .values()
-            .filter(|(id, _)| seen.insert(*id))
-            .map(|(_, tx)| tx.clone())
-            .collect()
-    }
 }
 
 pub(crate) struct Shared {
@@ -207,7 +196,9 @@ pub(crate) struct Shared {
     pub(crate) metrics: ConnectorMetrics,
     peers: Arc<PeerTable>,
     pub(crate) next_id: AtomicU64,
-    draining: watch::Sender<bool>,
+    pub(crate) draining: watch::Sender<bool>,
+    /// Bumped on every bundle reload; each session re-evaluates on change.
+    pub(crate) reloads: watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -273,6 +264,7 @@ impl Connector {
             peers,
             next_id: AtomicU64::new(1),
             draining: watch::channel(false).0,
+            reloads: watch::channel(0).0,
             config,
         });
         for relay in shared.config.relays.clone() {
@@ -289,7 +281,6 @@ impl Connector {
             shutdown_rx.clone(),
         ));
         tokio::spawn(dispatch_returns(shared.clone(), backend.returns));
-        tokio::spawn(sweep(shared.clone(), shutdown_rx));
         info!(group = %shared.config.group, relays = shared.config.relays.len(), "connector started");
         Ok(Connector {
             shared,
@@ -311,9 +302,7 @@ impl Connector {
             .state
             .replace(bundle)
             .map_err(|e| e.to_string())?;
-        for tx in self.shared.routes.all() {
-            let _ = tx.try_send(session::Event::Reevaluate);
-        }
+        self.shared.reloads.send_modify(|n| *n += 1);
         Ok(())
     }
 
@@ -321,9 +310,6 @@ impl Connector {
     /// are told and given up to `timeout` to finish.
     pub async fn drain(&self, timeout: Duration) {
         self.shared.draining.send_replace(true);
-        for tx in self.shared.routes.all() {
-            let _ = tx.try_send(session::Event::Draining);
-        }
         let deadline = tokio::time::Instant::now() + timeout;
         while self.shared.metrics.sessions.get() > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -461,6 +447,7 @@ async fn attach_once(
     // briefly instead of dropped.
     let mut pending: HashMap<u64, Vec<Bytes>> = HashMap::new();
     let mut draining = shared.draining.subscribe();
+    let mut drain_sent = false;
     let reason = loop {
         tokio::select! {
             d = rx.datagrams.recv() => {
@@ -520,15 +507,18 @@ async fn attach_once(
                     _ => {}
                 }
             }
-            () = async { let _ = draining.wait_for(|d| *d).await; } => {
+            () = async { let _ = draining.wait_for(|d| *d).await; }, if !drain_sent => {
+                // Keep serving existing peers until shutdown.
+                drain_sent = true;
+                let _ = attachment.tx.send_capsule(&Capsule::Notice(Notice {
+                    reason: "draining".into(),
+                    message: "connector is draining".into(),
+                })).await;
                 if let OuterConn::H3(h3) = conn {
                     let _ = h3.send_goaway().await;
                 }
-                // Keep serving existing peers until the session drain ends.
-                let _ = shutdown.wait_for(|s| *s).await;
-                break "drained".into();
             }
-            _ = shutdown.changed() => break "shutdown".into(),
+            _ = shutdown.changed() => break if drain_sent { "drained" } else { "shutdown" }.into(),
         }
     };
     {
@@ -628,7 +618,10 @@ async fn serve_inner(
                 .await
             {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(_) => {
+                    h3.close(warren_masque::h3::code::NO_ERROR, "accept failed");
+                    return;
+                }
             };
             session::run(shared.clone(), client, conn.clone(), peer_addr, tx, rx).await;
             h3.close(warren_masque::h3::code::NO_ERROR, "session ended");
@@ -652,20 +645,6 @@ async fn dispatch_returns(shared: Arc<Shared>, mut returns: mpsc::Receiver<Bytes
                 }
             }
             None => shared.metrics.dropped.inc(),
-        }
-    }
-}
-
-async fn sweep(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {
-                for tx in shared.routes.all() {
-                    let _ = tx.try_send(session::Event::Tick);
-                }
-            }
-            _ = shutdown.changed() => return,
         }
     }
 }

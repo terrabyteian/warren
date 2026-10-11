@@ -368,8 +368,11 @@ fn range_to_cidrs(start: IpAddr, end: IpAddr) -> Vec<IpNet> {
     while a <= b {
         let mut len = bits;
         while len > 0 {
-            let size = 1u128 << (bits - len + 1).min(127);
-            if a % size != 0 || a + size - 1 > b {
+            let fits = match 1u128.checked_shl(bits - len + 1) {
+                Some(size) => a % size == 0 && a + (size - 1) <= b,
+                None => a == 0 && b == u128::MAX,
+            };
+            if !fits {
                 break;
             }
             len -= 1;
@@ -383,8 +386,10 @@ fn range_to_cidrs(start: IpAddr, end: IpAddr) -> Vec<IpNet> {
             addr,
             len: len as u8,
         });
-        let step = 1u128 << (bits - len);
-        match a.checked_add(step) {
+        match 1u128
+            .checked_shl(bits - len)
+            .and_then(|step| a.checked_add(step))
+        {
             Some(n) => a = n,
             None => break,
         }
@@ -760,6 +765,38 @@ mod tests {
         assert_eq!(
             nets.iter().map(ToString::to_string).collect::<Vec<_>>(),
             ["fd00::/112"]
+        );
+        let nets = range_to_cidrs(
+            "::".parse().unwrap(),
+            "7fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+        );
+        assert_eq!(
+            nets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["::/1"]
+        );
+        let nets = range_to_cidrs(
+            "::".parse().unwrap(),
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+        );
+        assert_eq!(
+            nets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["::/0"]
+        );
+        let nets = range_to_cidrs(
+            "8000::".parse().unwrap(),
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+        );
+        assert_eq!(
+            nets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["8000::/1"]
+        );
+        let nets = range_to_cidrs(
+            "0.0.0.0".parse().unwrap(),
+            "255.255.255.255".parse().unwrap(),
+        );
+        assert_eq!(
+            nets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["0.0.0.0/0"]
         );
     }
 }

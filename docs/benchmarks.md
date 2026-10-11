@@ -64,13 +64,14 @@ networks.
 
 ### In-process
 
-| Platform | warren setup p50 | warren RTT p50 / p99 | warren UDP goodput | TLS over TCP setup p50 | TLS over TCP RTT p50 / p99 |
+| Platform | warren setup p50 | warren RTT p50 / p99 | warren UDP throughput | TLS over TCP setup p50 | TLS over TCP RTT p50 / p99 |
 | --- | --- | --- | --- | --- | --- |
-| macOS arm64 | 2.0 ms | 0.102 / 0.130 ms | 393 Mbit/s | 0.23 ms | 0.018 / 0.033 ms |
-| Linux arm64 | 1.9 ms | 0.066 / 0.204 ms | 789 Mbit/s | 0.14 ms | 0.004 / 0.030 ms |
+| macOS arm64 | 2.0 ms | 0.102 / 0.130 ms | 402 Mbit/s | 0.23 ms | 0.018 / 0.033 ms |
+| Linux arm64 | 1.9 ms | 0.066 / 0.204 ms | 807 Mbit/s | 0.14 ms | 0.004 / 0.030 ms |
 
-UDP goodput counts 1280-byte packets echoed back through the tunnel, so the
-tunnel carries twice that.
+UDP throughput counts whole 1280-byte IP packets (1252 bytes of UDP
+payload each) echoed back through the tunnel, so the tunnel carries twice
+that.
 
 ### Kernel (Linux arm64, 10-second runs)
 

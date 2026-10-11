@@ -2,8 +2,9 @@
 //! bindings, and every flow it starts (docs/protocol.md sections 5 to 7).
 //!
 //! A session is a single task that owns all of its state; packets from the
-//! client, return packets from the private network, timer ticks and policy
-//! changes all arrive as events, so admission needs no locks.
+//! client, return packets from the private network, timer ticks, bundle
+//! reloads and drains all arrive in its one loop, so admission needs no
+//! locks.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -60,12 +61,6 @@ impl Resolver for SystemResolver {
 pub(crate) enum Event {
     /// A packet from the private network for this client.
     Return(Bytes),
-    /// Once a second: expire idle flows.
-    Tick,
-    /// The bundle changed: re-evaluate every flow.
-    Reevaluate,
-    /// The connector is draining.
-    Draining,
     /// A name resolution finished.
     Resolved {
         synthetic: IpAddr,
@@ -140,6 +135,7 @@ struct Session {
     flows: HashMap<FlowKey, Flow>,
     by_client: HashMap<FlowKey, FlowKey>,
     frags_out: HashMap<(IpAddr, IpAddr, u8, u32), (FlowKey, Instant)>,
+    frags_in: HashMap<(IpAddr, IpAddr, u8, u32), (FlowKey, Instant)>,
     expires: SystemTime,
     reported_fallbacks: u64,
 }
@@ -174,6 +170,7 @@ pub(crate) async fn run(
         flows: HashMap::new(),
         by_client: HashMap::new(),
         frags_out: HashMap::new(),
+        frags_in: HashMap::new(),
         reported_fallbacks: 0,
     };
     s.shared.metrics.sessions.inc();
@@ -185,6 +182,10 @@ pub(crate) async fn run(
         relay_observed = ?s.shared.observed(s.peer),
         "inner session started"
     );
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut reloads = s.shared.reloads.subscribe();
+    let mut draining = s.shared.draining.subscribe();
+    let mut drain_told = false;
     let end = loop {
         let expiry = tokio::time::sleep(
             s.expires
@@ -207,9 +208,22 @@ pub(crate) async fn run(
             }
             e = events_rx.recv() => {
                 let Some(e) = e else { break "connector stopped" };
-                if let Some(reason) = s.event(e).await {
+                s.event(e);
+            }
+            _ = tick.tick() => s.tick(),
+            r = reloads.changed() => {
+                if r.is_err() { break "connector stopped" }
+                if let Some(reason) = s.reevaluate().await {
                     break reason;
                 }
+            }
+            () = async { let _ = draining.wait_for(|d| *d).await; }, if !drain_told => {
+                drain_told = true;
+                s.notice(
+                    "draining",
+                    "This connector is restarting; your connection moves to another one.",
+                )
+                .await;
             }
             () = expiry => {
                 s.notice("certificate_expired", "Your session certificate expired; reconnecting with a renewed one.").await;
@@ -262,21 +276,11 @@ impl Session {
             .await;
     }
 
-    async fn event(&mut self, e: Event) -> Option<&'static str> {
+    fn event(&mut self, e: Event) {
         match e {
             Event::Return(pkt) => self.inbound(pkt),
-            Event::Tick => self.tick(),
-            Event::Reevaluate => return self.reevaluate().await,
-            Event::Draining => {
-                self.notice(
-                    "draining",
-                    "This connector is restarting; your connection moves to another one.",
-                )
-                .await;
-            }
             Event::Resolved { synthetic, result } => self.resolved(synthetic, result),
         }
-        None
     }
 
     // ----- capsules -----
@@ -617,7 +621,7 @@ impl Session {
             // Errors about server-initiated flows go back as they came.
             if let Some((q, _)) = packet::quoted(&buf, &p) {
                 let key = (q.protocol, q.dst_sock(), q.src_sock());
-                if self.flows.get(&key).is_some_and(|f| f.server_initiated) {
+                if p.dst == q.src && self.flows.get(&key).is_some_and(|f| f.server_initiated) {
                     self.forward(&buf);
                     return;
                 }
@@ -1006,10 +1010,21 @@ impl Session {
             self.shared.metrics.dropped.inc();
             return;
         };
-        if p.fragment.is_some_and(|(_, first)| !first) {
-            // Return fragments: the kernel reassembles before NAT, so these
-            // only arrive for flows it already matched.
-            self.deliver(buf, &p);
+        if let Some((frag_id, false)) = p.fragment {
+            let key = (p.src, p.dst, p.protocol, frag_id);
+            match self.frags_in.get(&key).map(|(k, _)| *k) {
+                Some(fk) if self.flows.contains_key(&fk) => {
+                    let client_dst = self.flows[&fk].client_dst.ip();
+                    if client_dst != p.src
+                        && packet::rewrite_addr(&mut buf, &p, Side::Source, client_dst).is_err()
+                    {
+                        return;
+                    }
+                    let Ok(p2) = packet::parse(&buf) else { return };
+                    self.deliver(&buf, &p2, &pkt, &p);
+                }
+                _ => self.shared.metrics.dropped.inc(),
+            }
             return;
         }
         if p.is_icmp_error() {
@@ -1023,6 +1038,10 @@ impl Session {
             f.packets_in += 1;
             track_tcp(f, &buf, &p, false);
             let client_dst = f.client_dst;
+            if let Some((id, true)) = p.fragment {
+                self.frags_in
+                    .insert((p.src, p.dst, p.protocol, id), (fk, Instant::now()));
+            }
             if client_dst.ip() != p.src
                 && packet::rewrite_addr(&mut buf, &p, Side::Source, client_dst.ip()).is_err()
             {
@@ -1031,13 +1050,14 @@ impl Session {
             let Ok(p2) = packet::parse(&buf) else { return };
             let mtu = self.shared.config.tunnel_mtu;
             packet::clamp_mss(&mut buf, &p2, packet::mss_for(mtu, p2.src.is_ipv4()));
-            self.deliver(buf, &p2);
+            self.deliver(&buf, &p2, &pkt, &p);
             return;
         }
         self.server_initiated(buf, &p);
     }
 
     fn inbound_icmp_error(&mut self, mut buf: Vec<u8>, p: &Parsed) {
+        let received = buf.clone();
         let Some((q, _)) = packet::quoted(&buf, p) else {
             return;
         };
@@ -1052,25 +1072,29 @@ impl Session {
             return;
         }
         if let Ok(p2) = packet::parse(&buf) {
-            self.deliver(buf, &p2);
+            self.deliver(&buf, &p2, &received, p);
         }
     }
 
     /// Sends a packet to the client, answering oversized ones at this
-    /// ingress (docs/protocol.md section 9).
-    fn deliver(&mut self, buf: Vec<u8>, p: &Parsed) {
+    /// ingress (docs/protocol.md section 9). `buf` is the packet as the
+    /// client sees it; `received` is the packet as it arrived, which the
+    /// answer to its sender quotes.
+    fn deliver(&mut self, buf: &[u8], p: &Parsed, received: &[u8], rp: &Parsed) {
         let mtu = self.shared.config.tunnel_mtu;
         if p.len > usize::from(mtu) {
-            if let Some(frags) = packet::fragment_v4(&buf, p, mtu) {
+            if let Some(frags) = packet::fragment_v4(buf, p, mtu) {
                 for f in frags {
                     self.send_client(&f);
                 }
-            } else if let Some(err) = packet::icmp_error(&buf, p, IcmpError::TooBig(mtu), p.dst) {
+            } else if let Some(err) =
+                packet::icmp_error(received, rp, IcmpError::TooBig(mtu), rp.dst)
+            {
                 self.shared.forwarder.send(&err);
             }
             return;
         }
-        self.send_client(&buf);
+        self.send_client(buf);
     }
 
     fn send_client(&self, pkt: &[u8]) {
@@ -1146,7 +1170,11 @@ impl Session {
             },
         );
         self.by_client.insert(fk, fk);
-        self.deliver(buf, p);
+        if let Some((frag_id, true)) = p.fragment {
+            self.frags_in
+                .insert((p.src, p.dst, p.protocol, frag_id), (fk, Instant::now()));
+        }
+        self.deliver(&buf, p, &buf, p);
     }
 
     // ----- lifecycle -----
@@ -1172,6 +1200,8 @@ impl Session {
             self.end_flow(k, why);
         }
         self.frags_out
+            .retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(30));
+        self.frags_in
             .retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(30));
         let fb = self
             .tx

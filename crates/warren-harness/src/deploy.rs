@@ -97,19 +97,30 @@ pub struct UserspaceUdp {
     targets: HashMap<SocketAddr, SocketAddr>,
     returns: mpsc::Sender<Bytes>,
     flows: Mutex<HashMap<(SocketAddr, SocketAddr), Arc<std::net::UdpSocket>>>,
-    /// Every packet forwarded, for assertions.
+    record: bool,
+    /// Every packet forwarded, for assertions, when recording.
     pub seen: Mutex<Vec<Vec<u8>>>,
 }
 
 impl UserspaceUdp {
-    /// Creates the backend; `targets` maps app addresses to loopback
-    /// sockets.
+    /// Creates the backend, recording every packet forwarded; `targets`
+    /// maps app addresses to loopback sockets.
     pub fn start(targets: HashMap<SocketAddr, SocketAddr>) -> (Arc<UserspaceUdp>, Backend) {
+        UserspaceUdp::start_with(targets, true)
+    }
+
+    /// Creates the backend; `record` says whether to keep forwarded
+    /// packets in `seen`.
+    pub fn start_with(
+        targets: HashMap<SocketAddr, SocketAddr>,
+        record: bool,
+    ) -> (Arc<UserspaceUdp>, Backend) {
         let (returns, rx) = mpsc::channel(4096);
         let fwd = Arc::new(UserspaceUdp {
             targets,
             returns,
             flows: Mutex::new(HashMap::new()),
+            record,
             seen: Mutex::new(Vec::new()),
         });
         let backend = Backend {
@@ -127,7 +138,9 @@ impl UserspaceUdp {
 
 impl Forwarder for UserspaceUdp {
     fn send(&self, pkt: &[u8]) {
-        self.seen.lock().expect("seen lock").push(pkt.to_vec());
+        if self.record {
+            self.seen.lock().expect("seen lock").push(pkt.to_vec());
+        }
         let Ok(p) = packet::parse(pkt) else { return };
         match p.protocol {
             proto::ICMP | proto::ICMPV6
@@ -227,6 +240,11 @@ pub struct Options {
     pub relays: usize,
     /// A policy decision point in place of the bundle's rules.
     pub policy: Option<Arc<dyn warren_core::policy::PolicyDecisionPoint>>,
+    /// Whether the test backend records forwarded packets.
+    pub record_packets: bool,
+    /// How many connector replicas of the group (each attaches to every
+    /// relay); replicas after the first get their own test backend.
+    pub replicas: usize,
 }
 
 impl Default for Options {
@@ -238,6 +256,8 @@ impl Default for Options {
             connector_tuning: TransportTuning::default(),
             relays: 1,
             policy: None,
+            record_packets: true,
+            replicas: 1,
         }
     }
 }
@@ -253,6 +273,8 @@ pub struct Deployment {
     pub relays: Vec<Relay>,
     /// The connector.
     pub connector: Connector,
+    /// Further replicas of the connector's group.
+    pub replicas: Vec<Connector>,
     /// The test backend.
     pub backend: Arc<UserspaceUdp>,
     /// Audit records the connector wrote.
@@ -296,7 +318,7 @@ impl Deployment {
         ]
         .into_iter()
         .collect();
-        let (backend, io) = UserspaceUdp::start(targets);
+        let (backend, io) = UserspaceUdp::start_with(targets.clone(), opts.record_packets);
         let (audit, records) = AuditSink::collect(NodeInfo {
             role: "connector".into(),
             name: format!("connector/{GROUP}/c1"),
@@ -319,31 +341,44 @@ impl Deployment {
             .into_iter()
             .collect(),
         );
-        let connector = Connector::start(
-            ConnectorConfig {
-                group: GROUP.into(),
-                relays: relays.iter().map(relay_address).collect(),
-                transport: opts.connector_transport,
-                credentials: pki.connector(GROUP, "c1"),
-                trust: trust.clone(),
-                policy: opts.policy.clone().unwrap_or_else(|| {
-                    Arc::new(warren_core::policy::StaticPolicy::new(state.clone()))
-                }),
-                state,
-                audit,
-                resolver: Arc::new(resolver),
-                synthetic_pools: vec![
-                    params::SYNTHETIC_POOL_V4.parse::<IpNet>().expect("valid"),
-                    params::SYNTHETIC_POOL_V6.parse::<IpNet>().expect("valid"),
-                ],
-                tunnel_mtu: params::TUNNEL_MTU,
-                tuning: opts.connector_tuning,
-            },
-            io,
-        )
-        .expect("connector starts");
+        let resolver: Arc<dyn Resolver> = Arc::new(resolver);
+        let config = |id: &str, audit: AuditSink| ConnectorConfig {
+            group: GROUP.into(),
+            relays: relays.iter().map(relay_address).collect(),
+            transport: opts.connector_transport,
+            credentials: pki.connector(GROUP, id),
+            trust: trust.clone(),
+            policy: opts
+                .policy
+                .clone()
+                .unwrap_or_else(|| Arc::new(warren_core::policy::StaticPolicy::new(state.clone()))),
+            state: state.clone(),
+            audit,
+            resolver: resolver.clone(),
+            synthetic_pools: vec![
+                params::SYNTHETIC_POOL_V4.parse::<IpNet>().expect("valid"),
+                params::SYNTHETIC_POOL_V6.parse::<IpNet>().expect("valid"),
+            ],
+            tunnel_mtu: params::TUNNEL_MTU,
+            tuning: opts.connector_tuning,
+        };
+        let connector = Connector::start(config("c1", audit), io).expect("connector starts");
+        let mut replicas = Vec::new();
+        for i in 2..=opts.replicas.max(1) {
+            let (_, io) = UserspaceUdp::start_with(targets.clone(), false);
+            let audit = AuditSink::discard(NodeInfo {
+                role: "connector".into(),
+                name: format!("connector/{GROUP}/c{i}"),
+            });
+            replicas.push(
+                Connector::start(config(&format!("c{i}"), audit), io).expect("replica starts"),
+            );
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while relays.iter().any(|r| r.metrics().attachments.get() == 0) {
+        while relays
+            .iter()
+            .any(|r| r.metrics().attachments.get() < opts.replicas.max(1) as u64)
+        {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "connector never attached"
@@ -355,6 +390,7 @@ impl Deployment {
             trust,
             relays,
             connector,
+            replicas,
             backend,
             audit: records,
             echo,

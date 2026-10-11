@@ -154,7 +154,9 @@ Applies to links A to E.
   stream, one odd context ID per spliced client, with COMPRESSION_ASSIGN
   naming the client's virtual peer address; the connector answers
   COMPRESSION_ACK, and either side ends a context with COMPRESSION_CLOSE.
-  Context IDs are never reused on a stream. The draft lets a proxy open
+  Context IDs are never reused on a stream: once a relay has assigned every
+  ID within the bound, it assigns no more on that stream and closes it when
+  the last context ends, and the connector re-attaches with a fresh one. The draft lets a proxy open
   compressed contexts only while the client keeps an uncompressed one; warren
   replaces that rule with the splice itself (the relay opens a context only
   for a client it splices to this replica), and `Warren-Protocol` on the
@@ -168,8 +170,11 @@ Applies to links A to E.
 - Each connector replica keeps one attachment per relay in its relay set
   (default: every relay in the deployment) and re-attaches immediately when an
   attachment drops.
-- Draining: a connector that is shutting down sends HTTP/3 GOAWAY on the outer
-  connection; the relay MUST stop assigning new client streams to it and MAY
+- Draining: a connector that is shutting down sends a `WARREN_NOTICE` capsule
+  with reason `draining` on each bind stream, over either carrier, and HTTP/3
+  GOAWAY on an HTTP/3 outer connection; it keeps serving its existing peers.
+  The relay MUST stop assigning new client streams to it, except re-dials
+  naming it in `Warren-Connector` ([section 4.3](#43-relay-splicing)), and MAY
   keep existing ones until they close or `DRAIN_TIMEOUT` passes.
 - If the semantics change incompatibly before the draft is final, warren keeps
   the same semantics behind warren-specific capsules. The semantics, not the
@@ -180,7 +185,10 @@ Applies to links A to E.
 When a client's CONNECT-UDP names group G, the relay:
 
 1. selects a healthy replica of G attached to it (`REPLICA_SELECTION`, default
-   least-loaded) and pins the client stream to that replica for its lifetime;
+   least-loaded) and pins the client stream to that replica for its lifetime.
+   A request carrying `Warren-Connector: {node ID}` goes to that connector's
+   attachment while it has one with a free context ID, draining or not, and
+   to the `REPLICA_SELECTION` choice only when it has none;
 2. allocates a virtual peer address and announces it on the replica's bind
    stream;
 3. forwards datagram payloads between the two streams byte for byte.
@@ -203,6 +211,12 @@ Invariants:
 - A relay closes an outer connection when the certificate that authenticated it
   expires. Clients open a new outer connection with their renewed certificate
   before then and migrate the inner session onto it.
+- The inner session lives on one connector replica, so a client re-dialling
+  for a renewed certificate or after losing its outer path sends
+  `Warren-Connector` with the node ID from the connector certificate its inner
+  session verified. The header is a routing hint only: a relay never forwards
+  anywhere it would not otherwise, and the inner session still authenticates
+  the connector end to end.
 
 ## 5. Inner session (link C)
 

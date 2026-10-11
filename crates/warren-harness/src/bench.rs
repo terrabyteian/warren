@@ -186,15 +186,20 @@ pub mod inprocess {
         let src = SocketAddr::new(v4(t), 50_000);
         let dst: SocketAddr = "10.77.0.10:7".parse().expect("valid");
         let mut out = Vec::with_capacity(n);
+        let mut msg = [0u8; 64];
         for i in 0..n {
-            let pkt = packet::udp(src, dst, &(i as u64).to_be_bytes());
+            msg[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let pkt = packet::udp(src, dst, &msg);
             let at = Instant::now();
             t.send(&pkt);
-            if tokio::time::timeout(Duration::from_secs(2), t.recv())
-                .await
-                .is_ok()
-            {
-                out.push(at.elapsed());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while let Ok(Some(reply)) = tokio::time::timeout_at(deadline, t.recv()).await {
+                if packet::parse(&reply).is_ok_and(|p| {
+                    p.dst_sock() == src && packet::udp_payload(&reply, &p) == Some(&msg[..])
+                }) {
+                    out.push(at.elapsed());
+                    break;
+                }
             }
         }
         Samples(out)
@@ -224,11 +229,12 @@ pub mod inprocess {
         let (mut got, mut sent) = (0u64, window as u64);
         while start.elapsed() < limit {
             match tokio::time::timeout(Duration::from_millis(200), t.recv()).await {
-                Ok(Some(_)) => {
+                Ok(Some(reply)) if packet::parse(&reply).is_ok_and(|p| p.dst_sock() == src) => {
                     got += 1;
                     sender.send(&pkt);
                     sent += 1;
                 }
+                Ok(Some(_)) => {}
                 // A lost packet: refill the window.
                 _ => {
                     sender.send(&pkt);
@@ -237,13 +243,17 @@ pub mod inprocess {
             }
         }
         let elapsed = start.elapsed().as_secs_f64();
-        let mbps = got as f64 * 1252.0 * 8.0 / elapsed / 1e6;
+        let mbps = got as f64 * pkt.len() as f64 * 8.0 / elapsed / 1e6;
         (round3(mbps), round3(got as f64 / sent as f64))
     }
 
     /// Runs the suite and returns its results.
     pub async fn run(secs: f64) -> Value {
-        let d = Deployment::start(Options::default()).await;
+        let d = Deployment::start(Options {
+            record_packets: false,
+            ..Options::default()
+        })
+        .await;
         let mut setups = Vec::new();
         for _ in 0..20 {
             let t0 = Instant::now();
@@ -266,12 +276,19 @@ pub mod inprocess {
                 .expect("bind");
             s.connect(d.echo).await.expect("connect");
             let mut out = Vec::new();
-            let mut buf = [0u8; 64];
+            let mut msg = [0u8; 64];
+            let mut buf = [0u8; 2048];
             for i in 0..2000u64 {
+                msg[..8].copy_from_slice(&i.to_be_bytes());
                 let at = Instant::now();
-                s.send(&i.to_be_bytes()).await.expect("send");
-                let _ = s.recv(&mut buf).await;
-                out.push(at.elapsed());
+                s.send(&msg).await.expect("send");
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while let Ok(Ok(n)) = tokio::time::timeout_at(deadline, s.recv(&mut buf)).await {
+                    if buf[..n] == msg {
+                        out.push(at.elapsed());
+                        break;
+                    }
+                }
             }
             Samples(out)
         };

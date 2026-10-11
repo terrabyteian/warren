@@ -6,6 +6,7 @@
 #   172.31.2.2 --- 172.31.2.1 | 172.31.1.1 --- 172.31.1.2 | 10.77.0.1 --- 10.77.0.10 (echo, sink)
 #     TUN wc0                  warren relay       warren connector          10.77.0.20 (no rule)
 #                                                 TUN warren0 + NAT         10.77.0.11 (baselines)
+#                                                                           10.77.0.12 (WireGuard)
 #
 # The client and the connector can reach each other only through the
 # relay. The client link runs at a 1280-byte MTU, the narrowest path the
@@ -58,6 +59,7 @@ netns_setup() {
   veth "$NS_CONN" app0 10.77.0.1/24 "$NS_APP" eth0 10.77.0.10/24
   in_ns "$NS_APP" ip addr add 10.77.0.20/24 dev eth0
   in_ns "$NS_APP" ip addr add 10.77.0.11/24 dev eth0
+  in_ns "$NS_APP" ip addr add 10.77.0.12/24 dev eth0
   # Return path for traffic the connector does not masquerade (server-
   # initiated tests and baselines).
   in_ns "$NS_APP" ip route add 100.96.0.0/16 via 10.77.0.1
@@ -95,12 +97,15 @@ EOF
 
 # Starts a stand-in control-plane join endpoint, the apps, and a relay and a
 # connector that join the deployment with single-use tokens on first
-# start. Sets WORK, HARNESS, WARREN and CONNECTOR_PID.
+# start. Sets WORK, HARNESS, WARREN, CLIENT_ARGS and CONNECTOR_PID.
 start_deployment() {
   local bin=$1
   WARREN="$bin/warren"
   HARNESS="$bin/warren-harness"
   WORK=$(mktemp -d)
+  CLIENT_ARGS=(--relay relay.lab.test@172.31.2.1:443 --group homelab
+    --cert "$WORK/cp/client-alice-mac-1.pem" --key "$WORK/cp/client-alice-mac-1.key"
+    --trust-bundle "$WORK/cp/trust" --trust-domain lab.test)
   # A separate PKI serves the TLS-over-TCP baseline.
   "$HARNESS" pki --dir "$WORK/pki" --trust-domain bench.test --relay-dns relay.lab.test \
     --group homelab >/dev/null
@@ -129,6 +134,7 @@ start_deployment() {
   # itself and signals reach it.
   ip netns exec "$NS_APP" "$HARNESS" serve --tcp-echo 10.77.0.10:7 --udp-echo 10.77.0.10:7 \
     --tcp-sink 10.77.0.10:9 --tcp-echo 10.77.0.20:7 --tcp-echo 10.77.0.11:7 --tcp-sink 10.77.0.11:9 \
+    --tcp-echo 10.77.0.12:7 --tcp-sink 10.77.0.12:9 \
     --tls 10.77.0.11:8443 --tls-cert "$WORK/pki/tls.pem" --tls-key "$WORK/pki/tls.key" \
     >"$WORK/apps.log" 2>&1 &
   PIDS+=($!)
@@ -162,7 +168,12 @@ relay_metric() {
 }
 
 client() {
-  in_ns "$NS_CLI" "$HARNESS" client --relay relay.lab.test@172.31.2.1:443 --group homelab \
-    --cert "$WORK/cp/client-alice-mac-1.pem" --key "$WORK/cp/client-alice-mac-1.key" \
-    --trust-bundle "$WORK/cp/trust" --trust-domain lab.test "$@"
+  in_ns "$NS_CLI" "$HARNESS" client "${CLIENT_ARGS[@]}" "$@"
+}
+
+# Starts the test client in the background and sets CLIENT_PID.
+client_bg() {
+  ip netns exec "$NS_CLI" "$HARNESS" client "${CLIENT_ARGS[@]}" "$@" &
+  CLIENT_PID=$!
+  PIDS+=("$CLIENT_PID")
 }

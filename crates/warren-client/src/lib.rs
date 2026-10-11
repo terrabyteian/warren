@@ -408,6 +408,7 @@ async fn dial_outer(
     quic_config: &quinn::ClientConfig,
     h2_tls: &Arc<rustls::ClientConfig>,
     first: usize,
+    connector: Option<&str>,
 ) -> Result<Outer, ConnectError> {
     let mut errors = Vec::new();
     let mut refusal = None;
@@ -434,10 +435,12 @@ async fn dial_outer(
             }
         };
         let limit = 1 + usize::from(params::QUIC_MIN_UDP_PAYLOAD);
-        match conn
-            .open_tunnel(&connect::udp_to_group(&relay.name, &config.group), limit)
-            .await
-        {
+        let mut head = connect::udp_to_group(&relay.name, &config.group);
+        if let Some(id) = connector {
+            head.headers
+                .push((connect::WARREN_CONNECTOR.into(), id.to_owned()));
+        }
+        match conn.open_tunnel(&head, limit).await {
             Ok((_, tx, rx)) => {
                 return Ok(Outer {
                     tx,
@@ -463,6 +466,33 @@ async fn dial_outer(
         return Err(ConnectError::Rejected(errors.join("; ")));
     }
     Err(refusal.unwrap_or_else(|| ConnectError::Unreachable(errors.join("; "))))
+}
+
+/// The node ID in the connector certificate the inner session verified,
+/// which re-dials name so the relay keeps the session on that replica
+/// (docs/protocol.md section 4.3).
+fn connector_id(inner: &Mutex<Option<quinn::Connection>>, trust_domain: &str) -> Option<String> {
+    let conn = inner.lock().expect("inner lock").clone()?;
+    let certs = carrier::peer_certificates(&conn);
+    pki::check_infra_profile(certs.first()?, trust_domain)
+        .ok()
+        .map(|n| n.id)
+}
+
+/// Dials a new outer path in its own task, so the current one keeps
+/// carrying the inner session meanwhile.
+fn spawn_dial(
+    config: &ClientConfig,
+    endpoint: &quinn::Endpoint,
+    configs: &OuterConfigs,
+    first: usize,
+    connector: Option<String>,
+) -> tokio::task::JoinHandle<Result<Outer, ConnectError>> {
+    let (config, endpoint) = (config.clone(), endpoint.clone());
+    let (quic, h2) = (configs.quic.clone(), configs.h2.clone());
+    tokio::spawn(async move {
+        dial_outer(&config, &endpoint, &quic, &h2, first, connector.as_deref()).await
+    })
 }
 
 /// TLS and QUIC configurations for dialling relays with a credential.
@@ -518,7 +548,15 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
             .ok_or_else(|| ConnectError::Unreachable("no async runtime".into()))?,
     )
     .map_err(|e| ConnectError::Unreachable(e.to_string()))?;
-    let outer = dial_outer(&config, &outer_endpoint, &configs.quic, &configs.h2, 0).await?;
+    let outer = dial_outer(
+        &config,
+        &outer_endpoint,
+        &configs.quic,
+        &configs.h2,
+        0,
+        None,
+    )
+    .await?;
     info!(relay = %outer.relay, carrier = ?outer.conn.carrier(), "spliced through relay");
 
     // Inner session over the outer stream.
@@ -740,64 +778,103 @@ async fn supervise_outer(
         }
         let _ = events.try_send(ClientEvent::Closed(why));
     };
+    let switch = |outer: &mut Outer, fresh: Outer, why: &str| {
+        *path.tx.write().expect("path lock") = Some(fresh.tx.clone());
+        carrier.send_replace(Some(fresh.conn.carrier()));
+        let _ = events.try_send(ClientEvent::PathChanged {
+            carrier: fresh.conn.carrier(),
+            relay: fresh.relay.clone(),
+        });
+        let old = std::mem::replace(outer, fresh);
+        old.conn.close(why);
+    };
+    let trust_domain = config.trust.trust_domain.clone();
+    // Whether `configs` hold renewed credentials the current outer path was
+    // not dialled with.
+    let mut stale = false;
+    let mut renewal: Option<tokio::task::JoinHandle<Result<Outer, ConnectError>>> = None;
+    let mut retry: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut retry_backoff = Duration::from_secs(1);
+    let mut renew_open = true;
     loop {
-        let renewed = loop {
+        loop {
             tokio::select! {
                 d = outer.rx.datagrams.recv() => {
-                    let Some(d) = d else { break None };
+                    let Some(d) = d else { break };
                     if let Some((0, pkt)) = split_context(&d) {
                         inbound.deliver(connector, pkt);
                     }
                 }
                 c = outer.rx.capsules.recv() => {
-                    if c.is_none() { break None }
+                    if c.is_none() { break }
                 }
-                r = renew.changed() => {
-                    if r.is_err() { break None }
+                r = renew.changed(), if renew_open => {
+                    if r.is_err() {
+                        renew_open = false;
+                        continue;
+                    }
                     let creds = renew.borrow_and_update().clone();
-                    if let Some(c) = creds { break Some(c) }
+                    let Some(creds) = creds else { continue };
+                    // A renewed certificate: open a new outer connection with
+                    // it before the old one's certificate expires, and move
+                    // the inner session over (docs/protocol.md section 4.3).
+                    match outer_configs(&config, &creds) {
+                        Ok(c) => configs = c,
+                        Err(e) => {
+                            warn!(error = %e, "renewed credentials are unusable");
+                            continue;
+                        }
+                    }
+                    stale = true;
+                    retry = None;
+                    retry_backoff = Duration::from_secs(1);
+                    if let Some(h) = renewal.take() {
+                        h.abort();
+                    }
+                    let id = connector_id(&inner, &trust_domain);
+                    renewal = Some(spawn_dial(&config, &endpoint, &configs, outer.index, id));
+                }
+                res = async { renewal.as_mut().expect("renewal pending").await }, if renewal.is_some() => {
+                    renewal = None;
+                    match res {
+                        Ok(Ok(fresh)) => {
+                            info!(relay = %fresh.relay, "outer path renewed with the new certificate; migrating");
+                            switch(&mut outer, fresh, "renewed");
+                            stale = false;
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, retry = ?retry_backoff, "could not renew the outer path; keeping the current one");
+                            retry = Some(Box::pin(tokio::time::sleep(retry_backoff)));
+                            retry_backoff = (retry_backoff * 2).min(Duration::from_secs(30));
+                        }
+                        Err(_) => {}
+                    }
+                }
+                () = async { retry.as_mut().expect("retry pending").await }, if retry.is_some() => {
+                    retry = None;
+                    let id = connector_id(&inner, &trust_domain);
+                    renewal = Some(spawn_dial(&config, &endpoint, &configs, outer.index, id));
                 }
                 _ = shutdown.changed() => {
+                    if let Some(h) = renewal.take() {
+                        h.abort();
+                    }
                     outer.conn.close("client closed");
                     return;
                 }
             }
-        };
-        if let Some(creds) = renewed {
-            // A renewed certificate: open a new outer connection with it
-            // before the old one's certificate expires, and move the inner
-            // session over (docs/protocol.md section 4.3).
-            match outer_configs(&config, &creds) {
-                Ok(c) => configs = c,
-                Err(e) => {
-                    warn!(error = %e, "renewed credentials are unusable");
-                    continue;
-                }
-            }
-            match dial_outer(&config, &endpoint, &configs.quic, &configs.h2, outer.index).await {
-                Ok(fresh) => {
-                    info!(relay = %fresh.relay, "outer path renewed with the new certificate; migrating");
-                    *path.tx.write().expect("path lock") = Some(fresh.tx.clone());
-                    carrier.send_replace(Some(fresh.conn.carrier()));
-                    let _ = events.try_send(ClientEvent::PathChanged {
-                        carrier: fresh.conn.carrier(),
-                        relay: fresh.relay.clone(),
-                    });
-                    let old = std::mem::replace(&mut outer, fresh);
-                    old.conn.close("renewed");
-                }
-                Err(e) => {
-                    warn!(error = %e, "could not renew the outer path; keeping the current one")
-                }
-            }
-            continue;
         }
+        if let Some(h) = renewal.take() {
+            h.abort();
+        }
+        retry = None;
         debug!(relay = %outer.relay, "outer path lost");
-        // A relay that cut us for revocation or expiry will not take us
-        // back with the same certificate.
+        // A relay that cut us for revocation will not take us back, nor will
+        // one whose certificate expired unless renewed credentials are held.
         if let OuterConn::H3(h3) = &outer.conn
             && let Some(quinn::ConnectionError::ApplicationClosed(close)) = h3.quic().close_reason()
-            && matches!(&close.reason[..], b"revoked" | b"certificate expired")
+            && (&close.reason[..] == b"revoked"
+                || (&close.reason[..] == b"certificate expired" && !stale))
         {
             end(format!(
                 "the relay closed the connection: {}",
@@ -809,14 +886,24 @@ async fn supervise_outer(
         *path.tx.write().expect("path lock") = None;
         carrier.send_replace(None);
         let mut backoff = Duration::from_millis(50);
-        outer = loop {
+        let fresh = loop {
             if *shutdown.borrow() {
                 return;
             }
             // Start with the next relay: the one that just failed is the
             // least likely to work.
             let next = (outer.index + 1) % config.relays.len().max(1);
-            match dial_outer(&config, &endpoint, &configs.quic, &configs.h2, next).await {
+            let id = connector_id(&inner, &trust_domain);
+            match dial_outer(
+                &config,
+                &endpoint,
+                &configs.quic,
+                &configs.h2,
+                next,
+                id.as_deref(),
+            )
+            .await
+            {
                 Ok(o) => break o,
                 Err(ConnectError::Rejected(e)) => {
                     end(format!("access revoked or certificate expired: {e}"));
@@ -832,12 +919,8 @@ async fn supervise_outer(
                 }
             }
         };
-        info!(relay = %outer.relay, carrier = ?outer.conn.carrier(), "outer path re-established; migrating");
-        *path.tx.write().expect("path lock") = Some(outer.tx.clone());
-        carrier.send_replace(Some(outer.conn.carrier()));
-        let _ = events.try_send(ClientEvent::PathChanged {
-            carrier: outer.conn.carrier(),
-            relay: outer.relay.clone(),
-        });
+        info!(relay = %fresh.relay, carrier = ?fresh.conn.carrier(), "outer path re-established; migrating");
+        switch(&mut outer, fresh, "path lost");
+        stale = false;
     }
 }

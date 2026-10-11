@@ -85,8 +85,8 @@ check "tunnel MTU below the floor is refused" \
   'map(select(.event == "connect_failed"))[0].error | test("1280")' "$out"
 
 # 4. Server-initiated flows are refused without an opt-in.
-client --transport quic --tun wc0 --route 10.77.0.0/24 --hold 3 >"$out" &
-held=$!
+client_bg --transport quic --tun wc0 --route 10.77.0.0/24 --hold 3 >"$out"
+held=$CLIENT_PID
 sleep 1.5
 in_ns "$NS_APP" bash -c 'echo knock >/dev/udp/100.96.0.2/5555' || true
 wait "$held" || true
@@ -106,8 +106,8 @@ check "name binding audited" \
 
 # 6. Revocation: a reloaded bundle (SIGHUP) cuts a live session and its
 # flows at once.
-client --transport quic --tun wc0 --route 10.77.0.0/24 --probe tcp-echo=10.77.0.10:7 --hold 6 >"$out" 2>&1 &
-held=$!
+client_bg --transport quic --tun wc0 --route 10.77.0.0/24 --probe tcp-echo=10.77.0.10:7 --hold 6 >"$out" 2>&1
+held=$CLIENT_PID
 sleep 2
 write_bundle "$WORK/bundle.json" 2 '"mac-1"'
 kill -HUP "$CONNECTOR_PID"

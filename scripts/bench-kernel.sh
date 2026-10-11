@@ -62,14 +62,13 @@ if command -v wg >/dev/null && in_ns "$NS_CLI" ip link add wgbench type wireguar
   in_ns "$NS_CONN" ip link add wg0 type wireguard
   in_ns "$NS_CONN" bash -c "wg set wg0 listen-port 51820 private-key <(printf '%s' '$sk') peer '$cp' allowed-ips 10.99.0.2/32"
   in_ns "$NS_CONN" ip addr add 10.99.0.1/24 dev wg0
-  in_ns "$NS_CONN" ip link set wg0 mtu 1420 up
+  in_ns "$NS_CONN" ip link set wg0 mtu 1200 up
   in_ns "$NS_CLI" ip link add wg0 type wireguard
   in_ns "$NS_CLI" bash -c "wg set wg0 private-key <(printf '%s' '$ck') peer '$sp' allowed-ips 10.77.0.12/32,10.99.0.1/32 endpoint 172.31.1.2:51820"
   in_ns "$NS_CLI" ip addr add 10.99.0.2/24 dev wg0
-  in_ns "$NS_CLI" ip link set wg0 mtu 1420 up
+  in_ns "$NS_CLI" ip link set wg0 mtu 1200 up
   in_ns "$NS_CLI" ip route add 10.77.0.12/32 dev wg0
   in_ns "$NS_CLI" ip route add 172.31.1.0/24 via 172.31.2.1
-  in_ns "$NS_APP" ip addr add 10.77.0.12/24 dev eth0
   in_ns "$NS_APP" ip route add 10.99.0.0/24 via 10.77.0.1
   in_ns "$NS_CLI" "$HARNESS" bench --mode tcp --echo 10.77.0.12:7 --sink 10.77.0.12:9 --seconds "$SECONDS_PER_RUN" 2>/dev/null |
     jq -c '{ name: "WireGuard (kernel)", results }' >>"$results" ||

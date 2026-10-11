@@ -47,6 +47,8 @@ fn pools(m: &ArgMatches, name: &str, defaults: [&str; 2]) -> Result<Vec<IpNet>, 
 }
 
 pub fn run(m: &ArgMatches) -> Result<(), String> {
+    let runtime = node::runtime()?;
+    let mut signals = node::Signals::new(&runtime)?;
     let setup = node::setup(m)?;
     let group = m.get_one::<String>("group").expect("required").clone();
     let leaf = setup
@@ -112,12 +114,12 @@ pub fn run(m: &ArgMatches) -> Result<(), String> {
     let bundle_path = setup.bundle_path;
     let tun_name = m.get_one::<String>("tun-name").expect("defaulted").clone();
     let masquerade = m.get_one::<String>("nat").map(String::as_str) == Some("masquerade");
-    node::runtime()?.block_on(async move {
+    runtime.block_on(async move {
         let backend = kernel_backend(&tun_name, tunnel_mtu, device_pools.clone(), masquerade)?;
         let connector = Connector::start(config, backend).map_err(|e| e.to_string())?;
         node::serve_metrics(m, connector.metrics().registry.clone()).await?;
         loop {
-            match node::next_signal().await {
+            match signals.next().await {
                 Signal::Reload => {
                     match node::reload(&bundle_path).and_then(|b| connector.reload(b)) {
                         Ok(()) => info!("bundle reloaded; live flows re-evaluated"),
@@ -128,9 +130,10 @@ pub fn run(m: &ArgMatches) -> Result<(), String> {
                 }
                 Signal::Stop => {
                     info!(timeout = ?drain, "connector draining");
+                    let stop = async { while let Signal::Reload = signals.next().await {} };
                     tokio::select! {
                         () = connector.drain(drain) => {}
-                        _ = node::next_signal() => info!("stopping without waiting"),
+                        () = stop => info!("stopping without waiting"),
                     }
                     connector.shutdown();
                     stop_kernel(&tun_name, tunnel_mtu, device_pools, masquerade);

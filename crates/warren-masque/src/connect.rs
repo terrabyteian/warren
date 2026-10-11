@@ -14,6 +14,9 @@ pub const CONNECT_UDP_BIND: &str = "connect-udp-bind";
 pub const PROXY_PUBLIC_ADDRESS: &str = "proxy-public-address";
 /// RFC 9209.
 pub const PROXY_STATUS: &str = "proxy-status";
+/// The header on a client's CONNECT-UDP naming the connector node that
+/// holds its inner session, so the relay splices it to that replica.
+pub const WARREN_CONNECTOR: &str = "warren-connector";
 
 /// The current protocol version and the oldest one accepted.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -133,27 +136,57 @@ impl Refusal {
         let Some(ps) = head.header(PROXY_STATUS) else {
             return r;
         };
-        for param in ps.split(';').skip(1).map(str::trim) {
-            if let Some(e) = param.strip_prefix("error=") {
-                r.error = known_error(e);
-            } else if let Some(d) = param.strip_prefix("details=") {
-                let d = d.trim_matches('"');
-                let mut out = String::new();
-                let mut chars = d.chars();
-                while let Some(c) = chars.next() {
-                    if c == '\\' {
-                        if let Some(n) = chars.next() {
-                            out.push(n);
-                        }
-                    } else {
-                        out.push(c);
-                    }
+        let mut rest = ps;
+        sf_item(&mut rest);
+        while let Some(param) = rest.trim_start().strip_prefix(';') {
+            let param = param.trim_start();
+            let key_end = param.find(['=', ';', ',']).unwrap_or(param.len());
+            let key = param[..key_end].trim_end();
+            rest = &param[key_end..];
+            let value = match rest.strip_prefix('=') {
+                Some(v) => {
+                    rest = v;
+                    sf_item(&mut rest)
                 }
-                r.details = out;
+                None => String::new(),
+            };
+            match key {
+                "error" => r.error = known_error(&value),
+                "details" => r.details = value,
+                _ => {}
             }
         }
         r
     }
+}
+
+/// Reads an RFC 8941 bare item (a token or a quoted string, unescaped) from
+/// the front of `rest` and advances past it.
+fn sf_item(rest: &mut &str) -> String {
+    let s = *rest;
+    let Some(body) = s.strip_prefix('"') else {
+        let end = s.find([';', ',']).unwrap_or(s.len());
+        *rest = &s[end..];
+        return s[..end].trim().to_owned();
+    };
+    let mut out = String::new();
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some((_, n)) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '"' => {
+                *rest = &body[i + 1..];
+                return out;
+            }
+            c => out.push(c),
+        }
+    }
+    *rest = "";
+    out
 }
 
 const ERRORS: [&str; 12] = [
@@ -350,5 +383,22 @@ mod tests {
         );
         let back = Refusal::from_response(&r.response("warren-relay"));
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn proxy_status_details_keep_separators_quotes_and_escapes() {
+        let mut h = udp_to_group("r", "g");
+        h.headers[1].1 = "99".into();
+        let version = parse_relay_request(&h).unwrap_err();
+        assert_eq!(
+            Refusal::from_response(&version.response("warren-relay")),
+            version
+        );
+        let r = Refusal::new(
+            403,
+            "http_request_denied",
+            r#"a; b=\"c\"; path C:\dir\; ends with "quote""#,
+        );
+        assert_eq!(Refusal::from_response(&r.response("warren-relay")), r);
     }
 }

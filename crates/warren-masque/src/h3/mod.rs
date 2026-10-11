@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 use self::frame::{FrameEvent, FrameReader, Settings, setting, ty};
 use crate::http::{RequestHead, ResponseHead};
@@ -77,6 +78,9 @@ pub const MAX_QUARTER_STREAM_ID: u64 = 16_383;
 
 /// How long to wait for the peer's SETTINGS.
 pub const SETTINGS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a peer-initiated request stream may take to deliver HEADERS.
+pub const REQUEST_HEADERS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An HTTP/3 error.
 #[derive(Debug, Clone)]
@@ -173,7 +177,10 @@ pub struct H3Connection {
     goaway: watch::Receiver<Option<u64>>,
     routes: Mutex<HashMap<u64, mpsc::Sender<Bytes>>>,
     control: tokio::sync::Mutex<quinn::SendStream>,
+    pending: tokio::sync::Mutex<JoinSet<PendingRequest>>,
 }
+
+type PendingRequest = Result<Option<(u64, quinn::SendStream, FrameReader, RequestHead)>, H3Error>;
 
 impl H3Connection {
     /// Starts HTTP/3 on an established QUIC connection: opens the control
@@ -198,8 +205,14 @@ impl H3Connection {
             goaway,
             routes: Mutex::new(HashMap::new()),
             control: tokio::sync::Mutex::new(control),
+            pending: tokio::sync::Mutex::new(JoinSet::new()),
         });
-        tokio::spawn(accept_uni_streams(conn.clone(), settings_tx, goaway_tx));
+        tokio::spawn(accept_uni_streams(
+            conn.quic.clone(),
+            is_server,
+            settings_tx,
+            goaway_tx,
+        ));
         tokio::spawn(read_datagrams(Arc::downgrade(&conn), conn.quic.clone()));
         Ok(conn)
     }
@@ -265,10 +278,7 @@ impl H3Connection {
 
     /// Closes the connection with an HTTP/3 error code.
     pub fn close(&self, code: u64, reason: &str) {
-        self.quic.close(
-            quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::from_u32(0x102)),
-            reason.as_bytes(),
-        );
+        close(&self.quic, code, reason);
     }
 
     /// Opens a request stream and sends `head`; returns the final response.
@@ -292,7 +302,7 @@ impl H3Connection {
             conn: self.clone(),
         };
         loop {
-            let fields = stream.read_headers().await?;
+            let fields = read_headers(&mut stream.recv).await?;
             let response = ResponseHead::from_fields(fields).map_err(|e| H3Error::Message(e.0))?;
             // Interim responses are skipped; the final one follows.
             if response.status >= 200 {
@@ -306,42 +316,45 @@ impl H3Connection {
     pub async fn accept_request(
         self: &Arc<Self>,
     ) -> Result<Option<(RequestHead, RequestStream)>, H3Error> {
+        let mut pending = self.pending.lock().await;
         loop {
-            let (send, recv) = match self.quic.accept_bi().await {
-                Ok(s) => s,
-                Err(
-                    quinn::ConnectionError::ApplicationClosed(_)
-                    | quinn::ConnectionError::LocallyClosed,
-                ) => {
-                    return Ok(None);
+            tokio::select! {
+                biased;
+                Some(done) = pending.join_next() => match done {
+                    Ok(Ok(Some((id, send, recv, head)))) => {
+                        let stream = RequestStream {
+                            id,
+                            send,
+                            recv,
+                            conn: self.clone(),
+                        };
+                        return Ok(Some((head, stream)));
+                    }
+                    Ok(Err(e)) => {
+                        self.fail(&e);
+                        return Err(e);
+                    }
+                    Ok(Ok(None)) | Err(_) => {}
+                },
+                accepted = self.quic.accept_bi() => {
+                    let (mut send, recv) = match accepted {
+                        Ok(s) => s,
+                        Err(
+                            quinn::ConnectionError::ApplicationClosed(_)
+                            | quinn::ConnectionError::LocallyClosed,
+                        ) => {
+                            return Ok(None);
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    let id = stream_id(&send);
+                    let mut recv = FrameReader::new(recv);
+                    if id / 4 > MAX_QUARTER_STREAM_ID {
+                        reject(&mut send, &mut recv, code::REQUEST_REJECTED);
+                        continue;
+                    }
+                    pending.spawn(read_request(id, send, recv));
                 }
-                Err(e) => return Err(e.into()),
-            };
-            let mut stream = RequestStream {
-                id: stream_id(&send),
-                send,
-                recv: FrameReader::new(recv),
-                conn: self.clone(),
-            };
-            if stream.id / 4 > MAX_QUARTER_STREAM_ID {
-                stream.reject(code::REQUEST_REJECTED);
-                continue;
-            }
-            let fields = match stream.read_headers().await {
-                Ok(f) => f,
-                Err(H3Error::Message(_)) => {
-                    stream.reject(code::MESSAGE_ERROR);
-                    continue;
-                }
-                Err(e @ H3Error::Protocol { .. }) => {
-                    self.fail(&e);
-                    return Err(e);
-                }
-                Err(_) => continue,
-            };
-            match RequestHead::from_fields(fields) {
-                Ok(head) => return Ok(Some((head, stream))),
-                Err(_) => stream.reject(code::MESSAGE_ERROR),
             }
         }
     }
@@ -391,9 +404,54 @@ impl H3Connection {
     }
 
     fn fail(&self, e: &H3Error) {
-        if let H3Error::Protocol { code, reason } = e {
-            tracing::debug!(code = *code, reason = %reason, "closing HTTP/3 connection");
-            self.close(*code, reason);
+        fail(&self.quic, e);
+    }
+}
+
+impl Drop for H3Connection {
+    fn drop(&mut self) {
+        self.close(code::NO_ERROR, "");
+    }
+}
+
+fn close(quic: &quinn::Connection, code: u64, reason: &str) {
+    quic.close(
+        quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::from_u32(0x102)),
+        reason.as_bytes(),
+    );
+}
+
+fn fail(quic: &quinn::Connection, e: &H3Error) {
+    if let H3Error::Protocol { code, reason } = e {
+        tracing::debug!(code = *code, reason = %reason, "closing HTTP/3 connection");
+        close(quic, *code, reason);
+    }
+}
+
+async fn read_request(
+    id: u64,
+    mut send: quinn::SendStream,
+    mut recv: FrameReader,
+) -> PendingRequest {
+    let fields = match tokio::time::timeout(REQUEST_HEADERS_TIMEOUT, read_headers(&mut recv)).await
+    {
+        Ok(Ok(f)) => f,
+        Ok(Err(e @ H3Error::Protocol { .. })) => return Err(e),
+        Ok(Err(H3Error::Message(_))) => {
+            reject(&mut send, &mut recv, code::MESSAGE_ERROR);
+            return Ok(None);
+        }
+        Ok(Err(_)) => return Ok(None),
+        Err(_) => {
+            reject(&mut send, &mut recv, code::REQUEST_REJECTED);
+            return Ok(None);
+        }
+    };
+    match RequestHead::from_fields(fields) {
+        Ok(head) => Ok(Some((id, send, recv, head))),
+        Err(_) => {
+            reject(&mut send, &mut recv, code::MESSAGE_ERROR);
+            Ok(None)
         }
     }
 }
@@ -426,30 +484,6 @@ impl RequestStream {
         (self.id, self.send, self.recv, self.conn)
     }
 
-    async fn read_headers(&mut self) -> Result<Vec<(String, String)>, H3Error> {
-        loop {
-            match self.recv.next().await? {
-                None => return Err(H3Error::Message("stream ended before HEADERS".into())),
-                Some(FrameEvent::Frame {
-                    ty: ty::HEADERS,
-                    payload,
-                }) => {
-                    return qpack::decode(&payload).map_err(|e| H3Error::Protocol {
-                        code: code::QPACK_DECOMPRESSION_FAILED,
-                        reason: e.to_string(),
-                    });
-                }
-                Some(FrameEvent::Frame { ty: t, .. }) if !is_known_request_frame(t) => continue,
-                Some(_) => {
-                    return Err(H3Error::protocol(
-                        code::FRAME_UNEXPECTED,
-                        "expected HEADERS",
-                    ));
-                }
-            }
-        }
-    }
-
     /// Sends the response head (server side).
     pub async fn respond(&mut self, head: &ResponseHead) -> Result<(), H3Error> {
         let (status, rest) = head.to_fields();
@@ -464,9 +498,37 @@ impl RequestStream {
 
     /// Rejects the request by resetting both directions.
     pub fn reject(&mut self, code: u64) {
-        let c = quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::from_u32(0x102));
-        let _ = self.send.reset(c);
-        let _ = self.recv.stream_mut().stop(c);
+        reject(&mut self.send, &mut self.recv, code);
+    }
+}
+
+fn reject(send: &mut quinn::SendStream, recv: &mut FrameReader, code: u64) {
+    let c = quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::from_u32(0x102));
+    let _ = send.reset(c);
+    let _ = recv.stream_mut().stop(c);
+}
+
+async fn read_headers(recv: &mut FrameReader) -> Result<Vec<(String, String)>, H3Error> {
+    loop {
+        match recv.next().await? {
+            None => return Err(H3Error::Message("stream ended before HEADERS".into())),
+            Some(FrameEvent::Frame {
+                ty: ty::HEADERS,
+                payload,
+            }) => {
+                return qpack::decode(&payload).map_err(|e| H3Error::Protocol {
+                    code: code::QPACK_DECOMPRESSION_FAILED,
+                    reason: e.to_string(),
+                });
+            }
+            Some(FrameEvent::Frame { ty: t, .. }) if !is_known_request_frame(t) => continue,
+            Some(_) => {
+                return Err(H3Error::protocol(
+                    code::FRAME_UNEXPECTED,
+                    "expected HEADERS",
+                ));
+            }
+        }
     }
 }
 
@@ -513,7 +575,8 @@ pub async fn send_data(send: &mut quinn::SendStream, data: &[u8]) -> Result<(), 
 }
 
 async fn accept_uni_streams(
-    conn: Arc<H3Connection>,
+    quic: quinn::Connection,
+    is_server: bool,
     settings_tx: watch::Sender<Option<Arc<Settings>>>,
     goaway_tx: watch::Sender<Option<u64>>,
 ) {
@@ -521,10 +584,10 @@ async fn accept_uni_streams(
     let goaway_tx = Arc::new(goaway_tx);
     let control_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
-        let Ok(mut recv) = conn.quic.accept_uni().await else {
+        let Ok(mut recv) = quic.accept_uni().await else {
             return;
         };
-        let conn = conn.clone();
+        let quic = quic.clone();
         let (settings_tx, goaway_tx, control_seen) =
             (settings_tx.clone(), goaway_tx.clone(), control_seen.clone());
         tokio::spawn(async move {
@@ -542,22 +605,27 @@ async fn accept_uni_streams(
             match kind {
                 stream_type::CONTROL => {
                     if control_seen.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        conn.fail(&H3Error::protocol(
-                            code::STREAM_CREATION_ERROR,
-                            "second control stream",
-                        ));
+                        fail(
+                            &quic,
+                            &H3Error::protocol(
+                                code::STREAM_CREATION_ERROR,
+                                "second control stream",
+                            ),
+                        );
                         return;
                     }
                     let reader = FrameReader::with_prefix(recv, prefix.freeze());
-                    if let Err(e) =
-                        serve_control(reader, &settings_tx, &goaway_tx, conn.is_server).await
+                    if let Err(e) = serve_control(reader, &settings_tx, &goaway_tx, is_server).await
                     {
-                        conn.fail(&e);
+                        fail(&quic, &e);
                     }
                 }
                 stream_type::PUSH => {
                     // warren never sends MAX_PUSH_ID, so no push is allowed.
-                    conn.fail(&H3Error::protocol(code::ID_ERROR, "unexpected push stream"));
+                    fail(
+                        &quic,
+                        &H3Error::protocol(code::ID_ERROR, "unexpected push stream"),
+                    );
                 }
                 stream_type::QPACK_ENCODER | stream_type::QPACK_DECODER => {
                     // With no dynamic table these carry nothing that matters;
@@ -646,12 +714,21 @@ async fn read_datagrams(conn: std::sync::Weak<H3Connection>, quic: quinn::Connec
     while let Ok(datagram) = quic.read_datagram().await {
         let Some((qsid, n)) = varint::peek(&datagram) else {
             // RFC 9297: a datagram without a quarter stream ID is an error.
-            quic.close(
-                quinn::VarInt::from_u32(code::DATAGRAM_ERROR as u32),
-                b"datagram without quarter stream ID",
+            close(
+                &quic,
+                code::DATAGRAM_ERROR,
+                "datagram without quarter stream ID",
             );
             return;
         };
+        if qsid > MAX_QUARTER_STREAM_ID {
+            close(
+                &quic,
+                code::DATAGRAM_ERROR,
+                "quarter stream ID out of range",
+            );
+            return;
+        }
         let Some(conn) = conn.upgrade() else { return };
         let route = conn
             .routes
@@ -663,6 +740,179 @@ async fn read_datagrams(conn: std::sync::Weak<H3Connection>, quic: quinn::Connec
         // unreliable path would.
         if let Some(tx) = route {
             let _ = tx.try_send(datagram.slice(n..));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+    use warren_core::quic::{Layer, TransportTuning};
+    use warren_core::tls;
+
+    #[derive(Debug)]
+    struct AnyServer;
+
+    impl ServerCertVerifier for AnyServer {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![SignatureScheme::ED25519]
+        }
+    }
+
+    #[derive(Debug)]
+    struct OneKey(Arc<rustls::sign::CertifiedKey>);
+
+    impl rustls::server::ResolvesServerCert for OneKey {
+        fn resolve(
+            &self,
+            _: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            Some(self.0.clone())
+        }
+    }
+
+    struct Pair {
+        _endpoints: (quinn::Endpoint, quinn::Endpoint),
+        client: quinn::Connection,
+        server: quinn::Connection,
+    }
+
+    async fn pair() -> Pair {
+        let mut pkcs8 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        pkcs8.extend_from_slice(&[7; 32]);
+        let key = tls::provider()
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(pkcs8.into()))
+            .unwrap();
+        let certified = rustls::sign::CertifiedKey::new(vec![vec![0x30, 0x00].into()], key);
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(tls::provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(OneKey(Arc::new(certified))));
+        server_tls.alpn_protocols = vec![tls::ALPN_H3.to_vec()];
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(tls::provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyServer))
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![tls::ALPN_H3.to_vec()];
+
+        let server_config =
+            warren_core::quic::server_config(server_tls, Layer::Outer, TransportTuning::default());
+        let local = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let server_ep = quinn::Endpoint::server(server_config, local).unwrap();
+        let client_ep = quinn::Endpoint::client(local).unwrap();
+        let client_config =
+            warren_core::quic::client_config(client_tls, Layer::Outer, TransportTuning::default());
+        let connecting = client_ep
+            .connect_with(client_config, server_ep.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let (client, server) = tokio::join!(connecting, async {
+            server_ep.accept().await.unwrap().await
+        });
+        Pair {
+            client: client.unwrap(),
+            server: server.unwrap(),
+            _endpoints: (client_ep, server_ep),
+        }
+    }
+
+    const WAIT: Duration = Duration::from_secs(3);
+
+    #[tokio::test]
+    async fn dropping_the_last_handle_closes_the_connection() {
+        let p = pair().await;
+        let client = H3Connection::new(p.client.clone(), false).await.unwrap();
+        let _server = H3Connection::new(p.server.clone(), true).await.unwrap();
+        client.require_masque().await.unwrap();
+        drop(client);
+        let closed = tokio::time::timeout(WAIT, p.server.closed()).await;
+        assert!(closed.is_ok(), "the peer still sees the connection open");
+        assert!(p.client.close_reason().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_request_stream_does_not_block_later_requests() {
+        let p = pair().await;
+        let client = H3Connection::new(p.client.clone(), false).await.unwrap();
+        let server = H3Connection::new(p.server.clone(), true).await.unwrap();
+        let (mut stalled, _stalled_recv) = p.client.open_bi().await.unwrap();
+        // A HEADERS frame announcing 16 bytes, none of which follow.
+        stalled.write_all(&[0x01, 0x10]).await.unwrap();
+        let request = tokio::spawn(async move {
+            client
+                .send_request(&crate::connect::ip("homelab"))
+                .await
+                .map(|(r, _)| r.status)
+        });
+        let (head, mut stream) = tokio::time::timeout(WAIT, server.accept_request())
+            .await
+            .expect("accept_request blocked behind the stalled stream")
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.protocol.as_deref(), Some("connect-ip"));
+        stream.respond(&ResponseHead::new(200)).await.unwrap();
+        assert_eq!(request.await.unwrap().unwrap(), 200);
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_quarter_stream_id_is_a_datagram_error() {
+        let p = pair().await;
+        let _client = H3Connection::new(p.client.clone(), false).await.unwrap();
+        let server = H3Connection::new(p.server.clone(), true).await.unwrap();
+        server.require_masque().await.unwrap();
+        let mut d = BytesMut::new();
+        varint::put(&mut d, MAX_QUARTER_STREAM_ID + 1);
+        varint::put(&mut d, 0);
+        p.client.send_datagram(d.freeze()).unwrap();
+        let reason = tokio::time::timeout(WAIT, p.client.closed())
+            .await
+            .expect("the connection stayed open");
+        match reason {
+            quinn::ConnectionError::ApplicationClosed(c) => {
+                assert_eq!(
+                    c.error_code,
+                    quinn::VarInt::from_u32(code::DATAGRAM_ERROR as u32)
+                );
+            }
+            e => panic!("unexpected close: {e}"),
         }
     }
 }

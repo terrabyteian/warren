@@ -800,6 +800,22 @@ impl Bundle {
             if let Some(unknown) = r.what.apps.iter().find(|a| !apps.contains_key(*a)) {
                 return err(format!("rule {}: unknown app {unknown}", r.id));
             }
+            if r.what
+                .app_selector
+                .as_ref()
+                .is_some_and(|s| s.match_labels.is_empty())
+            {
+                return err(format!(
+                    "rule {}: appSelector needs matchLabels; an empty selector would match every app",
+                    r.id
+                ));
+            }
+            if deny && r.when.auth.is_some() {
+                return err(format!(
+                    "rule {}: a deny rule cannot have when conditions; it always applies",
+                    r.id
+                ));
+            }
             let auth = r.when.auth.clone().unwrap_or_default();
             let auth_max_age =
                 match &auth.max_age {
@@ -819,6 +835,20 @@ impl Bundle {
                 mfa: auth.mfa,
             });
         }
+        let mut revoked_serials = HashSet::new();
+        for s in &self.revoked.serials {
+            if s.is_empty() || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return err(format!(
+                    "revoked serial {s:?} must be plain hex digits, without separators"
+                ));
+            }
+            let digits = s.trim_start_matches('0').to_ascii_lowercase();
+            revoked_serials.insert(if digits.len() % 2 == 1 {
+                format!("0{digits}")
+            } else {
+                digits
+            });
+        }
         Ok(CompiledBundle {
             version: self.version,
             trust_domain: self.trust_domain,
@@ -834,12 +864,7 @@ impl Bundle {
             revoked_users: self.revoked.users.into_iter().collect(),
             revoked_devices: self.revoked.devices.into_iter().collect(),
             revoked_sessions: self.revoked.sessions.into_iter().collect(),
-            revoked_serials: self
-                .revoked
-                .serials
-                .into_iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect(),
+            revoked_serials,
             revoked_nodes: self.revoked.nodes.into_iter().collect(),
         })
     }
@@ -990,6 +1015,10 @@ mod tests {
     use super::*;
 
     fn bundle(apps: &str) -> Result<CompiledBundle, BundleError> {
+        bundle_with(apps, "")
+    }
+
+    fn bundle_with(apps: &str, extra: &str) -> Result<CompiledBundle, BundleError> {
         let text = format!(
             r#"{{
               "version": 1,
@@ -999,7 +1028,7 @@ mod tests {
                 "destinations": {{ "domains": ["*.lab.example.com", "nas.example.internal"], "cidrs": ["10.20.0.0/16", "fd00:20::/48"] }},
                 "clientNames": ["*.lab.example.com", "*.access.example.com"]
               }}],
-              "apps": {apps}
+              "apps": {apps}{extra}
             }}"#
         );
         serde_json::from_str::<Bundle>(&text).unwrap().compile()
@@ -1051,6 +1080,40 @@ mod tests {
             "destinations": [{"host": "files.access.example.com", "target": "nas.example.internal", "protocol": "tcp"},
                              {"cidr": "fd00:20::/64", "protocol": "icmp"}]}]"#;
         assert!(bundle(ok).is_ok());
+    }
+
+    #[test]
+    fn empty_selectors_and_conditional_denies_are_rejected() {
+        let apps = r#"[{"name": "grafana", "connectorGroup": "homelab", "labels": {"env": "prod"},
+            "destinations": [{"host": "grafana.lab.example.com", "protocol": "tcp"}]}]"#;
+        let rules = |r: &str| bundle_with(apps, &format!(r#", "rules": [{r}]"#));
+        for bad in [
+            r#"{"id": "p/a", "who": {"groups": ["eng"]}, "what": {"appSelector": {"matchLabels": {}}}}"#,
+            r#"{"id": "p/a", "who": {"groups": ["eng"]}, "what": {"appSelector": {}}}"#,
+            r#"{"id": "p/d", "effect": "deny", "who": {"groups": ["eng"]}, "what": {"apps": ["grafana"]},
+                "when": {"auth": {"mfa": true}}}"#,
+        ] {
+            assert!(rules(bad).is_err(), "{bad}");
+        }
+        for ok in [
+            r#"{"id": "p/a", "who": {"groups": ["eng"]}, "what": {"appSelector": {"matchLabels": {"env": "prod"}}},
+                "when": {"auth": {"mfa": true}}}"#,
+            r#"{"id": "p/d", "effect": "deny", "who": {"groups": ["eng"]}, "what": {"apps": ["grafana"]}}"#,
+        ] {
+            assert!(rules(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn revoked_serials_match_certificate_rendering() {
+        let serials = |s: &str| bundle_with("[]", &format!(r#", "revoked": {{"serials": [{s}]}}"#));
+        let b = serials(r#""008A01FF", "4B0c", "0abc", "000c""#).unwrap();
+        for s in ["8a01ff", "4b0c", "0abc", "0c"] {
+            assert!(b.revoked_serials.contains(s), "{s}");
+        }
+        for bad in [r#""00:8a:01""#, r#""""#, r#""0x8a01""#, r#""8a 01""#] {
+            assert!(serials(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

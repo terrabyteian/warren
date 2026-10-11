@@ -733,3 +733,224 @@ async fn name_bindings_follow_ownership_across_reloads() {
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renewal_keeps_the_inner_session_on_its_replica() {
+    use warren_harness::pki::KeyPair;
+    let d = Deployment::start(Options {
+        replicas: 2,
+        ..Options::default()
+    })
+    .await;
+    let key = KeyPair::generate();
+    let creds = d
+        .pki
+        .issue_client_with_key(&d.pki.client_spec(&alice()), &key);
+    let mut t = warren_client::connect(d.client_with(creds, TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut events = t.events();
+    echo_ok(&mut t, 47_000, b"before renewal").await;
+    let sessions = |c: &warren_connector::Connector| c.metrics().sessions_total.get();
+    let holder = sessions(&d.connector);
+    assert_eq!(holder + sessions(&d.replicas[0]), 1);
+
+    // The replica holding the session carries this client's splice, so
+    // least-loaded alone would send the renewed path to the other one.
+    let renewed = d
+        .pki
+        .issue_client_with_key(&d.pki.client_spec(&alice()), &key);
+    t.refresh_certificate(renewed, |exporter| Ok(key.sign(exporter)))
+        .await
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), events.recv()).await {
+            Ok(Some(warren_client::ClientEvent::PathChanged { .. })) => break,
+            Ok(Some(warren_client::ClientEvent::Closed(r))) => panic!("session closed: {r}"),
+            Ok(Some(_)) => {}
+            other => panic!("no path change: {other:?}"),
+        }
+    }
+    echo_ok(&mut t, 47_001, b"after renewal").await;
+    assert_eq!(sessions(&d.connector), holder);
+    assert_eq!(sessions(&d.replicas[0]), 1 - holder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn draining_keeps_sessions_and_stops_new_splices_on_either_carrier() {
+    for transport in [TransportMode::QuicOnly, TransportMode::Http2Only] {
+        let d = Deployment::start(Options {
+            connector_transport: transport,
+            ..Options::default()
+        })
+        .await;
+        let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+            .await
+            .unwrap();
+        echo_ok(&mut t, 48_000, b"before the drain").await;
+        let drain = d.connector.drain(Duration::from_secs(30));
+        tokio::pin!(drain);
+        let during = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            echo_ok(&mut t, 48_001, b"during the drain").await;
+            match warren_client::connect(d.client(&alice(), TransportMode::QuicOnly)).await {
+                Err(warren_client::ConnectError::Refused { error, details }) => {
+                    assert_eq!(error, "destination_unavailable", "{transport:?}");
+                    assert!(
+                        details.contains("no connector of group"),
+                        "{transport:?}: the relay should not splice to a draining replica: {details}"
+                    );
+                }
+                other => panic!("{transport:?}: expected a refusal, got {other:?}"),
+            }
+        };
+        tokio::select! {
+            () = &mut drain => panic!("{transport:?}: the drain ended early"),
+            () = during => {}
+        }
+        d.connector.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_icmp_errors_only_go_back_to_the_server() {
+    let d = Deployment::start(Options::default()).await;
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let device = SocketAddr::new(v4(&t), 5556);
+    let pusher: IpAddr = "10.77.0.40".parse().unwrap();
+    d.backend.inject(packet::udp(
+        SocketAddr::new(pusher, 9999),
+        device,
+        b"notify",
+    ));
+    let got = recv(&mut t).await;
+    let pg = packet::parse(&got).unwrap();
+    let err =
+        packet::icmp_error(&got, &pg, packet::IcmpError::AdminProhibited, device.ip()).unwrap();
+    let mut elsewhere = err.clone();
+    let pe = packet::parse(&elsewhere).unwrap();
+    let other: IpAddr = "10.77.0.20".parse().unwrap();
+    packet::rewrite_addr(&mut elsewhere, &pe, packet::Side::Destination, other).unwrap();
+    t.send(&elsewhere);
+    t.send(&err);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let errors: Vec<IpAddr> = d
+        .backend
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| packet::parse(s).ok())
+        .filter(|p| p.icmp == Some((3, 13)))
+        .map(|p| p.dst)
+        .collect();
+    assert_eq!(errors, vec![pusher]);
+}
+
+fn set_ipv4_fragmenting(pkt: &mut [u8], id: u16, dont_fragment: bool) {
+    pkt[4..6].copy_from_slice(&id.to_be_bytes());
+    pkt[6] = if dont_fragment { 0x40 } else { 0 };
+    pkt[10..12].copy_from_slice(&[0, 0]);
+    let ck = packet::checksum(&pkt[..20], 0);
+    pkt[10..12].copy_from_slice(&ck.to_be_bytes());
+}
+
+/// A tunnel with a name-app flow from `port` to grafana.lab.test (bound to
+/// 100.80.0.6, really 10.77.0.10:7).
+async fn name_flow(d: &Deployment, port: u16) -> (warren_client::Tunnel, SocketAddr) {
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let synthetic: IpAddr = "100.80.0.6".parse().unwrap();
+    t.bind_name(synthetic, "grafana.lab.test", "grafana")
+        .await
+        .unwrap();
+    let src = SocketAddr::new(v4(&t), port);
+    t.send(&packet::udp(src, SocketAddr::new(synthetic, 7), b"open"));
+    let _ = recv(&mut t).await;
+    (t, src)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn too_big_answers_go_to_the_real_server_of_a_name_flow() {
+    let d = Deployment::start(Options::default()).await;
+    let (_t, src) = name_flow(&d, 49_000).await;
+    let real: SocketAddr = "10.77.0.10:7".parse().unwrap();
+    let mut big = packet::udp(real, src, &[7; 1400]);
+    set_ipv4_fragmenting(&mut big, 1, true);
+    d.backend.inject(big);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let answers: Vec<IpAddr> = d
+        .backend
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| packet::parse(s).ok())
+        .filter(|p| p.icmp == Some((3, 4)))
+        .map(|p| p.dst)
+        .collect();
+    assert_eq!(answers, vec![real.ip()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_fragments_need_a_flow_and_are_translated() {
+    let d = Deployment::start(Options::default()).await;
+    let (mut t, src) = name_flow(&d, 49_100).await;
+    let real: SocketAddr = "10.77.0.10:7".parse().unwrap();
+    let synthetic: IpAddr = "100.80.0.6".parse().unwrap();
+    let fragments = |id: u16, from: SocketAddr| {
+        let mut big = packet::udp(from, src, &[9; 1800]);
+        set_ipv4_fragmenting(&mut big, id, false);
+        let p = packet::parse(&big).unwrap();
+        packet::fragment_v4(&big, &p, 1000).unwrap()
+    };
+    // A non-first fragment whose first fragment never matched a flow.
+    let stray = fragments(77, "10.77.0.20:9999".parse().unwrap());
+    d.backend.inject(stray[1].clone());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), t.recv())
+            .await
+            .is_err(),
+        "a stray fragment reached the client"
+    );
+    for f in fragments(78, real) {
+        d.backend.inject(f);
+    }
+    for _ in 0..2 {
+        let got = recv(&mut t).await;
+        let p = packet::parse(&got).unwrap();
+        assert!(p.fragment.is_some());
+        assert_eq!(
+            p.src, synthetic,
+            "every fragment comes from the synthetic address"
+        );
+        assert_eq!(p.dst, src.ip());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reloads_reach_every_session_of_a_device() {
+    let d = Deployment::start(Options::default()).await;
+    let mut first = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut first_events = first.events();
+    echo_ok(&mut first, 49_200, b"first").await;
+    // A second session from the same device takes over its addresses.
+    let mut second = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut second_events = second.events();
+    echo_ok(&mut second, 49_201, b"second").await;
+    let mut v2 = warren_harness::deploy::test_bundle(2);
+    v2["revoked"] = serde_json::json!({ "devices": ["mac-1"] });
+    d.connector
+        .reload(warren_harness::deploy::compile(&v2))
+        .unwrap();
+    for events in [&mut first_events, &mut second_events] {
+        assert_eq!(next_notice(events).await.reason, "revoked");
+    }
+}
