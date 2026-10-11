@@ -1222,8 +1222,20 @@ impl Session {
             return Some("revoked");
         }
         let group = self.shared.config.group.clone();
+        // A name stays bound only while its app still owns it here; the
+        // client binds again when it next resolves the name.
+        let owns = |name: &str, app: &str| {
+            bundle
+                .owning_app(name)
+                .is_some_and(|a| a.name == app && a.group == group)
+        };
+        self.binds.retain(|_, b| owns(&b.name, &b.app));
         let mut cut = Vec::new();
         for (k, f) in &self.flows {
+            if f.hostname.as_deref().is_some_and(|h| !owns(h, &f.app)) {
+                cut.push(*k);
+                continue;
+            }
             let app = bundle.apps.get(&f.app);
             let mut probe_dst = k.2;
             if f.server_initiated {

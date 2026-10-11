@@ -695,3 +695,41 @@ async fn the_enforcement_interface_takes_any_decision_point() {
     let _ = recv(&mut t).await;
     assert_eq!(next_denial(&mut events).await.reason, "out_of_scope");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn name_bindings_follow_ownership_across_reloads() {
+    let d = Deployment::start(Options::default()).await;
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut events = t.events();
+    let synthetic: IpAddr = "100.80.0.9".parse().unwrap();
+    t.bind_name(synthetic, "grafana.lab.test", "grafana")
+        .await
+        .unwrap();
+    let src = SocketAddr::new(v4(&t), 49_000);
+    t.send(&packet::udp(src, SocketAddr::new(synthetic, 7), b"bound"));
+    let _ = recv(&mut t).await;
+
+    // The next bundle drops the grafana app: its name now belongs to the
+    // lab-web wildcard, so the old binding no longer admits flows.
+    let mut v2 = warren_harness::deploy::test_bundle(2);
+    let apps = v2["apps"].as_array_mut().unwrap();
+    apps.retain(|a| a["name"] != "grafana");
+    v2["rules"][0]["what"]["apps"] = serde_json::json!(["echo-udp", "echo-tcp", "pusher"]);
+    d.connector
+        .reload(warren_harness::deploy::compile(&v2))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    t.send(&packet::udp(
+        SocketAddr::new(v4(&t), 49_001),
+        SocketAddr::new(synthetic, 7),
+        b"stale",
+    ));
+    let _ = recv(&mut t).await;
+    assert_eq!(next_denial(&mut events).await.reason, "out_of_scope");
+    // Binding it to its new owner works.
+    t.bind_name(synthetic, "grafana.lab.test", "lab-web")
+        .await
+        .unwrap();
+}
