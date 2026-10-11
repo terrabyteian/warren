@@ -545,3 +545,95 @@ async fn losing_a_relay_migrates_the_inner_session() {
         "the inner session was not re-established"
     );
 }
+
+async fn next_notice(
+    events: &mut tokio::sync::mpsc::Receiver<warren_client::ClientEvent>,
+) -> warren_masque::capsule::Notice {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Some(warren_client::ClientEvent::Notice(n))) => return n,
+            Ok(Some(_)) => continue,
+            other => panic!("no notice: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn certificate_refresh_extends_the_session() {
+    use warren_harness::pki::KeyPair;
+    let d = Deployment::start(Options::default()).await;
+    let key = KeyPair::generate();
+    // A certificate with five seconds left.
+    let mut short = d.pki.client_spec(&alice());
+    short.not_after = short.not_before + 65;
+    let creds = d.pki.issue_client_with_key(&short, &key);
+    let mut t = warren_client::connect(d.client_with(creds, TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut events = t.events();
+    echo_ok(&mut t, 46_000, b"before refresh").await;
+
+    // The renewed certificate for the same device key, bound to this
+    // session by the key's signature over the session's exporter.
+    let renewed = d
+        .pki
+        .issue_client_with_key(&d.pki.client_spec(&alice()), &key);
+    t.refresh_certificate(renewed.clone(), |exporter| Ok(key.sign(exporter)))
+        .await
+        .unwrap();
+
+    // A certificate for another key is refused, as is a bad signature.
+    let other = KeyPair::generate();
+    let foreign = d
+        .pki
+        .issue_client_with_key(&d.pki.client_spec(&alice()), &other);
+    // Signed by the other key, so the outer path renews but the connector
+    // refuses the session-bound refresh.
+    t.refresh_certificate(foreign, |exporter| Ok(other.sign(exporter)))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_notice(&mut events).await.reason,
+        "certificate_refresh_failed",
+        "foreign key"
+    );
+    t.refresh_certificate(renewed.clone(), |_| {
+        Ok(vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01])
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        next_notice(&mut events).await.reason,
+        "certificate_refresh_failed",
+        "bad signature"
+    );
+
+    // Past the original certificate's expiry, the session lives on.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    echo_ok(&mut t, 46_001, b"after refresh").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_end_with_their_certificate() {
+    let d = Deployment::start(Options::default()).await;
+    let mut short = d.pki.client_spec(&alice());
+    short.not_after = short.not_before + 63;
+    let mut t =
+        warren_client::connect(d.client_with(d.pki.issue_client(&short), TransportMode::QuicOnly))
+            .await
+            .unwrap();
+    let mut events = t.events();
+    echo_ok(&mut t, 47_000, b"while valid").await;
+    let mut ended = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline && !ended {
+        match tokio::time::timeout(Duration::from_millis(500), events.recv()).await {
+            Ok(Some(warren_client::ClientEvent::Closed(_))) => ended = true,
+            Ok(Some(warren_client::ClientEvent::Notice(n))) => {
+                assert!(n.reason.contains("expired"), "{n:?}")
+            }
+            _ => {}
+        }
+    }
+    assert!(ended, "the session outlived its certificate");
+}

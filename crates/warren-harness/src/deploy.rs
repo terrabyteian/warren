@@ -369,6 +369,24 @@ impl Deployment {
         }
     }
 
+    /// A client configuration for given credentials.
+    pub fn client_with(
+        &self,
+        credentials: warren_core::tls::Credentials,
+        transport: TransportMode,
+    ) -> ClientConfig {
+        ClientConfig {
+            group: GROUP.into(),
+            relays: self.relays.iter().map(relay_address).collect(),
+            transport,
+            credentials,
+            trust: self.trust.clone(),
+            tunnel_mtu: params::TUNNEL_MTU,
+            fallback_delay: params::FALLBACK_DELAY,
+            tuning: TransportTuning::default(),
+        }
+    }
+
     /// The first relay.
     pub fn relay(&self) -> &Relay {
         &self.relays[0]

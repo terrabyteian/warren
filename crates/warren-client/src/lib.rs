@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use rustls::pki_types::CertificateDer;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use warren_core::params;
@@ -193,6 +192,7 @@ pub struct Tunnel {
     carrier: watch::Receiver<Option<CarrierKind>>,
     _endpoint: quinn::Endpoint,
     shutdown: Arc<watch::Sender<bool>>,
+    renew: watch::Sender<Option<Credentials>>,
 }
 
 impl Tunnel {
@@ -266,11 +266,15 @@ impl Tunnel {
         }
     }
 
-    /// Hands the connector a renewed certificate, signing the session's
-    /// exporter value with the device key so it is bound to this session.
+    /// Moves the tunnel to a renewed certificate: the connector gets it in
+    /// a `WARREN_CERT_REFRESH` capsule, signed with the device key over the
+    /// session's exporter value so it is bound to this session, and the
+    /// outer path is re-established with it before the old certificate
+    /// expires (docs/protocol.md sections 4.3 and 5). `sign` signs with the
+    /// device key, which may live in hardware.
     pub async fn refresh_certificate(
         &self,
-        chain: &[CertificateDer<'static>],
+        credentials: Credentials,
         sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>,
     ) -> Result<(), String> {
         let mut exporter = [0u8; 32];
@@ -279,13 +283,19 @@ impl Tunnel {
             .map_err(|_| "keying material export failed".to_owned())?;
         let signature = sign(&exporter)?;
         let capsule = Capsule::CertRefresh(CertRefresh {
-            chain: chain.iter().map(|c| Bytes::copy_from_slice(c)).collect(),
+            chain: credentials
+                .chain
+                .iter()
+                .map(|c| Bytes::copy_from_slice(c))
+                .collect(),
             signature: Bytes::from(signature),
         });
         self.tx
             .send_capsule(&capsule)
             .await
-            .map_err(|_| "tunnel closed".to_owned())
+            .map_err(|_| "tunnel closed".to_owned())?;
+        self.renew.send_replace(Some(credentials));
+        Ok(())
     }
 
     /// Closes the tunnel.
@@ -455,6 +465,28 @@ async fn dial_outer(
     Err(refusal.unwrap_or_else(|| ConnectError::Unreachable(errors.join("; "))))
 }
 
+/// TLS and QUIC configurations for dialling relays with a credential.
+struct OuterConfigs {
+    quic: quinn::ClientConfig,
+    h2: Arc<rustls::ClientConfig>,
+}
+
+fn outer_configs(config: &ClientConfig, creds: &Credentials) -> Result<OuterConfigs, ConnectError> {
+    let verifier = Arc::new(WarrenServerVerifier::new(
+        config.trust.clone(),
+        ExpectServer::Relay,
+        Arc::new(NoRevocations),
+    ));
+    let quic_tls = tls::client_config(creds, verifier.clone(), tls::ALPN_H3)
+        .map_err(|e| ConnectError::Credentials(e.to_string()))?;
+    let h2 = tls::client_config(creds, verifier, tls::ALPN_H2)
+        .map_err(|e| ConnectError::Credentials(e.to_string()))?;
+    Ok(OuterConfigs {
+        quic: quic::client_config(quic_tls, Layer::Outer, config.tuning),
+        h2: Arc::new(h2),
+    })
+}
+
 /// Sets up the tunnel.
 pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
     if config.tunnel_mtu < params::TUNNEL_MTU_FLOOR {
@@ -473,19 +505,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
         .map_err(|e| ConnectError::Credentials(e.to_string()))?;
 
     // Outer layer.
-    let relay_verifier = Arc::new(WarrenServerVerifier::new(
-        config.trust.clone(),
-        ExpectServer::Relay,
-        Arc::new(NoRevocations),
-    ));
-    let outer_quic_tls =
-        tls::client_config(&config.credentials, relay_verifier.clone(), tls::ALPN_H3)
-            .map_err(|e| ConnectError::Credentials(e.to_string()))?;
-    let h2_tls = Arc::new(
-        tls::client_config(&config.credentials, relay_verifier, tls::ALPN_H2)
-            .map_err(|e| ConnectError::Credentials(e.to_string()))?,
-    );
-    let outer_quic = quic::client_config(outer_quic_tls, Layer::Outer, config.tuning);
+    let configs = outer_configs(&config, &config.credentials)?;
     let bind: SocketAddr = match config.relays.first().map(|r| r.quic) {
         Some(SocketAddr::V6(_)) => "[::]:0".parse().expect("valid"),
         _ => "0.0.0.0:0".parse().expect("valid"),
@@ -498,7 +518,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
             .ok_or_else(|| ConnectError::Unreachable("no async runtime".into()))?,
     )
     .map_err(|e| ConnectError::Unreachable(e.to_string()))?;
-    let outer = dial_outer(&config, &outer_endpoint, &outer_quic, &h2_tls, 0).await?;
+    let outer = dial_outer(&config, &outer_endpoint, &configs.quic, &configs.h2, 0).await?;
     info!(relay = %outer.relay, carrier = ?outer.conn.carrier(), "spliced through relay");
 
     // Inner session over the outer stream.
@@ -516,6 +536,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
     let shutdown = Arc::new(shutdown);
     let inner_slot: Arc<Mutex<Option<quinn::Connection>>> = Arc::default();
     let (events_tx, events_rx) = mpsc::channel(256);
+    let (renew, renew_rx) = watch::channel(None);
     tokio::spawn(supervise_outer(
         config.clone(),
         outer,
@@ -523,12 +544,12 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
         inbound,
         connector_addr,
         outer_endpoint.clone(),
-        outer_quic,
-        h2_tls,
+        configs,
         carrier_tx,
         events_tx.clone(),
         shutdown_rx,
         inner_slot.clone(),
+        renew_rx,
     ));
 
     let inner_verifier = Arc::new(WarrenServerVerifier::new(
@@ -691,6 +712,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
         carrier: carrier_rx,
         _endpoint: inner_endpoint,
         shutdown,
+        renew,
     })
 }
 
@@ -704,12 +726,12 @@ async fn supervise_outer(
     inbound: Inbound,
     connector: SocketAddr,
     endpoint: quinn::Endpoint,
-    quic_config: quinn::ClientConfig,
-    h2_tls: Arc<rustls::ClientConfig>,
+    mut configs: OuterConfigs,
     carrier: watch::Sender<Option<CarrierKind>>,
     events: mpsc::Sender<ClientEvent>,
     mut shutdown: watch::Receiver<bool>,
     inner: Arc<Mutex<Option<quinn::Connection>>>,
+    mut renew: watch::Receiver<Option<Credentials>>,
 ) {
     let end = |why: String| {
         info!(reason = %why, "tunnel ended");
@@ -719,22 +741,56 @@ async fn supervise_outer(
         let _ = events.try_send(ClientEvent::Closed(why));
     };
     loop {
-        loop {
+        let renewed = loop {
             tokio::select! {
                 d = outer.rx.datagrams.recv() => {
-                    let Some(d) = d else { break };
+                    let Some(d) = d else { break None };
                     if let Some((0, pkt)) = split_context(&d) {
                         inbound.deliver(connector, pkt);
                     }
                 }
                 c = outer.rx.capsules.recv() => {
-                    if c.is_none() { break }
+                    if c.is_none() { break None }
+                }
+                r = renew.changed() => {
+                    if r.is_err() { break None }
+                    let creds = renew.borrow_and_update().clone();
+                    if let Some(c) = creds { break Some(c) }
                 }
                 _ = shutdown.changed() => {
                     outer.conn.close("client closed");
                     return;
                 }
             }
+        };
+        if let Some(creds) = renewed {
+            // A renewed certificate: open a new outer connection with it
+            // before the old one's certificate expires, and move the inner
+            // session over (docs/protocol.md section 4.3).
+            match outer_configs(&config, &creds) {
+                Ok(c) => configs = c,
+                Err(e) => {
+                    warn!(error = %e, "renewed credentials are unusable");
+                    continue;
+                }
+            }
+            match dial_outer(&config, &endpoint, &configs.quic, &configs.h2, outer.index).await {
+                Ok(fresh) => {
+                    info!(relay = %fresh.relay, "outer path renewed with the new certificate; migrating");
+                    *path.tx.write().expect("path lock") = Some(fresh.tx.clone());
+                    carrier.send_replace(Some(fresh.conn.carrier()));
+                    let _ = events.try_send(ClientEvent::PathChanged {
+                        carrier: fresh.conn.carrier(),
+                        relay: fresh.relay.clone(),
+                    });
+                    let old = std::mem::replace(&mut outer, fresh);
+                    old.conn.close("renewed");
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not renew the outer path; keeping the current one")
+                }
+            }
+            continue;
         }
         debug!(relay = %outer.relay, "outer path lost");
         // A relay that cut us for revocation or expiry will not take us
@@ -760,7 +816,7 @@ async fn supervise_outer(
             // Start with the next relay: the one that just failed is the
             // least likely to work.
             let next = (outer.index + 1) % config.relays.len().max(1);
-            match dial_outer(&config, &endpoint, &quic_config, &h2_tls, next).await {
+            match dial_outer(&config, &endpoint, &configs.quic, &configs.h2, next).await {
                 Ok(o) => break o,
                 Err(ConnectError::Rejected(e)) => {
                     end(format!("access revoked or certificate expired: {e}"));
