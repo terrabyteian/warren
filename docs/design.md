@@ -353,23 +353,26 @@ Non-web clientless access (SSH, RDP, VNC in the browser) comes later.
   stands for; the connector resolves that name's target (the name itself unless
   the app sets a separate one) inside the private network and translates
   addresses (NAT). No internal DNS data is exposed to the client
-  beyond the user's own entitlements and the names other apps own beneath
-  them.
+  beyond the user's own entitlements.
 - **Names are claimed once.** Each connector group and each delegated source
   has a deployment-admin-owned scope of client-facing names. Every name has
   exactly one owning app across the deployment (an exact host first, otherwise
-  the most specific matching wildcard), and the client and connector bind a
-  name only to that app, so a broader wildcard app never reaches a more
-  specific app's name. warren's own names (control plane, relays, IdP sign-in
-  hosts) are reserved, so no app or cluster can take over a name another app
-  or warren itself uses ([policy.md](policy.md#3-apps)).
+  the most specific matching wildcard), and the connector accepts a name only
+  for that app, so a broader wildcard app never reaches a more specific app's
+  name; a bind to the wrong app is rejected and audited. warren's own names
+  (control plane, relays, IdP sign-in hosts) are reserved, so no app or cluster
+  can take over a name another app or warren itself uses
+  ([policy.md](policy.md#3-apps)).
 - **CIDR and IP apps keep real addresses** and are routed as-is.
 - **Split DNS.** On macOS the client claims only the internal DNS suffixes in
   use. Names outside them, and names under them that warren does not publish,
   resolve exactly as they would without warren.
 - **Requestable apps.** Names of apps a user may request but cannot yet reach
   still resolve, so the connection fails with a "request access" reason instead
-  of a lookup failure.
+  of a lookup failure. Apps a user may neither reach nor request stay
+  invisible: their names fail as a lookup failure, or, under a wildcard of an
+  app the user can reach, with a reason from the connector that never names
+  the other app.
 - **Bypass detection.** Applications that use their own encrypted DNS (DNS over
   HTTPS or private DNS settings) bypass split DNS. The client detects such
   bypass for internal names and tells the user how to fix it instead of failing

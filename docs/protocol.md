@@ -228,19 +228,22 @@ Invariants:
 - For FQDN and wildcard apps the client answers DNS queries for entitled names
   with synthetic addresses from its local pools `SYNTHETIC_POOL_V4` and
   `SYNTHETIC_POOL_V6`. Synthetic addresses are meaningful only inside one
-  client's sessions. The client binds a name only to its owning app; a name
-  under an entitled wildcard that another app owns is never bound to the
-  wildcard app, and a connection to it fails fast with a deny reason (G12).
+  client's sessions. The client knows only the user's own apps (those the user
+  may reach or request) and binds each name to the most specific of them that
+  matches it.
 - Before releasing packets to a synthetic address, the client binds it on the
   inner session with a `WARREN_NAME_BIND` capsule {synthetic address, name,
   app}. The connector MUST check, against its verified bundle, that the named
-  app is the name's owning app and that the app is served by its group, and
-  MUST reject the bind otherwise, so a broader wildcard app can never be used
-  to reach a more specific app's name. It then answers `WARREN_NAME_BOUND`
-  {synthetic address, result, reason}. Binding happens when the name resolves,
-  so it usually completes before the application's first packet; until it
-  does, the client holds that destination's packets (`FIRST_PACKET_HOLD`,
-  bounded by `FIRST_PACKET_QUEUE`).
+  app is the name's owning app and that the app is served by its group. A bind
+  that names any other app, such as a broader wildcard app for a name a more
+  specific app owns, MUST be rejected with reason `name_not_in_app`; the
+  rejection is an access decision with its own audit record (G13), and its
+  reason never names the owning app. The connector then answers
+  `WARREN_NAME_BOUND` {synthetic address, result, reason}. Binding happens when
+  the name resolves, so it usually completes before the application's first
+  packet; until it does, the client holds that destination's packets
+  (`FIRST_PACKET_HOLD`, bounded by `FIRST_PACKET_QUEUE`). When a bind fails the
+  client fails those packets fast and shows the reason (G12).
 - The connector resolves the name's target (the name itself unless the app
   sets a separate target, [policy.md](policy.md#3-apps)) with its own resolver
   when a flow starts, MUST check that every address used is inside its group's
@@ -281,10 +284,10 @@ Invariants:
      human-readable message, remediation} on the CONNECT-IP stream.
 - Reason codes include `no_rule`, `request_access`, `posture_failed`,
   `reauth_required`, `mfa_required`, `outside_schedule`, `network_not_allowed`,
-  `device_not_approved`, `revoked`, `grant_expired`, `out_of_scope`, and
-  `server_initiated_blocked`. Clients map unknown codes to the message text.
-  The client rate-limits notifications per app so a retrying application
-  produces one clear message, not a stream of them.
+  `device_not_approved`, `revoked`, `grant_expired`, `out_of_scope`,
+  `name_not_in_app`, and `server_initiated_blocked`. Clients map unknown codes
+  to the message text. The client rate-limits notifications per app so a
+  retrying application produces one clear message, not a stream of them.
 - Before closing a session for revocation, draining or policy reasons, the
   connector SHOULD send a `WARREN_NOTICE` capsule with the reason.
 
@@ -455,8 +458,8 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
    clock and then drop it, so stale posture fails closed at the connector even
    if the client stops reporting (G11).
 6. **Entitlements.** Apps the user may reach or request, with names, ranges,
-   ports, connector groups and the relay list, and under each wildcard name
-   the more specific names that other apps own. Nothing in it is secret.
+   ports, connector groups and the relay list. It never names apps the user
+   may neither reach nor request. Nothing in it is secret.
 7. **Notices.** A server-to-client stream of user-facing events (re-auth
    needed, device revoked, posture failing, entitlements changed). It drives the
    UI only; clients are never part of enforcement.

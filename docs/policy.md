@@ -97,9 +97,13 @@ Client-facing names are claimed, not just declared:
   one source, exact hosts and narrower wildcards may sit under a broader
   wildcard, and the more specific claim owns the names it covers: below,
   `grafana.lab.example.com` belongs to `grafana`, not to `lab-web`.
-- Clients and connectors map a name to an app only through its owning app
+- The connector accepts a name only for its owning app
   ([protocol.md](protocol.md#6-names-addresses-and-routes)), so a broader
-  wildcard app can never be used to reach a more specific app's name.
+  wildcard app can never be used to reach a more specific app's name. The
+  client knows only the user's own apps and binds a name to the most specific
+  of them that matches, so a name owned by an app the user cannot see is
+  rejected at the connector with `name_not_in_app` and audited, without naming
+  that app.
 - warren's own names (the control plane, the relays, and the configured IdP
   sign-in hosts) are reserved: no app can claim them, and no wildcard host
   covers them.
@@ -163,7 +167,9 @@ Field notes:
   to; its host must be one of the app's destination targets.
 - `discoverable: true` makes the app visible to users who may request it, so a
   connection attempt fails with a "request access" reason instead of a lookup
-  failure.
+  failure. A non-discoverable app stays invisible to users who cannot reach
+  it: its names fail as a lookup failure, or with `name_not_in_app` when they
+  fall under a wildcard of an app the user can reach.
 
 ### Kubernetes API apps
 
@@ -595,6 +601,7 @@ user sees ([protocol.md](protocol.md#7-flow-admission-and-deny-signalling)):
 | `schedule` | `outside_schedule` | "lab-web is available Mon-Fri 08:00-19:00 Europe/Berlin." |
 | `network` | `network_not_allowed` | "grafana isn't available from this network." |
 | grant expired | `grant_expired` | "Your access to prod-db ended at 14:05. Request access again." |
+| name bound to an app that does not own it | `name_not_in_app` | "secret.lab.example.com isn't part of any app you can reach." |
 
 The console's "why?" explorer shows the same explanation for any audited
 decision, and the simulator evaluates hypothetical requests, or replays recent
