@@ -30,7 +30,10 @@ dnsNames: [nodes.warren.example.com]
 
 # Unauthenticated connections one source may hold (0: no limit), and load
 # balancers that send PROXY protocol version 2 headers naming the real
-# source (see docs/operating.md).
+# source: list only the load balancer's own addresses (such as
+# [192.0.2.10]), never ranges peers also connect from directly, since a
+# trusted address that sends no header is disconnected (see
+# docs/operating.md).
 connections:
   maxPerSource: 64
   trustedProxies: []

@@ -444,7 +444,7 @@ components:
       type: object
       properties:
         trust_domain: { type: string }
-        api_base: { type: string }
+        api_base: { type: string, description: "For sign-in and enrollment only; an enrolled client makes later calls at the api_base its enrollment answer gives." }
         authorize_endpoint: { type: string }
         token_endpoint: { type: string }
         trust_bundle: { type: string, description: "PEM: root CA, client CA, infrastructure CA." }

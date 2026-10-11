@@ -25,8 +25,11 @@ name, `publicUrl`'s host included, gets the operator's. The operator's
 certificate serves browser sign-in and enrollment only (discovery,
 `/v1/auth/*` and `/v1/devices`); every other call made at `publicUrl`'s host
 is refused with `421 misdirected_request`. So `tls` needs at least one name
-in `dnsNames` besides `publicUrl`'s host, resolving to the same address from
+in `dnsNames` besides `publicUrl`'s host that reaches the control plane from
 everywhere clients and nodes run; the first such name is the internal name.
+Any name in `dnsNames` gets the control plane's own certificate, so peers in
+the control plane's own cluster can use a ClusterIP Service name instead
+(see [Behind a load balancer](#behind-a-load-balancer)).
 
 - Clients sign in and enroll at the organization URL. The enrollment answer
   gives them `api_base`, a URL under the internal name, and from then on they
@@ -96,7 +99,7 @@ to 0 to turn the limit off.
 ```yaml
 connections:
   maxPerSource: 64           # 0: no limit
-  trustedProxies: [10.0.0.0/8]
+  trustedProxies: [192.0.2.10, 192.0.2.11]   # the load balancer's own addresses
 ```
 
 ### Behind a load balancer
@@ -106,19 +109,33 @@ look like the balancer, so the per-source limit, and the addresses in audit
 records, would see only it. Either keep client addresses or have the
 balancer send them:
 
-- **PROXY protocol version 2.** List the balancer's addresses (or the range
-  they come from) in `connections.trustedProxies`. Every connection from
-  those addresses must then start with a PROXY protocol version 2 header,
-  and the control plane uses the source it names; a `LOCAL` header (a
-  health check) counts as the balancer itself. A trusted address that sends
-  anything else is disconnected, and no other peer's connection is read for
-  a header. The balancer must terminate nothing: TLS goes through to the
+- **PROXY protocol version 2.** List only the balancer's own addresses in
+  `connections.trustedProxies`. Every connection from those addresses must
+  then start with a PROXY protocol version 2 header, and the control plane
+  uses the source it names; a `LOCAL` header (a health check) counts as the
+  balancer itself. A trusted address that sends anything else is
+  disconnected, and no other peer's connection is read for a header. So
+  never list a range that peers also connect from directly, such as node,
+  pod or office ranges: a relay, connector or client connecting from such
+  an address without passing through the balancer sends no header and is
+  disconnected. The balancer must terminate nothing: TLS goes through to the
   control plane, since relays, connectors and enrolled clients authenticate
   with certificates.
 - **Kubernetes.** Give the control plane's `LoadBalancer` Service
   `externalTrafficPolicy: Local`, so pods see client addresses, or enable
   PROXY protocol version 2 on the cloud load balancer (usually with an
-  annotation on the Service) and list the node or load-balancer range in
-  `trustedProxies`. With the default `externalTrafficPolicy: Cluster` and
-  no PROXY protocol, every peer appears as a node address: set
-  `maxPerSource` to 0 rather than let the limit refuse legitimate peers.
+  annotation on the Service) and list only the load balancer's own
+  addresses in `trustedProxies`. With the default
+  `externalTrafficPolicy: Cluster` and no PROXY protocol, every peer appears
+  as a node address: set `maxPerSource` to 0 rather than let the limit
+  refuse legitimate peers.
+- **Relays and connectors in the same cluster.** kube-proxy sends in-cluster
+  traffic for a `LoadBalancer` IP straight to the pod, bypassing the load
+  balancer, so it carries no PROXY header; if it arrives from a trusted
+  address it is disconnected. Give in-cluster relays and connectors a
+  ClusterIP Service name that is also in `dnsNames` (for example
+  `warren.warren-system.svc.cluster.local`), so they reach the control plane
+  directly under its own certificate, or set the `LoadBalancer` Service's
+  `status.loadBalancer.ingress[].ipMode` to `Proxy` where the cloud
+  provider supports it, so in-cluster traffic goes through the load
+  balancer too.
