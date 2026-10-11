@@ -21,7 +21,7 @@ env:
 # rust-toolchain.toml. Third-party actions are pinned by commit.
 jobs:
   lint:
-    name: rustfmt and shellcheck
+    name: rustfmt, shellcheck and script tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,6 +30,8 @@ jobs:
       - run: rustup toolchain install
       - run: cargo fmt --all --check
       - run: shellcheck scripts/*.sh
+      - name: DCO gate tests
+        run: scripts/test-check-dco.sh
 
   clippy:
     name: clippy
@@ -94,7 +96,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - name: every commit is signed off
+      - name: every outside commit is signed off
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}

@@ -21,8 +21,9 @@ design in issues is as valuable as code right now.
 
 ## Developer Certificate of Origin
 
-Every commit must be signed off to certify the Developer Certificate of
-Origin below. Use `git commit -s`, which adds a trailer like:
+Every commit from an outside contributor must be signed off to certify the
+Developer Certificate of Origin below. Use `git commit -s`, which adds a
+trailer like:
 
 ```
 Signed-off-by: Your Name <you@example.com>
@@ -31,6 +32,12 @@ Signed-off-by: Your Name <you@example.com>
 The email must match the commit's author email. CI checks every commit in a
 pull request; to fix a missing sign-off, amend (`git commit --amend -s`) or
 rebase (`git rebase --signoff main`).
+
+The DCO is an attestation that outside contributors make about their
+contributions, so commits authored by the project owner
+(`terrabyteian <terrabyteian@users.noreply.github.com>`) are exempt.
+Maintainers confirm the authorship of any owner-attributed commit in an outside
+pull request.
 
 ```
 Developer Certificate of Origin
@@ -82,6 +89,7 @@ The checks CI runs, in order:
 ```sh
 cargo fmt --all --check
 shellcheck scripts/*.sh
+scripts/test-check-dco.sh
 cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 cargo clippy -p warren --no-default-features --features relay,connector --all-targets --locked --offline -- -D warnings
 cargo build --workspace --all-targets --locked --offline
