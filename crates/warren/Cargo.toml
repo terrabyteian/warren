@@ -1,0 +1,27 @@
+[package]
+name = "warren"
+description = "One binary for warren's control plane, relay and connector roles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Each role is a feature. A data-path build is
+# `--no-default-features --features relay,connector`, which must never link
+# control-plane, console or Kubernetes crates (scripts/check-closure.sh).
+[features]
+default = ["control-plane", "relay", "connector"]
+control-plane = ["dep:warren-control"]
+relay = ["dep:warren-relay"]
+connector = ["dep:warren-connector"]
+
+[dependencies]
+clap.workspace = true
+warren-connector = { workspace = true, optional = true }
+warren-control = { workspace = true, optional = true }
+warren-relay = { workspace = true, optional = true }
+
+[lints]
+workspace = true

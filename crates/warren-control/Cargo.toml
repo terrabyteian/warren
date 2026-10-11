@@ -1,0 +1,17 @@
+[package]
+name = "warren-control"
+description = "Control plane role: identity, device trust, certificates, policy distribution, revocation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+warren-core.workspace = true
+warren-policy.workspace = true
+warren-console.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "warren-policy"
+description = "Policy schema and its compilation to Cedar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

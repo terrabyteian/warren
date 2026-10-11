@@ -1,0 +1,17 @@
+[package]
+name = "warren-connector"
+description = "Connector role: end-to-end session termination, per-connection policy enforcement, forwarding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+warren-core.workspace = true
+warren-masque.workspace = true
+warren-policy.workspace = true
+
+[lints]
+workspace = true

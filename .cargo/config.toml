@@ -1,0 +1,8 @@
+# Builds use only the vendored sources in vendor/, which match Cargo.lock.
+# Refresh them with `cargo vendor --locked vendor` after a reviewed change to
+# the dependency set (see docs/dependencies.md).
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
