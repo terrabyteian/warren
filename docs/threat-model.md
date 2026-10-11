@@ -169,7 +169,10 @@ make it hard, visible and recoverable.
 
 - **Hard.** Minimal exposed surface; admin actions require an authenticated,
   recently MFA'd admin identity from the IdP; CA and signing keys are encrypted
-  at rest, with an offline root possible (G16, G18). Policy from Git or CRDs is
+  at rest, with an offline root possible (G16, G18). Until the console brings
+  remote admin access (M3), the admin API listens only on a local Unix socket
+  on the control-plane host, mode 0600, which grants nothing an operator of
+  that host does not already hold. Policy from Git or CRDs is
   reviewed outside warren before it applies (G19).
 - **Visible.** Every change and every decision is audited and can be streamed
   off-box as it happens to sinks the control plane cannot rewrite (G13).
@@ -276,10 +279,12 @@ Residual risk: a fully compromised device acts as its user until detected.
 ### T12. Rogue relay or connector through a stolen join token
 
 Join tokens are single-use, short-lived and scoped to one role and one
-connector group. A token also pins the deployment root, so a node being
-bootstrapped cannot be steered to an impostor control plane, and the node's
-key is generated on the node: only its signed certificate request leaves
-it. A node's identity is an infrastructure certificate the admin
+connector group. The control plane stores only a hash of each token, and the
+token carries the root CA's fingerprint, so a joining node pins the
+deployment before trusting anything the control plane answers and cannot be
+steered to an impostor control plane. The node's key is generated on the
+node: only its signed certificate request leaves it. A node's identity is an
+infrastructure certificate the admin
 can see and revoke (G9). A rogue relay gains only what T1 describes. A rogue
 connector in a group could receive that group's sessions until it is noticed
 and revoked; every attachment is audited (G13). Admin approval of new
@@ -379,10 +384,11 @@ extend access past the other's view (G4, G9).
 | Item | Milestone |
 | --- | --- |
 | Choose the hardware attestation path for Mac device keys and its trust class | M1 |
-| Specify posture-statement and policy-bundle encodings and their signature formats | M1 |
+| Specify the posture-statement encoding and signature (policy bundles are specified in [protocol.md](protocol.md#112-relays-and-connectors-to-control-plane-link-e)) | M2 |
 | Specify the clientless session-assertion format and its signature | M3 |
 | Revocation-deadline integration test and published latency metric | M2 |
 | Per-IdP revocation latency documentation | M2 |
 | Off-box audit streaming verified end to end | M3 |
+| Replace the M1 cargo-vet exemptions with audits, imported audits or reviewed publisher trust ([dependencies.md](dependencies.md#4-audit-sources-and-trust-decisions)) | M4 |
 | Release signing, provenance and reproducible-build checks | M4 |
 | External security audit of the design and implementation | M4 |

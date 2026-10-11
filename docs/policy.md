@@ -394,7 +394,7 @@ The compiler generates a Cedar schema for each policy set. Its core is:
 ```cedarschema
 namespace Warren {
   entity Group;
-  entity User in [Group] { email: String };
+  entity User in [Group] { email: String, subject: String };
   entity AutoApprover;                      // warren's built-in automatic approver
   entity AppLabel;                          // one entity per "key=value" label
   entity App in [AppLabel] { connectorGroup: String };
@@ -434,6 +434,10 @@ namespace Warren {
 The schema and the policy examples in this section validate in Cedar's strict
 mode with the Cedar 4.13 CLI.
 
+A user's `email` is the address the IdP asserted, lowercased, or empty when
+the IdP marked it unverified; `subject` is the IdP's subject identifier. They
+are what `who.users` matches.
+
 The enforcement point builds the request: the principal and groups from the
 signed entity snapshot, the device and its signals from the latest verified
 posture statement (dropping every signal once that statement is stale, as
@@ -446,15 +450,17 @@ relay, and grants from the snapshot filtered by expiry on the local clock.
 ### 8.2 Rules
 
 Each rule compiles to exactly one Cedar policy. The policy ID is the rule's
-path, `<policy>/<rule>`, and an `@source` annotation records the file and line
-or the CRD it came from, so every decision points back to what a person wrote.
+path, `<policy>/<rule>`, carried in an `@id` annotation, and an `@source`
+annotation records the file and line of the rule or the CRD it came from, so
+every decision points back to what a person wrote. Cedar numbers policies when
+it parses a set, so enforcement points take each policy's ID from its `@id`.
 
 `observability/engineers-view-grafana` from [section 5](#5-access-policies)
 compiles to:
 
 ```cedar
 @id("observability/engineers-view-grafana")
-@source("config/policies/observability.yaml:6")
+@source("config/policies/observability.yaml:7")
 permit (
   principal in Warren::Group::"engineering",
   action == Warren::Action::"connect",
@@ -488,6 +494,16 @@ when {
 Because the posture profile requires a device, this rule can never match a
 browser session even though it lists `browser`; the compiler warns about such
 rules.
+
+`who` and `what` go into the policy scope when they name a single group, app
+or label, as above. Otherwise they become the first conditions of the `when`
+clause: a disjunction of `principal in Warren::Group::"…"` for groups and
+`principal.email == "…"` or `principal.subject == "…"` for users (an entry
+with `@` is an email), and of `resource == Warren::App::"…"` for apps and
+`resource in Warren::AppLabel::"…"` for each selector label. A `via` that
+lists both `client` and `browser` adds no condition. A deny rule without
+`via` applies to every kind of session. Strings are written as Cedar string
+literals with quotes, backslashes and control characters escaped.
 
 A label selector becomes membership in a label entity, and a deny rule becomes
 a `forbid`, which Cedar always lets win over any `permit`:
@@ -587,7 +603,9 @@ Every decision is explainable by named rules and named conditions (G12):
 - **Default denies** (no rule allowed) list the candidate rules, the ones
   whose `who` and `what` match the request, with the first condition each one
   failed. The compiler keeps each rule's conditions as separate expressions so
-  the explainer can evaluate them one at a time.
+  the explainer can evaluate them one at a time, and ships them in the policy
+  bundle with the reason code and message for each
+  ([protocol.md](protocol.md#112-relays-and-connectors-to-control-plane-link-e)).
 
 The connector turns the failing condition into the reason code and message the
 user sees ([protocol.md](protocol.md#7-flow-admission-and-deny-signalling)):

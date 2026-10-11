@@ -473,7 +473,10 @@ Requirements:
   given to clients at enrollment over HTTPS to the organization URL, verified
   with WebPKI or with a fingerprint preset by MDM. After enrollment clients
   verify relays, connectors and the control plane's client API against the
-  bundle only.
+  bundle only, and require the certificate to name the role they expect
+  (`warren://{td}/control-plane/{id}` for the control plane), so no relay or
+  connector certificate can stand in for the control plane. The control plane
+  never issues a node a certificate for its own or the IdP's host names.
 - The trust domain `{td}` is the deployment's identifier, used in URI SANs.
 
 ### 10.2 User+device certificate
@@ -511,6 +514,8 @@ Requirements:
   Verifiers ignore fields appended after `tunnelAddresses`.
 - Group membership is deliberately absent: it changes faster than certificates
   and reaches connectors in signed policy bundles instead.
+- `notAfter` never passes the end of the sign-in session the certificate
+  belongs to (`SESSION_MAX_LIFETIME`).
 - Issuance needs a signed PKCS#10 request from the device key, a live session,
   an enabled user, an approved and unrevoked device, and passing baseline
   posture. Renewal starts at half-life (`CLIENT_CERT_RENEW_AT`, fixed at 0.5)
@@ -528,9 +533,16 @@ Requirements:
   connections; connectors need both (they are the TLS server of link C and the
   TLS client of links B and E).
 - Lifetime `INFRA_CERT_LIFETIME`, renewed at half-life over link E.
+- Subject: empty, as for client certificates; the SAN carries the identity.
+  Relays get both serverAuth and clientAuth as well: they listen on links A
+  and B and dial out on link E.
 - Bootstrap: a single-use join token, valid for `JOIN_TOKEN_LIFETIME` and scoped
   to one role (and one connector group), is exchanged with a signed request for
-  the first certificate.
+  the first certificate. The token is `wj1.<secret>.<fingerprint>`: 32 random
+  bytes and the SHA-256 of the root CA certificate's DER, both base64url. The
+  joining node pins the deployment by checking the root it receives against
+  the fingerprint before it trusts anything else in the answer. The control
+  plane stores only a hash of the secret.
 
 #### Join exchange
 
@@ -555,6 +567,21 @@ Requirements:
 - The node accepts the result only if the bundle's root is the pinned one,
   the certificate chains to it through an infrastructure CA, names the role
   and group the token was for, and carries the node's own key.
+
+### 10.4 Encodings
+
+- **Object identifiers.** `WARREN_OID_ARC` is a UUID-based arc (ITU-T
+  X.667, section 14), so it needs no registration. The identity extension is
+  `WARREN_OID_ARC.1`, encoded as in [section 10.2](#102-userdevice-certificate).
+  Until a hardware attestation path exists the enrollment trust class is
+  device-reported (1).
+- **Key identifiers** (Subject and Authority Key Identifier) are the leftmost
+  160 bits of the SHA-256 digest of the subject public key (RFC 7093,
+  method 1).
+- **Times** are UTCTime through 2049 and GeneralizedTime from 2050, in UTC
+  with seconds (RFC 5280 section 4.1.2.5).
+- **Signatures** on certificates and PKCS#10 requests are ECDSA P-256 with
+  SHA-256, with no algorithm parameters (RFC 5758).
 
 ## 11. Control channels
 
@@ -594,6 +621,26 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
    needed, device revoked, posture failing, entitlements changed). It drives the
    UI only; clients are never part of enforcement.
 
+The endpoints, all JSON unless noted, are described in
+[api/openapi.yaml](api/openapi.yaml):
+
+| Step | Request |
+| --- | --- |
+| Discovery | `GET /.well-known/warren`: trust domain, API base, sign-in endpoints, trust bundle (root, client CA, infrastructure CA, PEM), protocol versions. |
+| Sign-in | `GET /v1/auth/authorize` with `redirect_uri`, `code_challenge`, `code_challenge_method=S256` and `state`, in the system browser. The redirect URI is an `http` loopback URI on `127.0.0.1` or `[::1]` with any port (RFC 8252 section 7.3), or one the deployment configures exactly; anything else gets an error page, never a redirect. The control plane runs its own authorization-code flow with PKCE and a nonce toward the IdP, then redirects to the client with a one-time `code` (valid 2 minutes) and the client's `state`, or with `error` and a human-readable `error_description`. |
+| Session | `POST /v1/auth/token` with a compact JWS (ES256, `typ` `warren-session-request+jws`, the device's public key as the header's `jwk`) whose payload is `{code, code_verifier, redirect_uri, iat}`. The control plane checks the signature, the PKCE verifier, the redirect URI and that `iat` is within `CLOCK_SKEW_ALLOWANCE`, and returns a session bound to that key with a bearer token. |
+| Enrollment | `POST /v1/devices` with a PKCS#10 request signed by the session's device key, platform facts, and where the key lives. |
+| Certificates | `POST /v1/certificates` with a PKCS#10 request signed by the session's device key. Renewal is the same call. |
+| Entitlements | `GET /v1/entitlements`. |
+
+After sign-in the client authenticates link D calls with its session token,
+and every call that yields a credential also proves possession of the device
+key with a request signed by it, so a token alone yields nothing beyond the
+user's entitlement data. Errors are RFC 9457 problem details with a stable
+`reason` code and a `detail` written for people, so the client can always say
+why something failed (G12). Posture reports and notices arrive with
+posture evaluation in M2.
+
 ### 11.2 Relays and connectors to control plane (link E)
 
 - mTLS with infrastructure certificates.
@@ -610,6 +657,33 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
 - **Event stream:** [section 12](#12-revocation-push-channel).
 - **Health and audit.** Nodes report health and metrics and export audit
   records to the control plane and any configured sinks.
+
+Encodings and endpoints ([api/openapi.yaml](api/openapi.yaml)):
+
+- **Joining.** `POST /v1/join` with the join token, a PKCS#10 request signed
+  by the node's key, the node's name and, for relays, the DNS names it
+  listens on. The answer carries the node ID, the certificate, the trust
+  bundle and the policy-signing public key (a JWK). Renewal at half-life is
+  `POST /v1/node/certificate` with a request signed by the same key.
+- **Bundles.** `GET /v1/node/bundle` returns the latest bundle as a JWS in
+  compact serialization (RFC 7515), ES256, `typ` `warren-bundle+jws`, `kid`
+  the RFC 7638 thumbprint of the policy-signing key. The payload is JSON with
+  `format` `warren.bundle.v1`, `trust_domain`, `version`, `issued_at`,
+  `view`, the compiled `policy` (Cedar schema and policies, a `sha256:`
+  digest, and per rule the conditions the explainer evaluates one by one),
+  the Cedar `entities`, `apps`, `connector_groups`, approved `devices` with
+  their users and tunnel addresses, enabled `nodes`, `revocations`, and the
+  posture and session-assertion public `keys`. Each Cedar policy carries its
+  rule path in `@id`; enforcement points use it as the policy ID. Nodes
+  reject a bundle for another trust domain or view.
+- **Views.** Each version is published twice: the connector view with
+  everything above, and the relay view with only what admission needs
+  (nodes, connector groups and revocations), so relays never hold the
+  policy, users, devices or apps.
+- **Audit.** `POST /v1/node/audit` takes OCSF-shaped records as JSON lines.
+  The control plane stamps `metadata.log_provider` with the reporting node's
+  identity and `metadata.logged_time`, so one node cannot pass records off as
+  another's, and writes them to its audit sinks.
 
 ## 12. Revocation push channel
 
@@ -640,7 +714,8 @@ Requirements, which together implement G9 and G10:
 7. **Measured.** Each event carries its commit time. Nodes acknowledge each
    event with the time it took effect and the number of connections it cut; the
    control plane exports the commit-to-cut latency as a metric, and an
-   integration test asserts the deadline (M2).
+   integration test asserts the deadline (the control plane's side from M1,
+   end to end through real connectors in M2).
 8. **Unknown events** are logged and trigger a bundle refresh; they are never
    silently ignored.
 9. **Partition.** While a node's stream is broken it keeps enforcing its last
@@ -652,6 +727,27 @@ Requirements, which together implement G9 and G10:
 11. **Defense in depth.** JIT grant expiry and certificate expiry are enforced
     on the node's own clock as well, so they hold even if the event never
     arrives.
+
+Wire format:
+
+- The stream is `GET /v1/node/events`, optionally with `?after=<seq>`, and
+  its body is `application/x-ndjson`: one JSON object per line, each with a
+  `type`.
+- Events: `{"type", "seq", "committed_at_ms", ...}` with these types and
+  fields: `user_disabled` (`user_id`), `device_disabled` (`device_id`,
+  `revoked`), `session_revoked` (`session_id`), `certificate_revoked`
+  (`serial`, `not_after`), `node_revoked` (`node_id`), `reauth_required`
+  (`user_id`) and `bundle_updated` (`version`, `digest`). Grant and posture
+  events arrive with just-in-time access and posture evaluation.
+- Heartbeats: `{"type": "heartbeat", "seq", "time_ms"}`, where `seq` is the
+  latest sequence number sent.
+- Snapshots: `{"type": "snapshot", "seq", "revocations", "bundle_version",
+  "bundle_digest"}`. A stream without `after`, or with an `after` the control
+  plane no longer retains (`EVENT_RETENTION`), starts with one.
+- The control plane closes the stream when the node is revoked or when the
+  certificate it connected with expires.
+- Acknowledgements: `POST /v1/node/events/ack` with
+  `{"acks": [{"seq", "applied_at_ms", "connections_cut"}]}`.
 
 ## 13. Versioning and extensibility
 
@@ -687,6 +783,7 @@ defaults are initial and may change with measurement.
 | `INFRA_CERT_LIFETIME` | 24 h | Relay, connector and control-plane certificates |
 | `INFRA_KEY_ALG` | ECDSA P-256 | Infrastructure key algorithm |
 | `JOIN_TOKEN_LIFETIME` | 1 h, single use | Node bootstrap token |
+| `EVENT_RETENTION` | 7 days | How far back a node can resume the event stream |
 | `SESSION_MAX_LIFETIME` | deployment setting | Maximum time between browser sign-ins |
 | `TUNNEL_MTU` | 1280 | Initial tunnel MTU |
 | `TUNNEL_MTU_MAX` | 1380 | Largest tunnel MTU used when proven |
