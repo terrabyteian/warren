@@ -20,13 +20,21 @@ use crate::web::{self, Body};
 /// The content type of the stream: one JSON object per line.
 pub const CONTENT_TYPE: &str = "application/x-ndjson";
 
+/// The certificate a node opened its stream with.
+pub struct StreamCert {
+    /// Its serial, lowercase hex.
+    pub serial: String,
+    /// When it expires, Unix seconds.
+    pub not_after: i64,
+}
+
 /// Opens a stream for `node`, resuming after sequence number `after` when
-/// given. The stream ends when the node is revoked or when the certificate
-/// it authenticated with expires (`not_after`, Unix seconds).
-pub fn open(app: Arc<App>, node: Node, after: Option<u64>, not_after: i64) -> Response<Body> {
+/// given. The stream ends when the node is revoked, or when the certificate
+/// it authenticated with is revoked or expires.
+pub fn open(app: Arc<App>, node: Node, after: Option<u64>, cert: StreamCert) -> Response<Body> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        if let Err(e) = run(app, node, after, not_after, tx).await {
+        if let Err(e) = run(app, node, after, cert, tx).await {
             crate::log::warn("events", &format!("event stream ended: {e}"));
         }
     });
@@ -55,9 +63,10 @@ async fn run(
     app: Arc<App>,
     node: Node,
     after: Option<u64>,
-    not_after: i64,
+    cert: StreamCert,
     tx: mpsc::Sender<Bytes>,
 ) -> Result<(), crate::Error> {
+    let not_after = cert.not_after;
     let mut changes = app.subscribe();
     let (latest, oldest) = app.store.event_bounds().await?;
     let mut last = match after {
@@ -73,8 +82,14 @@ async fn run(
     loop {
         loop {
             let events = app.store.events_after(last, 256).await?;
-            if events.is_empty() {
-                break;
+            let Some(first) = events.first() else { break };
+            if first.seq != last + 1 {
+                // The events right after `last` were pruned between reading
+                // the bounds and reading the log: never skip them silently.
+                let (latest, _) = app.store.event_bounds().await?;
+                send(&tx, &snapshot(&app, latest).await?).await?;
+                last = latest;
+                continue;
             }
             for event in events {
                 last = event.seq;
@@ -86,6 +101,7 @@ async fn run(
             .node(&node.id)
             .await?
             .is_none_or(|n| n.revoked_at.is_some())
+            || app.store.certificate_revoked(&cert.serial).await?
         {
             return Ok(());
         }

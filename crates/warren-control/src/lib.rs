@@ -87,6 +87,7 @@ pub struct ControlPlane {
     pub addr: SocketAddr,
     /// The admin socket.
     pub admin_socket: PathBuf,
+    admin_socket_id: Option<(u64, u64)>,
     app: Arc<App>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
@@ -246,6 +247,10 @@ impl ControlPlane {
         );
         Ok(ControlPlane {
             addr,
+            #[cfg(unix)]
+            admin_socket_id: file_id(&admin_socket),
+            #[cfg(not(unix))]
+            admin_socket_id: None,
             admin_socket,
             app,
             shutdown,
@@ -267,10 +272,49 @@ impl ControlPlane {
         for task in self.tasks {
             let _ = task.await;
         }
+        // Remove the socket only if it is still the one this instance made.
         #[cfg(unix)]
-        let _ = std::fs::remove_file(&self.admin_socket);
+        if self.admin_socket_id.is_some() && file_id(&self.admin_socket) == self.admin_socket_id {
+            let _ = std::fs::remove_file(&self.admin_socket);
+        }
         self.app.store.close().await;
     }
+}
+
+/// Makes way for the admin socket at `path`: nothing there is fine, a stale
+/// socket is removed, and anything else is refused, whether a file that is
+/// not a socket (a misconfigured path must never delete data) or a socket
+/// another control plane is still answering on.
+#[cfg(unix)]
+fn clear_stale_socket(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::Config(format!("{}: {e}", path.display()))),
+    };
+    if !meta.file_type().is_socket() {
+        return Err(Error::Config(format!(
+            "{} exists and is not a socket; adminSocket must name a path the control plane owns",
+            path.display()
+        )));
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(Error::Config(format!(
+            "another control plane is already serving {}",
+            path.display()
+        )));
+    }
+    std::fs::remove_file(path).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
+}
+
+/// The identity of the file at `path`, to recognize our own socket later.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
 }
 
 /// Creates the admin socket so that nobody but the control plane's own user
@@ -284,6 +328,7 @@ fn bind_admin_socket(path: &Path) -> Result<tokio::net::UnixListener, Error> {
         .parent()
         .ok_or_else(|| Error::Config(format!("{}: no parent directory", path.display())))?;
     std::fs::create_dir_all(dir).map_err(err)?;
+    clear_stale_socket(path)?;
     let staging = dir.join(format!(
         ".a{}",
         warren_core::keys::hex(
@@ -300,7 +345,6 @@ fn bind_admin_socket(path: &Path) -> Result<tokio::net::UnixListener, Error> {
     let result = (|| {
         let listener = tokio::net::UnixListener::bind(&staged).map_err(err)?;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).map_err(err)?;
-        let _ = std::fs::remove_file(path);
         std::fs::rename(&staged, path).map_err(err)?;
         Ok(listener)
     })();
@@ -402,4 +446,34 @@ pub fn check_policy(dir: &Path, reserved: &[String]) -> Result<(String, Vec<Stri
         compiled.policy.policies.clone(),
         compiled.warnings.iter().map(|w| w.to_string()).collect(),
     ))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::clear_stale_socket;
+
+    #[test]
+    fn only_stale_sockets_are_cleared() {
+        let dir = std::env::temp_dir().join(format!(
+            "warren-sock-{}",
+            warren_core::keys::hex(&warren_core::keys::random_bytes::<4>().unwrap())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Nothing there.
+        assert!(clear_stale_socket(&dir.join("none")).is_ok());
+        // A regular file is never deleted.
+        let file = dir.join("data");
+        std::fs::write(&file, b"keep me").unwrap();
+        assert!(clear_stale_socket(&file).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
+        // A live socket belongs to someone else.
+        let live = dir.join("live");
+        let listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        assert!(clear_stale_socket(&live).is_err());
+        // Once nobody listens it is stale, and goes.
+        drop(listener);
+        assert!(clear_stale_socket(&live).is_ok());
+        assert!(!live.exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlSafeStr, Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, SqlSafeStr, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use warren_core::api::Platform;
 use warren_core::clock;
 use warren_core::events::{Event, EventBody};
@@ -50,6 +50,19 @@ pub struct User {
     pub disabled: bool,
     /// When the user last signed in, Unix seconds.
     pub last_auth_at: i64,
+}
+
+/// An admin's change to a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAction {
+    /// Pending to approved.
+    Approve,
+    /// Disabled back to approved, or to pending if it was never approved.
+    Enable,
+    /// Pending or approved to disabled.
+    Disable,
+    /// Anything to revoked, for good.
+    Revoke,
 }
 
 /// A device's approval state.
@@ -179,6 +192,19 @@ pub struct AuthCode {
     pub auth_time: i64,
     /// Whether the sign-in used MFA.
     pub mfa: bool,
+}
+
+/// What a bundle is built from, read in the transaction that stores it.
+#[derive(Debug, Clone)]
+pub struct BundleState {
+    /// Every user.
+    pub users: Vec<User>,
+    /// Every device.
+    pub devices: Vec<Device>,
+    /// Every node.
+    pub nodes: Vec<Node>,
+    /// The revocation state.
+    pub revocations: Revocations,
 }
 
 /// A stored bundle version.
@@ -367,7 +393,7 @@ impl Store {
     }
 
     /// The latest committed sequence number and the oldest retained one
-    /// (0 when nothing has been pruned).
+    /// (the latest plus one when the log is empty).
     pub async fn event_bounds(&self) -> Result<(u64, u64), Error> {
         let latest: i64 = sqlx::query_scalar("SELECT value FROM counters WHERE name = 'event_seq'")
             .fetch_one(&self.pool)
@@ -424,12 +450,13 @@ impl Store {
             .bind(node_id)
             .bind(ack.applied_at_ms)
             .bind(now)
-            .bind(ack.connections_cut as i64)
+            .bind(i64::try_from(ack.connections_cut).unwrap_or(i64::MAX))
             .execute(&mut *tx)
             .await
             .map_err(db)?;
             if inserted.rows_affected() == 1 {
-                out.push((ack.seq, ack.applied_at_ms - committed));
+                // The node reports applied_at_ms; it never overflows the sum.
+                out.push((ack.seq, ack.applied_at_ms.saturating_sub(committed)));
             }
         }
         tx.commit().await.map_err(db)?;
@@ -438,12 +465,17 @@ impl Store {
 
     /// Commit-to-cut latency over every retained acknowledgement.
     pub async fn latency_summary(&self, deadline_ms: i64) -> Result<LatencySummary, Error> {
-        let mut values: Vec<i64> = sqlx::query_scalar(
-            "SELECT a.applied_at_ms - e.committed_at_ms FROM event_acks a JOIN events e ON e.seq = a.seq",
+        let pairs: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT a.applied_at_ms, e.committed_at_ms FROM event_acks a JOIN events e ON e.seq = a.seq",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(db)?;
+        // Subtract here rather than in SQL: applied_at_ms comes from nodes.
+        let mut values: Vec<i64> = pairs
+            .into_iter()
+            .map(|(applied, committed)| applied.saturating_sub(committed))
+            .collect();
         if values.is_empty() {
             return Ok(LatencySummary::default());
         }
@@ -591,8 +623,12 @@ impl Store {
 
     /// Every user.
     pub async fn users(&self) -> Result<Vec<User>, Error> {
+        Self::read_users(&mut *self.pool.acquire().await.map_err(db)?).await
+    }
+
+    async fn read_users(conn: &mut SqliteConnection) -> Result<Vec<User>, Error> {
         let rows = sqlx::query("SELECT * FROM users ORDER BY id")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(db)?;
         rows.iter().map(Self::user_from_row).collect()
@@ -874,14 +910,18 @@ impl Store {
 
     /// Every device.
     pub async fn devices(&self) -> Result<Vec<Device>, Error> {
+        Self::read_devices(&mut *self.pool.acquire().await.map_err(db)?).await
+    }
+
+    async fn read_devices(conn: &mut SqliteConnection) -> Result<Vec<Device>, Error> {
         let rows = sqlx::query("SELECT * FROM devices ORDER BY id")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(db)?;
         let links: Vec<(String, String)> = sqlx::query_as(
             "SELECT device_id, user_id FROM device_users ORDER BY device_id, user_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db)?;
         rows.iter()
@@ -926,8 +966,8 @@ impl Store {
                 let platform_json =
                     serde_json::to_string(platform).map_err(|e| Error::Internal(e.to_string()))?;
                 sqlx::query(
-                    "INSERT INTO devices (id, public_key, status, trust_class, key_storage, platform_json, address_index, tunnel_v4, tunnel_v6, created_at, updated_at) \
-                     VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO devices (id, public_key, status, trust_class, key_storage, platform_json, address_index, tunnel_v4, tunnel_v6, approved_at, created_at, updated_at) \
+                     VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&id)
                 .bind(public_key)
@@ -937,6 +977,7 @@ impl Store {
                 .bind(index)
                 .bind(v4)
                 .bind(v6)
+                .bind((status == DeviceStatus::Approved).then_some(now))
                 .bind(now)
                 .bind(now)
                 .execute(&mut *tx)
@@ -960,31 +1001,53 @@ impl Store {
         Ok((device, created))
     }
 
-    /// Moves a device to a new status. Disabling or revoking commits a
-    /// `device_disabled` event with it. A revoked device never changes
-    /// again. Returns whether the status changed and the event.
-    pub async fn set_device_status(
+    /// Applies an admin's change to a device, atomically and only from a
+    /// status that allows it: approve a pending device; enable a disabled
+    /// one (back to approved if it ever was, otherwise to pending, so
+    /// enabling never skips approval); disable a pending or approved one;
+    /// revoke any device not yet revoked. Disabling and revoking commit a
+    /// `device_disabled` event with the change. Returns the new status, or
+    /// `None` when the device's status does not allow the change.
+    pub async fn transition_device(
         &self,
         id: &str,
-        status: DeviceStatus,
-    ) -> Result<(bool, Option<Event>), Error> {
+        action: DeviceAction,
+    ) -> Result<(Option<DeviceStatus>, Option<Event>), Error> {
         let mut tx = self.begin().await?;
-        let r = sqlx::query("UPDATE devices SET status = ?, updated_at = ? WHERE id = ? AND status <> ? AND status <> 'revoked'")
-            .bind(status.as_str())
-            .bind(clock::now_secs())
+        let now = clock::now_secs();
+        let query = match action {
+            DeviceAction::Approve => sqlx::query_scalar(
+                "UPDATE devices SET status = 'approved', approved_at = ?, updated_at = ? \
+                 WHERE id = ? AND status = 'pending' RETURNING status",
+            )
+            .bind(now),
+            DeviceAction::Enable => sqlx::query_scalar(
+                "UPDATE devices SET status = CASE WHEN approved_at IS NULL THEN 'pending' ELSE 'approved' END, \
+                 updated_at = ? WHERE id = ? AND status = 'disabled' RETURNING status",
+            ),
+            DeviceAction::Disable => sqlx::query_scalar(
+                "UPDATE devices SET status = 'disabled', updated_at = ? \
+                 WHERE id = ? AND status IN ('pending', 'approved') RETURNING status",
+            ),
+            DeviceAction::Revoke => sqlx::query_scalar(
+                "UPDATE devices SET status = 'revoked', updated_at = ? \
+                 WHERE id = ? AND status <> 'revoked' RETURNING status",
+            ),
+        };
+        let status: Option<String> = query
+            .bind(now)
             .bind(id)
-            .bind(status.as_str())
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(db)?;
-        let changed = r.rows_affected() == 1;
-        let event = match status {
-            DeviceStatus::Disabled | DeviceStatus::Revoked if changed => Some(
+        let status = status.map(|s| DeviceStatus::parse(&s));
+        let event = match (action, status) {
+            (DeviceAction::Disable | DeviceAction::Revoke, Some(_)) => Some(
                 Self::append_event(
                     &mut tx,
                     EventBody::DeviceDisabled {
                         device_id: id.into(),
-                        revoked: status == DeviceStatus::Revoked,
+                        revoked: action == DeviceAction::Revoke,
                     },
                 )
                 .await?,
@@ -992,7 +1055,7 @@ impl Store {
             _ => None,
         };
         tx.commit().await.map_err(db)?;
-        Ok((changed, event))
+        Ok((status, event))
     }
 
     // Certificates.
@@ -1123,13 +1186,8 @@ impl Store {
                 node.name
             )));
         }
-        // A revoked node's name may be reused by a new node.
-        sqlx::query("DELETE FROM nodes WHERE role = ? AND name = ? AND revoked_at IS NOT NULL")
-            .bind(&role)
-            .bind(&node.name)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
+        // A revoked node's name may be reused by a new node; the revoked
+        // node keeps its row, so its revocation stays in every bundle.
         let dns =
             serde_json::to_string(&node.dns_names).map_err(|e| Error::Internal(e.to_string()))?;
         sqlx::query(
@@ -1180,8 +1238,12 @@ impl Store {
 
     /// Every node.
     pub async fn nodes(&self) -> Result<Vec<Node>, Error> {
-        let rows = sqlx::query("SELECT * FROM nodes ORDER BY role, name")
-            .fetch_all(&self.pool)
+        Self::read_nodes(&mut *self.pool.acquire().await.map_err(db)?).await
+    }
+
+    async fn read_nodes(conn: &mut SqliteConnection) -> Result<Vec<Node>, Error> {
+        let rows = sqlx::query("SELECT * FROM nodes ORDER BY role, name, created_at")
+            .fetch_all(&mut *conn)
             .await
             .map_err(db)?;
         rows.iter().map(Self::node_from_row).collect()
@@ -1190,12 +1252,23 @@ impl Store {
     /// Revokes a node, committing a `node_revoked` event with it.
     pub async fn revoke_node(&self, id: &str) -> Result<Option<Event>, Error> {
         let mut tx = self.begin().await?;
+        let now = clock::now_secs();
         let r = sqlx::query("UPDATE nodes SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
-            .bind(clock::now_secs())
+            .bind(now)
             .bind(id)
             .execute(&mut *tx)
             .await
             .map_err(db)?;
+        // Its certificates are revoked too, so they appear in the revocation
+        // state by serial until they expire.
+        sqlx::query(
+            "UPDATE certificates SET revoked_at = ? WHERE subject_id = ? AND kind = 'node' AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
         let event = if r.rows_affected() == 1 {
             Some(Self::append_event(&mut tx, EventBody::NodeRevoked { node_id: id.into() }).await?)
         } else {
@@ -1210,34 +1283,38 @@ impl Store {
     /// The full revocation state: disabled users, disabled or revoked
     /// devices, revoked unexpired sessions and certificates, revoked nodes.
     pub async fn revocations(&self) -> Result<Revocations, Error> {
+        Self::read_revocations(&mut *self.pool.acquire().await.map_err(db)?).await
+    }
+
+    async fn read_revocations(conn: &mut SqliteConnection) -> Result<Revocations, Error> {
         let now = clock::now_secs();
         let users = sqlx::query_scalar("SELECT id FROM users WHERE disabled = TRUE ORDER BY id")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(db)?;
         let devices = sqlx::query_scalar(
             "SELECT id FROM devices WHERE status IN ('disabled', 'revoked') ORDER BY id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db)?;
         let sessions = sqlx::query_scalar(
             "SELECT id FROM sessions WHERE revoked_at IS NOT NULL AND expires_at > ? ORDER BY id",
         )
         .bind(now)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db)?;
         let certificates: Vec<(String, i64)> = sqlx::query_as(
             "SELECT serial, not_after FROM certificates WHERE revoked_at IS NOT NULL AND not_after > ? ORDER BY serial",
         )
         .bind(now)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db)?;
         let nodes =
             sqlx::query_scalar("SELECT id FROM nodes WHERE revoked_at IS NOT NULL ORDER BY id")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *conn)
                 .await
                 .map_err(db)?;
         Ok(Revocations {
@@ -1252,18 +1329,25 @@ impl Store {
         })
     }
 
-    /// Takes the next bundle version.
-    pub async fn next_bundle_version(&self) -> Result<u64, Error> {
+    /// Builds and stores the next bundle in one write transaction: reads
+    /// the state, takes the next version, lets `build` sign the bundle, and
+    /// commits it with its `bundle_updated` event. Holding the write lock
+    /// throughout means no revocation can commit between the state read and
+    /// the bundle's event, so a bundle never lacks a revocation whose event
+    /// came before it. Keeps the latest few versions.
+    pub async fn publish_bundle(
+        &self,
+        build: impl FnOnce(BundleState, u64) -> Result<StoredBundle, Error>,
+    ) -> Result<Event, Error> {
         let mut tx = self.begin().await?;
-        let v = Self::next_counter(&mut tx, "bundle_version").await?;
-        tx.commit().await.map_err(db)?;
-        Ok(v as u64)
-    }
-
-    /// Stores a signed bundle and commits its `bundle_updated` event, then
-    /// prunes all but the latest few versions.
-    pub async fn insert_bundle(&self, b: &StoredBundle) -> Result<Event, Error> {
-        let mut tx = self.begin().await?;
+        let state = BundleState {
+            users: Self::read_users(&mut tx).await?,
+            devices: Self::read_devices(&mut tx).await?,
+            nodes: Self::read_nodes(&mut tx).await?,
+            revocations: Self::read_revocations(&mut tx).await?,
+        };
+        let version = Self::next_counter(&mut tx, "bundle_version").await? as u64;
+        let b = build(state, version)?;
         sqlx::query("INSERT INTO bundles (version, digest, connector_jws, relay_jws, created_at) VALUES (?, ?, ?, ?, ?)")
             .bind(b.version as i64)
             .bind(&b.digest)

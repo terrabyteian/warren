@@ -18,9 +18,10 @@ use crate::policy_bundle::Revocations;
 pub enum Line {
     /// An event to apply.
     Event(Event),
-    /// The stream is alive; `seq` is the latest committed sequence number.
+    /// The stream is alive; `seq` is the last sequence number sent on it,
+    /// which is the latest committed one once the stream has caught up.
     Heartbeat {
-        /// The latest committed sequence number.
+        /// The last sequence number sent.
         seq: u64,
         /// The control plane's clock, Unix milliseconds.
         time_ms: i64,

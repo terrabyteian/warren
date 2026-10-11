@@ -62,7 +62,7 @@ pub fn compile(
     if !diagnostics.iter().any(|d| d.severity == Severity::Error) {
         generate(&objects, &mut out);
     }
-    let schema_text = schema(&out.timezones);
+    let schema_text = schema(&out.timezones.keys().cloned().collect());
     if !diagnostics.iter().any(|d| d.severity == Severity::Error) {
         validate(&schema_text, &out, &mut diagnostics);
     }
@@ -81,6 +81,7 @@ pub fn compile(
             schema: schema_text,
             policies,
             rules: out.policies.into_iter().map(|p| p.info).collect(),
+            timezones: out.timezones,
         },
         apps: objects.apps.iter().map(bundle_app).collect(),
         groups: objects
@@ -180,6 +181,45 @@ fn check(objects: &Objects, reserved: &[String], diags: &mut Vec<Diagnostic>) {
         "AccessPolicy or AccessRequestPolicy",
         diags,
     );
+
+    // Every schedule's time zone gets its own context field.
+    let mut fields: BTreeMap<String, (String, Source, usize)> = BTreeMap::new();
+    let schedules = objects
+        .policies
+        .iter()
+        .flat_map(|p| p.rules.iter().map(move |r| (&p.meta.source, &r.when)))
+        .chain(objects.request_policies.iter().flat_map(|p| {
+            std::iter::once((&p.meta.source, &p.when))
+                .chain(p.automatic.iter().map(move |a| (&p.meta.source, a)))
+        }));
+    for (src, when) in schedules {
+        let Some(s) = &when.schedule else { continue };
+        let field = timezone_field(&s.timezone);
+        if !valid_field(&field) {
+            error(
+                diags,
+                src,
+                when.line,
+                format!("time zone {:?} cannot be used in a schedule", s.timezone),
+            );
+            continue;
+        }
+        match fields.get(&field) {
+            Some((tz, first, line)) if *tz != s.timezone => error(
+                diags,
+                src,
+                when.line,
+                format!(
+                    "time zones {:?} and {:?} (at {}:{line}) cannot both be used; their names are too alike",
+                    s.timezone, tz, first.file
+                ),
+            ),
+            Some(_) => {}
+            None => {
+                fields.insert(field, (s.timezone.clone(), src.clone(), when.line));
+            }
+        }
+    }
 
     let reserved: Vec<String> = reserved.iter().map(|r| r.to_ascii_lowercase()).collect();
     // Every client-facing name claimed so far, with its app.
@@ -281,6 +321,38 @@ fn check(objects: &Objects, reserved: &[String], diags: &mut Vec<Diagnostic>) {
                     _ => None,
                 })
                 .collect();
+            let port_declared = app.destinations.iter().any(|d| {
+                let target = match &d.kind {
+                    DestinationKind::Host {
+                        host: DomainPattern::Exact(h),
+                        target: None,
+                    } => h.clone(),
+                    DestinationKind::Host {
+                        target: Some(t), ..
+                    } => t.to_string(),
+                    _ => return false,
+                };
+                target == c.upstream_host
+                    && matches!(
+                        d.protocol,
+                        crate::model::Protocol::Tcp | crate::model::Protocol::Any
+                    )
+                    && (d.ports.is_empty()
+                        || d.ports
+                            .iter()
+                            .any(|r| (r.from..=r.to).contains(&c.upstream_port)))
+            });
+            if targets.contains(&c.upstream_host) && !port_declared {
+                error(
+                    diags,
+                    src,
+                    c.line,
+                    format!(
+                        "clientless.upstream port {} is not one of the app's TCP ports for {}",
+                        c.upstream_port, c.upstream_host
+                    ),
+                );
+            }
             if !targets.contains(&c.upstream_host) {
                 error(
                     diags,
@@ -463,16 +535,22 @@ pub fn timezone_field(timezone: &str) -> String {
     if matches!(timezone, "UTC" | "Etc/UTC") {
         return "utcMinuteOfWeek".into();
     }
-    timezone
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let mut field = String::new();
+    for c in timezone.chars() {
+        match c {
+            c if c.is_ascii_alphanumeric() => field.push(c.to_ascii_lowercase()),
+            // Keep offsets apart: Etc/GMT+5 and Etc/GMT-5 are ten hours apart.
+            '+' => field.push_str("_plus_"),
+            _ => field.push('_'),
+        }
+    }
+    field
+}
+
+/// Whether a field name is a Cedar identifier warren can use.
+fn valid_field(field: &str) -> bool {
+    field.starts_with(|c: char| c.is_ascii_alphabetic())
+        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 struct CompiledPolicy {
@@ -484,7 +562,8 @@ struct CompiledPolicy {
 #[derive(Default)]
 struct Output {
     policies: Vec<CompiledPolicy>,
-    timezones: BTreeSet<String>,
+    /// Context field name to time zone.
+    timezones: BTreeMap<String, String>,
 }
 
 struct Scope {
@@ -530,7 +609,7 @@ fn who_scope(who: &Who, principal_var: &str) -> (String, Option<Condition>) {
         }
     }));
     (
-        "principal".into(),
+        "principal is Warren::User".into(),
         Some(condition(
             "who",
             paren_or(terms),
@@ -621,8 +700,12 @@ fn posture_conditions(check: &Check, prefix: &str) -> Condition {
         }
         Signal::OsVersion(min) => {
             terms.push(format!("{field}.value >= {min}"));
-            let version = format!("{}.{}.{}", min / 10_000, min / 100 % 100, min % 100);
-            let version = version.trim_end_matches(".0").to_owned();
+            let (major, minor, patch) = (min / 10_000, min / 100 % 100, min % 100);
+            let version = match (minor, patch) {
+                (0, 0) => format!("{major}"),
+                (_, 0) => format!("{major}.{minor}"),
+                _ => format!("{major}.{minor}.{patch}"),
+            };
             (
                 format!("macOS {version} or later is required."),
                 "Update macOS in System Settings to reach {app}.".to_owned(),
@@ -681,7 +764,7 @@ fn when_conditions(
     via: Option<&[Via]>,
     prefix: &str,
     objects: &Objects,
-    timezones: &mut BTreeSet<String>,
+    timezones: &mut BTreeMap<String, String>,
 ) -> Vec<Condition> {
     let mut out = Vec::new();
     if let Some(via) = via
@@ -724,7 +807,7 @@ fn when_conditions(
     }
     if let Some(schedule) = &when.schedule {
         let field = timezone_field(&schedule.timezone);
-        timezones.insert(field.clone());
+        timezones.insert(field.clone(), schedule.timezone.clone());
         let terms: Vec<String> = schedule
             .ranges
             .iter()

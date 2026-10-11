@@ -155,7 +155,8 @@ Field notes:
 
 - `protocol` is `tcp`, `udp`, `icmp` or `any`; `ports` is omitted for `icmp`
   and `any`. Omitting `ports` for `tcp` or `udp` means every port, which the
-  compiler flags as a warning.
+  compiler flags as a warning; an empty `ports` list is an error rather than
+  a quiet way to say the same.
 - Host names use synthetic addresses on the client; the connector resolves
   each destination's target inside the private network
   ([design.md](design.md#8-internal-names-and-addressing)). Targets must lie
@@ -164,7 +165,9 @@ Field notes:
 - `clientless.url` is the address users open in the browser; its host is a
   client-facing name under the same rules as any `host`.
   `clientless.upstream` is the URL the connector forwards clientless requests
-  to; its host must be one of the app's destination targets.
+  to; its host must be one of the app's destination targets, and its port
+  (443 for `https`, 80 for `http` unless given) one of that destination's
+  TCP ports.
 - `discoverable: true` makes the app visible to users who may request it, so a
   connection attempt fails with a "request access" reason instead of a lookup
   failure. A non-discoverable app stays invisible to users who cannot reach
@@ -496,14 +499,22 @@ browser session even though it lists `browser`; the compiler warns about such
 rules.
 
 `who` and `what` go into the policy scope when they name a single group, app
-or label, as above. Otherwise they become the first conditions of the `when`
-clause: a disjunction of `principal in Warren::Group::"…"` for groups and
+or label, as above. Otherwise the scope is `principal is Warren::User` (so a
+rule naming users never matches the automatic approver) or `resource`, and
+they become the first conditions of the `when` clause: a disjunction of
+`principal in Warren::Group::"…"` for groups and
 `principal.email == "…"` or `principal.subject == "…"` for users (an entry
 with `@` is an email), and of `resource == Warren::App::"…"` for apps and
 `resource in Warren::AppLabel::"…"` for each selector label. A `via` that
 lists both `client` and `browser` adds no condition. A deny rule without
 `via` applies to every kind of session. Strings are written as Cedar string
 literals with quotes, backslashes and control characters escaped.
+
+Each time zone a schedule names gets its own `context.time` field: the name
+lowercased with `+` written as `_plus_` and other punctuation as `_`
+(`Europe/Berlin` is `europe_berlin`, `Etc/GMT+5` is `etc_gmt_plus_5`), and
+`UTC` is `utcMinuteOfWeek`. The compiler refuses two zones whose fields would
+collide, and the bundle maps each field back to its zone.
 
 A label selector becomes membership in a label entity, and a deny rule becomes
 a `forbid`, which Cedar always lets win over any `permit`:

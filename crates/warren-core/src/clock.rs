@@ -145,7 +145,11 @@ pub fn parse_der_time(tag: u8, contents: &[u8]) -> Option<i64> {
             let yy = i64::from(num(&digits[..2])?);
             (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &digits[2..])
         }
-        (0x18, 14) => (i64::from(num(&digits[..4])?), &digits[4..]),
+        // RFC 5280 section 4.1.2.5: GeneralizedTime only from 2050.
+        (0x18, 14) => match i64::from(num(&digits[..4])?) {
+            1950..=2049 => return None,
+            year => (year, &digits[4..]),
+        },
         _ => return None,
     };
     Civil {
@@ -244,6 +248,7 @@ mod tests {
         assert_eq!(parse_der_time(0x17, b"261311105000Z"), None);
         assert_eq!(parse_der_time(0x17, b"260230105000Z"), None);
         assert_eq!(parse_der_time(0x18, b"20261011105000.5Z"), None);
+        assert_eq!(parse_der_time(0x18, b"20261011105000Z"), None);
         assert_eq!(parse_der_time(0x04, b"261011105000Z"), None);
     }
 

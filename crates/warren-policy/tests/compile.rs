@@ -64,8 +64,25 @@ impl Engine {
     }
 
     fn decide(&self, user: &str, app: &str, context: serde_json::Value) -> (Decision, Vec<String>) {
-        let principal = EntityUid::from_str(&format!("Warren::User::\"{user}\"")).unwrap();
-        let action = EntityUid::from_str("Warren::Action::\"connect\"").unwrap();
+        self.decide_as(
+            &format!("Warren::User::\"{user}\""),
+            "connect",
+            app,
+            context,
+        )
+    }
+
+    /// Decides any action for any principal (a user or the automatic
+    /// approver).
+    fn decide_as(
+        &self,
+        principal: &str,
+        action: &str,
+        app: &str,
+        context: serde_json::Value,
+    ) -> (Decision, Vec<String>) {
+        let principal = EntityUid::from_str(principal).unwrap();
+        let action = EntityUid::from_str(&format!("Warren::Action::\"{action}\"")).unwrap();
         let resource = EntityUid::from_str(&format!("Warren::App::\"{app}\"")).unwrap();
         let context = Context::from_json_value(context, Some((&self.schema, &action))).unwrap();
         let request =
@@ -489,6 +506,229 @@ fn timezone_fields() {
         compile::timezone_field("America/Port-au-Prince"),
         "america_port_au_prince"
     );
+    assert_ne!(
+        compile::timezone_field("Etc/GMT+5"),
+        compile::timezone_field("Etc/GMT-5")
+    );
     let schema = compile::schema(&BTreeSet::from(["europe_berlin".to_owned()]));
     assert!(Schema::from_cedarschema_str(&schema).is_ok());
+    // The bundle carries which zone each field stands for.
+    let compiled = docs_examples();
+    assert_eq!(
+        compiled
+            .policy
+            .timezones
+            .get("europe_berlin")
+            .map(String::as_str),
+        Some("Europe/Berlin")
+    );
+}
+
+fn schedule_policy(rule_zone: &str, other_zone: &str) -> String {
+    format!(
+        "{GROUP}{}---\napiVersion: warren.dev/v1alpha1\nkind: AccessPolicy\nmetadata: {{ name: p }}\nspec:\n  rules:\n    - name: r1\n      who: {{ groups: [g] }}\n      what: {{ apps: [a] }}\n      when:\n        schedule: {{ timezone: \"{rule_zone}\", windows: [{{ days: [mon], from: \"08:00\", to: \"09:00\" }}] }}\n    - name: r2\n      who: {{ groups: [g] }}\n      what: {{ apps: [a] }}\n      when:\n        schedule: {{ timezone: \"{other_zone}\", windows: [{{ days: [mon], from: \"08:00\", to: \"09:00\" }}] }}\n",
+        app("a", "a.lab.example.com", "")
+    )
+}
+
+#[test]
+fn time_zones_that_would_share_a_field_are_refused() {
+    assert!(compile_text(&schedule_policy("Etc/GMT+5", "Etc/GMT-5")).is_ok());
+    let errors = errors_of(&schedule_policy("Etc/GMT-5", "Etc_GMT-5"));
+    assert!(
+        errors.iter().any(|e| e.contains("cannot both be used")),
+        "{errors:?}"
+    );
+    let errors = errors_of(&schedule_policy("1Zone/X", "UTC"));
+    assert!(
+        errors.iter().any(|e| e.contains("cannot be used")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn schedule_and_network_conditions_decide() {
+    // contractors-office-hours, without the deny rule that would hide it.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/policy");
+    let mut objects = Objects::default();
+    let mut diags = Vec::new();
+    for file in [
+        "connector-groups.yaml",
+        "apps.yaml",
+        "posture.yaml",
+        "observability.yaml",
+    ] {
+        let text = std::fs::read_to_string(dir.join(file)).unwrap();
+        model::parse_file(file, &text, &mut objects, &mut diags);
+    }
+    objects.policies[0]
+        .rules
+        .retain(|r| r.name == "contractors-office-hours");
+    let compiled = compile::compile(objects, diags, &[]).unwrap();
+    let engine = Engine::new(&compiled, &[user("cy", &["contractors"])]);
+    let monday = |minute: i64| context(Some(good_device()), 60, false, Some(1440 + minute));
+    assert_eq!(
+        engine.decide("cy", "grafana", monday(9 * 60)).0,
+        Decision::Allow
+    );
+    assert_eq!(
+        engine.decide("cy", "grafana", monday(7 * 60 + 59)).0,
+        Decision::Deny
+    );
+    assert_eq!(
+        engine.decide("cy", "grafana", monday(19 * 60)).0,
+        Decision::Deny
+    );
+    let saturday = context(Some(good_device()), 60, false, Some(6 * 1440 + 9 * 60));
+    assert_eq!(engine.decide("cy", "grafana", saturday).0, Decision::Deny);
+    let mut elsewhere = monday(9 * 60);
+    elsewhere["network"] = json!({ "source": { "__extn": { "fn": "ip", "arg": "198.51.100.7" } } });
+    assert_eq!(engine.decide("cy", "grafana", elsewhere).0, Decision::Deny);
+    let mut unknown = monday(9 * 60);
+    unknown.as_object_mut().unwrap().remove("network");
+    assert_eq!(engine.decide("cy", "grafana", unknown).0, Decision::Deny);
+}
+
+#[test]
+fn request_and_approval_policies_decide() {
+    let compiled = docs_examples();
+    let users = [
+        user("sam", &["sre"]),
+        user("lee", &["sre-leads"]),
+        user("cy", &["contractors"]),
+    ];
+    let engine = Engine::new(&compiled, &users);
+    let fresh = context(Some(good_device()), 60, true, Some(0));
+    let (d, why) = engine.decide_as("Warren::User::\"sam\"", "request", "prod-db", fresh.clone());
+    assert_eq!(
+        (d, why),
+        (
+            Decision::Allow,
+            vec!["prod-db-break-glass/request".to_owned()]
+        )
+    );
+    let stale = context(Some(good_device()), 7200, true, Some(0));
+    assert_eq!(
+        engine
+            .decide_as("Warren::User::\"sam\"", "request", "prod-db", stale)
+            .0,
+        Decision::Deny
+    );
+    assert_eq!(
+        engine
+            .decide_as("Warren::User::\"cy\"", "request", "prod-db", fresh.clone())
+            .0,
+        Decision::Deny
+    );
+
+    let approval = |requester: &str, utc_minute: i64| {
+        let mut request = fresh.clone();
+        request["time"]["utcMinuteOfWeek"] = json!(utc_minute);
+        json!({ "requester": { "type": "Warren::User", "id": requester }, "request": request })
+    };
+    // A lead approves an SRE's request; nobody approves their own.
+    let (d, why) = engine.decide_as(
+        "Warren::User::\"lee\"",
+        "approve",
+        "prod-db",
+        approval("sam", 0),
+    );
+    assert_eq!(
+        (d, why),
+        (
+            Decision::Allow,
+            vec!["prod-db-break-glass/approve".to_owned()]
+        )
+    );
+    assert_eq!(
+        engine
+            .decide_as(
+                "Warren::User::\"lee\"",
+                "approve",
+                "prod-db",
+                approval("lee", 0)
+            )
+            .0,
+        Decision::Deny
+    );
+    assert_eq!(
+        engine
+            .decide_as(
+                "Warren::User::\"sam\"",
+                "approve",
+                "prod-db",
+                approval("sam", 0)
+            )
+            .0,
+        Decision::Deny
+    );
+    // Automatic approval holds on weekdays 06:00-18:00 UTC only.
+    let auto = "Warren::AutoApprover::\"automatic\"";
+    assert_eq!(
+        engine
+            .decide_as(auto, "approve", "prod-db", approval("sam", 1440 + 7 * 60))
+            .0,
+        Decision::Allow
+    );
+    assert_eq!(
+        engine
+            .decide_as(auto, "approve", "prod-db", approval("sam", 1440 + 19 * 60))
+            .0,
+        Decision::Deny
+    );
+    assert_eq!(
+        engine
+            .decide_as(auto, "approve", "prod-db", approval("sam", 7 * 60))
+            .0,
+        Decision::Deny
+    );
+}
+
+#[test]
+fn users_can_be_approvers() {
+    let text = format!(
+        "{GROUP}{}---\napiVersion: warren.dev/v1alpha1\nkind: AccessRequestPolicy\nmetadata: {{ name: jit }}\nspec:\n  who: {{ groups: [g] }}\n  what: {{ apps: [a] }}\n  approval:\n    approvers: {{ users: [lead@example.com] }}\n  maxDuration: 1h\n",
+        app("a", "a.lab.example.com", "")
+    );
+    let compiled = compile_text(&text).unwrap();
+    let lead = UserEntity {
+        id: "u-lead".into(),
+        email: "lead@example.com".into(),
+        subject: "s".into(),
+        groups: vec![],
+    };
+    let engine = Engine::new(&compiled, &[lead, user("sam", &["g"])]);
+    let request = context(None, 0, false, None);
+    let ctx = json!({ "requester": { "type": "Warren::User", "id": "sam" }, "request": request });
+    assert_eq!(
+        engine
+            .decide_as("Warren::User::\"u-lead\"", "approve", "a", ctx.clone())
+            .0,
+        Decision::Allow
+    );
+    assert_eq!(
+        engine
+            .decide_as("Warren::AutoApprover::\"automatic\"", "approve", "a", ctx)
+            .0,
+        Decision::Deny
+    );
+}
+
+#[test]
+fn a_clientless_upstream_needs_a_declared_port() {
+    let clientless = |upstream: &str| {
+        format!(
+            "{GROUP}{}",
+            app(
+                "a",
+                "a.lab.example.com",
+                &format!(
+                    "  clientless:\n    url: https://web.example.com\n    upstream: {upstream}\n"
+                ),
+            )
+        )
+    };
+    assert!(compile_text(&clientless("https://a.lab.example.com")).is_ok());
+    let errors = errors_of(&clientless("http://a.lab.example.com:8080/"));
+    assert!(errors.iter().any(|e| e.contains("port 8080")), "{errors:?}");
 }

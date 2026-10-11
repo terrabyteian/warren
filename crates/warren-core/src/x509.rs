@@ -335,6 +335,26 @@ pub fn build_certificate(
     {
         return Err(err("subject alternative names must be ASCII"));
     }
+    if let Usage::Leaf {
+        server_auth: false,
+        client_auth: false,
+    } = spec.usage
+    {
+        return Err(err(
+            "a leaf certificate needs at least one extended key usage",
+        ));
+    }
+    if let Some(id) = &spec.identity
+        && !(1..=3).contains(&id.trust_class)
+    {
+        return Err(err("identity extension trust class out of range"));
+    }
+    if ![spec.not_before, spec.not_after]
+        .iter()
+        .all(|t| (1950..=9999).contains(&clock::Civil::from_unix(*t).year))
+    {
+        return Err(err("certificate validity must fall between 1950 and 9999"));
+    }
     let tbs = tbs_der(spec, issuer);
     let signature = sign(&tbs)?;
     Ok(yasna::construct_der(|w| {
@@ -586,9 +606,10 @@ impl Certificate {
                     authority_key_id: None,
                     identity: None,
                 };
+                let mut seen = Vec::new();
                 r.read_optional(|r| {
                     r.read_tagged(Tag::context(3), |r| {
-                        r.read_sequence_of(|r| read_extension(r, &mut cert))
+                        r.read_sequence_of(|r| read_extension(r, &mut cert, &mut seen))
                     })
                 })?;
                 Ok(cert)
@@ -622,12 +643,21 @@ fn read_time(r: BERReader) -> Result<i64, ASN1Error> {
     clock::parse_der_time(tag, value.value()).ok_or(ASN1Error::new(ASN1ErrorKind::Invalid))
 }
 
-fn read_extension(r: BERReader, cert: &mut Certificate) -> Result<(), ASN1Error> {
+fn read_extension(
+    r: BERReader,
+    cert: &mut Certificate,
+    seen: &mut Vec<Vec<u8>>,
+) -> Result<(), ASN1Error> {
     r.read_sequence(|r| {
         let id = r.next().read_der()?;
         let critical = r.read_default(false, |r| r.read_bool())?;
         let value = r.next().read_bytes()?;
         let invalid = || ASN1Error::new(ASN1ErrorKind::Invalid);
+        // RFC 5280 section 4.2: at most one instance of each extension.
+        if seen.contains(&id) {
+            return Err(invalid());
+        }
+        seen.push(id.clone());
         if id == oid_der(OID_BASIC_CONSTRAINTS) {
             cert.is_ca = yasna::parse_der(&value, |r| {
                 r.read_sequence(|r| {
@@ -653,6 +683,10 @@ fn read_extension(r: BERReader, cert: &mut Certificate) -> Result<(), ASN1Error>
             yasna::parse_der(&value, |r| {
                 r.read_sequence_of(|r| {
                     let name = r.read_tagged_der()?;
+                    let named = name.tag() == Tag::context(6) || name.tag() == Tag::context(2);
+                    if named && name.pcbit() != yasna::PCBit::Primitive {
+                        return Err(invalid());
+                    }
                     let text = || {
                         std::str::from_utf8(name.value())
                             .ok()
@@ -982,6 +1016,121 @@ mod tests {
         spec.dns_names.push("relay.example.com".into());
         spec.not_after = 1;
         assert!(build_certificate(&spec, &issuer, |t| ca.key.sign_der(t)).is_err());
+    }
+
+    #[test]
+    fn the_builder_refuses_what_the_profile_forbids() {
+        let ca = root();
+        let key = SigningKey::generate().unwrap();
+        let issuer = IssuerInfo {
+            name: ca.cert.subject.clone(),
+            key_id: ca.key.public_key().key_id(),
+        };
+        let good = CertificateSpec {
+            serial: [1; 16],
+            not_before: 1_791_000_000,
+            not_after: 1_791_003_600,
+            subject: EMPTY_NAME.to_vec(),
+            public_key: key.public_key(),
+            usage: Usage::Leaf {
+                server_auth: false,
+                client_auth: true,
+            },
+            uris: vec!["warren://example.com/user/u-1".into()],
+            dns_names: vec![],
+            identity: Some(identity()),
+        };
+        let sign = |t: &[u8]| ca.key.sign_der(t);
+        assert!(build_certificate(&good, &issuer, sign).is_ok());
+        let mut no_usage = good.clone();
+        no_usage.usage = Usage::Leaf {
+            server_auth: false,
+            client_auth: false,
+        };
+        assert!(build_certificate(&no_usage, &issuer, sign).is_err());
+        let mut bad_class = good.clone();
+        if let Some(id) = bad_class.identity.as_mut() {
+            id.trust_class = 4;
+        }
+        assert!(build_certificate(&bad_class, &issuer, sign).is_err());
+        let mut far = good.clone();
+        far.not_after = 400_000_000_000;
+        assert!(build_certificate(&far, &issuer, sign).is_err());
+    }
+
+    /// A copy of `cert` with its extensions replaced by `extensions`
+    /// (each a DER Extension), signed again by `key`.
+    fn with_extensions(cert: &Certificate, key: &SigningKey, extensions: &[Vec<u8>]) -> Vec<u8> {
+        let fields = yasna::parse_der(&cert.tbs, |r| {
+            r.read_sequence(|r| {
+                let fields: Vec<Vec<u8>> = (0..7)
+                    .map(|_| r.next().read_der())
+                    .collect::<Result<_, _>>()?;
+                r.next().read_der()?;
+                Ok(fields)
+            })
+        })
+        .unwrap();
+        let tbs = yasna::construct_der(|w| {
+            w.write_sequence(|w| {
+                for f in &fields {
+                    w.next().write_der(f);
+                }
+                w.next().write_tagged(Tag::context(3), |w| {
+                    w.write_sequence(|w| {
+                        for e in extensions {
+                            w.next().write_der(e);
+                        }
+                    })
+                });
+            })
+        });
+        let sig = key.sign_der(&tbs).unwrap();
+        yasna::construct_der(|w| {
+            w.write_sequence(|w| {
+                w.next().write_der(&tbs);
+                write_ecdsa_sha256(w.next());
+                w.next().write_bitvec_bytes(&sig, sig.len() * 8);
+            })
+        })
+    }
+
+    #[test]
+    fn the_parser_refuses_repeated_extensions_and_constructed_names() {
+        let ca = root();
+        let ski = yasna::construct_der(|w| {
+            write_extension(
+                w,
+                &oid_der(OID_SUBJECT_KEY_ID),
+                false,
+                yasna::construct_der(|w| w.write_bytes(&[1, 2, 3])),
+            )
+        });
+        let once = with_extensions(&ca.cert, &ca.key, std::slice::from_ref(&ski));
+        assert!(Certificate::parse(&once).is_ok());
+        let twice = with_extensions(&ca.cert, &ca.key, &[ski.clone(), ski]);
+        assert!(Certificate::parse(&twice).is_err());
+
+        let san = |constructed: bool| {
+            let value = yasna::construct_der(|w| {
+                w.write_sequence(|w| {
+                    if constructed {
+                        w.next()
+                            .write_tagged(Tag::context(6), |w| w.write_ia5_string("x"));
+                    } else {
+                        w.next()
+                            .write_tagged_implicit(Tag::context(6), |w| w.write_ia5_string("x"));
+                    }
+                })
+            });
+            yasna::construct_der(|w| {
+                write_extension(w, &oid_der(OID_SUBJECT_ALT_NAME), false, value)
+            })
+        };
+        let primitive = with_extensions(&ca.cert, &ca.key, &[san(false)]);
+        assert_eq!(Certificate::parse(&primitive).unwrap().uris, ["x"]);
+        let constructed = with_extensions(&ca.cert, &ca.key, &[san(true)]);
+        assert!(Certificate::parse(&constructed).is_err());
     }
 
     #[test]

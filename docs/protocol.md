@@ -524,8 +524,8 @@ Requirements:
 ### 10.3 Infrastructure certificates
 
 - Issued by the infrastructure CA to the control plane, relays and connectors.
-  Keys are generated on the node and never leave it (P-256 ECDSA or Ed25519,
-  `INFRA_KEY_ALG`).
+  Keys are generated on the node and never leave it (`INFRA_KEY_ALG`: ECDSA
+  P-256; Ed25519 may be added later).
 - SAN: DNS names where the node listens (control plane, relays) and a URI
   `warren://{td}/{role}/{id}`; connectors use
   `warren://{td}/connector/{group}/{id}`.
@@ -674,16 +674,25 @@ Encodings and endpoints ([api/openapi.yaml](api/openapi.yaml)):
   the Cedar `entities`, `apps`, `connector_groups`, approved `devices` with
   their users and tunnel addresses, enabled `nodes`, `revocations`, and the
   posture and session-assertion public `keys`. Each Cedar policy carries its
-  rule path in `@id`; enforcement points use it as the policy ID. Nodes
-  reject a bundle for another trust domain or view.
+  rule path in `@id`; enforcement points use it as the policy ID. The policy
+  also maps each `context.time` field schedules use to its time zone
+  (`timezones`). Nodes reject a bundle for another trust domain or view. The
+  control plane reads the state a bundle carries in the same transaction
+  that commits the bundle's `bundle_updated` event, so a bundle never lacks a
+  revocation whose event came before it.
 - **Views.** Each version is published twice: the connector view with
   everything above, and the relay view with only what admission needs
   (nodes, connector groups and revocations), so relays never hold the
   policy, users, devices or apps.
 - **Audit.** `POST /v1/node/audit` takes OCSF-shaped records as JSON lines.
   The control plane stamps `metadata.log_provider` with the reporting node's
-  identity and `metadata.logged_time`, so one node cannot pass records off as
-  another's, and writes them to its audit sinks.
+  identity, `metadata.log_name` with its role and `metadata.logged_time`, so
+  a node can pass its records off neither as another node's nor as the
+  control plane's, and writes them to its audit sinks.
+- **Node revocation.** Revoking a relay or connector also revokes every
+  certificate issued to it, so they stay in the revocation state by serial
+  until they expire, and a revoked node stays revoked even if a new node
+  later joins under its name.
 
 ## 12. Revocation push channel
 
@@ -744,8 +753,10 @@ Wire format:
 - Snapshots: `{"type": "snapshot", "seq", "revocations", "bundle_version",
   "bundle_digest"}`. A stream without `after`, or with an `after` the control
   plane no longer retains (`EVENT_RETENTION`), starts with one.
-- The control plane closes the stream when the node is revoked or when the
-  certificate it connected with expires.
+- If events the node needs were pruned while it resumed, the control plane
+  sends a snapshot instead of skipping them.
+- The control plane closes the stream when the node is revoked, or when the
+  certificate it connected with is revoked or expires.
 - Acknowledgements: `POST /v1/node/events/ack` with
   `{"acks": [{"seq", "applied_at_ms", "connections_cut"}]}`.
 

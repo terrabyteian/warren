@@ -172,6 +172,8 @@ pub struct Clientless {
     pub upstream_host: String,
     /// The URL the connector forwards to.
     pub upstream: String,
+    /// The upstream's port: explicit, or 443 for https and 80 for http.
+    pub upstream_port: u16,
     /// 1-based line.
     pub line: usize,
 }
@@ -833,6 +835,14 @@ fn parse_ports(ctx: &mut Ctx<'_>, node: &Node) -> Vec<PortRange> {
     let Some(items) = ctx.list(node, "ports") else {
         return Vec::new();
     };
+    if items.is_empty() {
+        // An empty list would read as "every port"; make that explicit.
+        ctx.error(
+            node.line,
+            "ports must list at least one port; omit ports to allow every port",
+        );
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for item in items {
         let Value::Scalar { text, .. } = &item.value else {
@@ -1050,18 +1060,34 @@ fn parse_app(ctx: &mut Ctx<'_>, meta: Meta, spec: &Node) -> Option<App> {
                     return None;
                 }
             };
-            let Some((upstream_host, _)) = url_host(&upstream) else {
+            let Some((upstream_host, authority)) = url_host(&upstream) else {
                 ctx.error(
                     up_node.line,
                     "clientless.upstream must be an http:// or https:// URL",
                 );
                 return None;
             };
+            let default_port = if upstream.starts_with("https://") {
+                443
+            } else {
+                80
+            };
+            let upstream_port = match authority.rsplit_once(':') {
+                Some((_, port)) => match port.parse::<u16>() {
+                    Ok(p) if p > 0 => p,
+                    _ => {
+                        ctx.error(up_node.line, "clientless.upstream has an invalid port");
+                        return None;
+                    }
+                },
+                None => default_port,
+            };
             Some(Clientless {
                 url_host: url_host_pattern,
                 url,
                 upstream_host,
                 upstream,
+                upstream_port,
                 line: c.line,
             })
         }
@@ -1308,7 +1334,7 @@ fn parse_what(ctx: &mut Ctx<'_>, node: &Node) -> Option<What> {
 
 fn parse_time_of_day(text: &str) -> Option<i64> {
     let (h, m) = text.split_once(':')?;
-    if h.len() != 2 || m.len() != 2 {
+    if h.len() != 2 || m.len() != 2 || !h.bytes().chain(m.bytes()).all(|c| c.is_ascii_digit()) {
         return None;
     }
     let (h, m): (i64, i64) = (h.parse().ok()?, m.parse().ok()?);
@@ -1358,11 +1384,12 @@ fn parse_schedule(ctx: &mut Ctx<'_>, node: &Node) -> Option<Schedule> {
         let wf = ctx.fields(w, "a window", &["days", "from", "to"])?;
         let days: Vec<(String, usize)> = match wf.get("days") {
             Some(d) => ctx.strings(d, "days"),
-            None => {
-                ctx.error(w.line, "a window needs days");
-                return None;
-            }
+            None => Vec::new(),
         };
+        if days.is_empty() {
+            ctx.error(w.line, "a window needs at least one day");
+            return None;
+        }
         let (Some(from_n), Some(to_n)) = (wf.get("from"), wf.get("to")) else {
             ctx.error(
                 w.line,
@@ -1710,6 +1737,35 @@ mod tests {
         for bad in ["", "h", "12", "1x", "-1h", "1.5h"] {
             assert_eq!(parse_duration(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn times_of_day_are_digits_only() {
+        assert_eq!(parse_time_of_day("08:00"), Some(480));
+        assert_eq!(parse_time_of_day("24:00"), Some(1440));
+        for bad in ["-1:00", "08:-5", "+8:00", "8:00", "24:01", "08:60"] {
+            assert_eq!(parse_time_of_day(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn empty_lists_are_not_everything() {
+        let (_, diags) = parse(
+            "apiVersion: warren.dev/v1alpha1\nkind: App\nmetadata: {name: a}\nspec:\n  connectorGroup: g\n  destinations:\n    - host: a.example.com\n      ports: []\n      protocol: tcp\n",
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("at least one port")),
+            "{diags:?}"
+        );
+        let (_, diags) = parse(
+            "apiVersion: warren.dev/v1alpha1\nkind: AccessPolicy\nmetadata: {name: p}\nspec:\n  rules:\n    - name: r\n      who: {groups: [g]}\n      what: {apps: [a]}\n      when:\n        schedule:\n          timezone: UTC\n          windows: [{days: [], from: \"08:00\", to: \"09:00\"}]\n",
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("at least one day")),
+            "{diags:?}"
+        );
     }
 
     #[test]

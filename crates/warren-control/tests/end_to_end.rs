@@ -286,6 +286,15 @@ async fn sign_in_enroll_certify_and_revoke() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(problem["reason"], "key_mismatch");
 
+    // Disabling and re-enabling a pending device never skips approval, and
+    // a disabled device cannot be approved directly.
+    let device_admin = |action: &str| format!("/v1/admin/devices/{device_id}/{action}");
+    d.admin("POST", &device_admin("disable"), None).await;
+    let (status, _) = d.admin("POST", &device_admin("approve"), None).await;
+    assert_eq!(status, 409);
+    d.admin("POST", &device_admin("enable"), None).await;
+    assert_eq!(client.device().await.status, "pending");
+
     let (status, body) = d
         .admin(
             "POST",
@@ -678,6 +687,48 @@ async fn sign_in_enroll_certify_and_revoke() {
     let (_, again) = next_event(&mut resumed, |b| matches!(b, EventBody::NodeRevoked { .. })).await;
     assert_eq!(again.seq, event.seq);
 
+    // The revoked relay's certificate is in the revocation state by serial,
+    // and reusing its name does not drop the node's revocation.
+    let relay_serial = relay.joined.certificate.serial.clone();
+    let after_revoke = wait_for_bundle(&connector, &policy_key, changed.version, |b| {
+        b.revocations
+            .certificates
+            .iter()
+            .any(|c| c.serial == relay_serial)
+            && b.revocations.nodes.contains(&relay.joined.node_id)
+    })
+    .await;
+    let reused = d
+        .join("relay", None, "relay-1", &["relay1.example.test"])
+        .await;
+    let kept = wait_for_bundle(&connector, &policy_key, after_revoke.version, |b| {
+        b.nodes.iter().any(|n| n.id == reused.joined.node_id)
+    })
+    .await;
+    assert!(kept.revocations.nodes.contains(&relay.joined.node_id));
+
+    // Revoking a node's certificate by serial closes that node's stream.
+    let lab4 = d.join("connector", Some("homelab"), "lab-4", &[]).await;
+    let mut lab4_events = lab4.events(None).await;
+    lab4_events.recv().await.unwrap();
+    d.admin(
+        "POST",
+        &format!(
+            "/v1/admin/certificates/{}/revoke",
+            lab4.joined.certificate.serial
+        ),
+        None,
+    )
+    .await;
+    let closed = tokio::time::timeout(REVOCATION_DEADLINE, async {
+        while lab4_events.recv().await.is_some() {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "a stream outlived the revocation of its certificate"
+    );
+
     // The commit-to-cut metric counts the acknowledgements.
     let (_, latency) = d.admin("GET", "/v1/admin/revocation-latency", None).await;
     assert!(
@@ -750,6 +801,14 @@ async fn automatic_approval_and_disabled_sign_in() {
     let (status, again) = client.enroll().await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(again["id"], device["id"]);
+    // An approved device that is disabled and enabled is approved again.
+    let id = device["id"].as_str().unwrap();
+    d.admin("POST", &format!("/v1/admin/devices/{id}/disable"), None)
+        .await;
+    assert_eq!(client.device().await.status, "disabled");
+    d.admin("POST", &format!("/v1/admin/devices/{id}/enable"), None)
+        .await;
+    assert_eq!(client.device().await.status, "approved");
 
     // A disabled user is refused at sign-in with a reason for the app.
     d.admin("POST", "/v1/admin/users/00u-ada/disable", None)

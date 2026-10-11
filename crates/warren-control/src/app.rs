@@ -23,7 +23,7 @@ use crate::audit::{self, Activity, Actor};
 use crate::authority::Authority;
 use crate::config::Config;
 use crate::oidc::Provider;
-use crate::store::{DeviceStatus, Node, Session, Store, StoredBundle, User};
+use crate::store::{BundleState, DeviceStatus, Node, Session, Store, StoredBundle, User};
 use crate::web::{ApiError, Peer};
 
 /// The outcome of the last policy load.
@@ -204,23 +204,41 @@ impl App {
     }
 
     /// Builds, signs and stores a new bundle version from the current state,
-    /// and announces it.
+    /// and announces it. The state is read in the same transaction that
+    /// stores the bundle (see [`Store::publish_bundle`]).
     pub async fn publish(&self) -> Result<u64, Error> {
         let _guard = self.publish_lock.lock().await;
         let Some(compiled) = self.compiled() else {
             return Err(Error::Unavailable("no policy has been loaded".into()));
         };
-        let users = self.store.users().await?;
-        let devices = self.store.devices().await?;
-        let nodes = self.store.nodes().await?;
-        let revocations = self.store.revocations().await?;
-        let enabled: Vec<UserEntity> = users
+        let event = self
+            .store
+            .publish_bundle(|state, version| self.build_bundle(&compiled, state, version))
+            .await?;
+        self.announce(Some(&event));
+        match event.body {
+            warren_core::events::EventBody::BundleUpdated { version, .. } => Ok(version),
+            _ => Err(Error::Internal(
+                "publishing committed an unexpected event".into(),
+            )),
+        }
+    }
+
+    fn build_bundle(
+        &self,
+        compiled: &Compiled,
+        state: BundleState,
+        version: u64,
+    ) -> Result<StoredBundle, Error> {
+        let enabled: Vec<UserEntity> = state
+            .users
             .iter()
             .filter(|u| !u.disabled)
             .map(user_entity)
             .collect();
         let enabled_ids: Vec<&str> = enabled.iter().map(|u| u.id.as_str()).collect();
-        let bundle_devices = devices
+        let bundle_devices = state
+            .devices
             .iter()
             .filter(|d| d.status == DeviceStatus::Approved)
             .map(|d| policy_bundle::Device {
@@ -236,7 +254,8 @@ impl App {
                 trust_class: d.trust_class,
             })
             .collect();
-        let bundle_nodes: Vec<policy_bundle::Node> = nodes
+        let bundle_nodes: Vec<policy_bundle::Node> = state
+            .nodes
             .iter()
             .filter(|n| n.revoked_at.is_none())
             .map(|n| policy_bundle::Node {
@@ -247,7 +266,6 @@ impl App {
                 dns_names: n.dns_names.clone(),
             })
             .collect();
-        let version = self.store.next_bundle_version().await?;
         let mut keys = BTreeMap::new();
         keys.insert(
             "posture".to_owned(),
@@ -268,8 +286,8 @@ impl App {
             apps: compiled.apps.clone(),
             connector_groups: compiled.groups.clone(),
             devices: bundle_devices,
-            nodes: bundle_nodes.clone(),
-            revocations: revocations.clone(),
+            nodes: bundle_nodes,
+            revocations: state.revocations,
             keys,
         };
         let relay = Bundle {
@@ -285,15 +303,12 @@ impl App {
             b.sign(&self.authority.policy_key)
                 .map_err(|e| Error::Internal(e.to_string()))
         };
-        let stored = StoredBundle {
+        Ok(StoredBundle {
             version,
             digest: compiled.policy.digest.clone(),
             connector_jws: sign(&connector)?,
             relay_jws: sign(&relay)?,
-        };
-        let event = self.store.insert_bundle(&stored).await?;
-        self.announce(Some(&event));
-        Ok(version)
+        })
     }
 
     /// The session presenting `Authorization: Bearer <token>`, with its

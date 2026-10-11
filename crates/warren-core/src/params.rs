@@ -129,5 +129,19 @@ pub const INFRA_CERT_LIFETIME: Duration = Duration::from_secs(24 * 3600);
 /// When a certificate valid from `not_before` to `not_after` should be
 /// renewed: at half-life (`CLIENT_CERT_RENEW_AT`, fixed at 0.5).
 pub fn renew_at(not_before: i64, not_after: i64) -> i64 {
-    not_before + (not_after - not_before) / 2
+    let mid = (i128::from(not_before) + i128::from(not_after)) / 2;
+    // The midpoint of two i64 values is itself an i64.
+    i64::try_from(mid).unwrap_or(not_before)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renew_at;
+
+    #[test]
+    fn renewal_is_at_half_life_without_overflow() {
+        assert_eq!(renew_at(100, 300), 200);
+        assert_eq!(renew_at(-1, i64::MAX), i64::MAX / 2);
+        assert_eq!(renew_at(i64::MIN, i64::MAX), 0);
+    }
 }

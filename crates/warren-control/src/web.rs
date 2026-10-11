@@ -229,19 +229,35 @@ pub fn problem(e: &ApiError) -> Response<Body> {
     with_protocol(resp)
 }
 
-/// Reads a whole request body, up to `limit` bytes.
+/// How long a client may take to send a request body.
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Reads a whole request body, up to `limit` bytes and within
+/// `BODY_TIMEOUT`.
 pub async fn read_body(req: Request<Incoming>, limit: usize) -> Result<Bytes, ApiError> {
-    Limited::new(req.into_body(), limit)
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .map_err(|_| {
+    let collected =
+        tokio::time::timeout(BODY_TIMEOUT, Limited::new(req.into_body(), limit).collect())
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request_timeout",
+                    "The request body took too long to arrive.",
+                )
+            })?;
+    collected.map(|c| c.to_bytes()).map_err(|e| {
+        if e.downcast_ref::<http_body_util::LengthLimitError>()
+            .is_some()
+        {
             ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "too_large",
                 format!("request bodies are limited to {limit} bytes"),
             )
-        })
+        } else {
+            ApiError::bad_request("the request body could not be read")
+        }
+    })
 }
 
 /// Reads a JSON request body.
@@ -406,12 +422,38 @@ pub fn server_config(
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn builder() -> hyper_util::server::conn::auto::Builder<TokioExecutor> {
-    let mut b = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-    b.http1()
-        .timer(TokioTimer::new())
-        .header_read_timeout(Duration::from_secs(10));
-    b
+/// The most connections the HTTPS listener holds at once. Beyond it new
+/// connections are closed at once, so slow or idle clients cannot exhaust
+/// the process's file descriptors.
+const MAX_CONNECTIONS: usize = 4096;
+
+/// Serves one TLS connection with the protocol ALPN chose: HTTP/2 with
+/// keep-alive pings that drop dead peers, or HTTP/1.1 with a deadline for
+/// each request's headers. No protocol sniffing, so nothing waits unbounded
+/// before the first request.
+async fn serve_connection<S>(tls: tokio_rustls::server::TlsStream<TcpStream>, service: S)
+where
+    S: hyper::service::Service<Request<Incoming>, Response = Response<Body>, Error = Infallible>
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+    let io = TokioIo::new(tls);
+    if h2 {
+        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .keep_alive_interval(Some(Duration::from_secs(30)))
+            .keep_alive_timeout(Duration::from_secs(20))
+            .serve_connection(io, service)
+            .await;
+    } else {
+        let _ = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(10))
+            .serve_connection(io, service)
+            .await;
+    }
 }
 
 /// Serves HTTPS on `listener` until `shutdown` turns true.
@@ -423,15 +465,22 @@ pub async fn serve_tls<H: Handler>(
 ) {
     let acceptor = TlsAcceptor::from(config);
     let mut connections = tokio::task::JoinSet::new();
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let accepted = tokio::select! {
             a = listener.accept() => a,
             _ = shutdown.changed() => break,
         };
         let Ok((tcp, addr)) = accepted else { continue };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            // At capacity: close this one rather than queue it.
+            drop(tcp);
+            continue;
+        };
         let acceptor = acceptor.clone();
         let handler = handler.clone();
         connections.spawn(async move {
+            let _slot = slot;
             let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await
             else {
                 return;
@@ -450,7 +499,7 @@ pub async fn serve_tls<H: Handler>(
                 let peer = peer.clone();
                 async move { Ok::<_, Infallible>(handler.handle(req, peer).await) }
             });
-            let _ = builder().serve_connection(TokioIo::new(tls), service).await;
+            serve_connection(tls, service).await;
         });
         while connections.try_join_next().is_some() {}
     }
@@ -592,18 +641,24 @@ impl Client {
         } else {
             path.to_owned()
         };
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => (
-                h,
-                p.parse::<u16>()
-                    .map_err(|_| Error::BadRequest(format!("bad port in {url}")))?,
-            ),
-            None => (authority, 443),
+        let bad_port = || Error::BadRequest(format!("bad port in {url}"));
+        let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+            // An IPv6 literal, with an optional port after the bracket.
+            let (host, after) = rest
+                .split_once(']')
+                .ok_or_else(|| Error::BadRequest(format!("bad host in {url}")))?;
+            match after.strip_prefix(':') {
+                Some(p) => (host, p.parse::<u16>().map_err(|_| bad_port())?),
+                None if after.is_empty() => (host, 443),
+                None => return Err(bad_port()),
+            }
+        } else {
+            match authority.rsplit_once(':') {
+                Some((h, p)) => (h, p.parse::<u16>().map_err(|_| bad_port())?),
+                None => (authority, 443),
+            }
         };
-        let host = host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_owned();
+        let host = host.to_owned();
         let server_name = ServerName::try_from(host.clone())
             .map_err(|_| Error::BadRequest(format!("bad host in {url}")))?;
         let tcp = TcpStream::connect((host.as_str(), port))

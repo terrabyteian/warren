@@ -62,15 +62,13 @@ pub struct Jwk {
 impl Jwk {
     /// The JWK of a P-256 public key, with its thumbprint as key ID.
     pub fn from_key(key: &PublicKey) -> Jwk {
-        let mut jwk = Jwk {
+        Jwk {
             kty: "EC".into(),
             crv: "P-256".into(),
             x: b64url(key.x()),
             y: b64url(key.y()),
-            kid: None,
-        };
-        jwk.kid = Some(jwk.thumbprint());
-        jwk
+            kid: Some(thumbprint(key)),
+        }
     }
 
     /// The public key, with the point checked to be on the curve.
@@ -82,15 +80,22 @@ impl Jwk {
             .map_err(|e| err(e.0))
     }
 
-    /// The RFC 7638 thumbprint: base64url SHA-256 of the required members
-    /// in lexicographic order.
-    pub fn thumbprint(&self) -> String {
-        let canonical = format!(
-            r#"{{"crv":"{}","kty":"{}","x":"{}","y":"{}"}}"#,
-            self.crv, self.kty, self.x, self.y
-        );
-        b64url(&sha256(canonical.as_bytes()))
+    /// The RFC 7638 thumbprint of the key. The members are checked first,
+    /// so a crafted JWK cannot produce a non-canonical thumbprint.
+    pub fn thumbprint(&self) -> Result<String, JoseError> {
+        Ok(thumbprint(&self.to_key()?))
     }
+}
+
+/// The RFC 7638 thumbprint of a P-256 key: base64url SHA-256 of its required
+/// JWK members in lexicographic order.
+pub fn thumbprint(key: &PublicKey) -> String {
+    let canonical = format!(
+        r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
+        b64url(key.x()),
+        b64url(key.y())
+    );
+    b64url(&sha256(canonical.as_bytes()))
 }
 
 /// The protected header warren writes and accepts.
@@ -291,8 +296,12 @@ mod tests {
             )
             .as_bytes(),
         ));
-        assert_eq!(jwk.thumbprint(), expected);
+        assert_eq!(jwk.thumbprint().unwrap(), expected);
         assert_eq!(jwk.kid.as_deref(), Some(expected.as_str()));
+        // Members that are not a P-256 key have no thumbprint.
+        let mut crafted = jwk.clone();
+        crafted.crv = "P-256\",\"kty\":\"EC".into();
+        assert!(crafted.thumbprint().is_err());
     }
 
     #[test]

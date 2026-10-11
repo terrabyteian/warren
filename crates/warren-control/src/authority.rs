@@ -278,21 +278,21 @@ impl Authority {
         Jwk::from_key(self.policy_key.public_key())
     }
 
-    /// Issues a user+device certificate (docs/protocol.md section 10.2).
+    /// Issues a user+device certificate (docs/protocol.md section 10.2)
+    /// valid from `not_before` to `not_after`, Unix seconds.
     pub fn issue_client(
         &self,
         key: &PublicKey,
         user_id: &str,
         device_id: &str,
         identity: Identity,
-        lifetime_secs: i64,
-        skew_secs: i64,
+        not_before: i64,
+        not_after: i64,
     ) -> Result<Issued, Error> {
-        let now = clock::now_secs();
         let spec = CertificateSpec {
             serial: serial()?,
-            not_before: now - skew_secs,
-            not_after: now + lifetime_secs,
+            not_before,
+            not_after,
             subject: EMPTY_NAME.to_vec(),
             public_key: key,
             usage: Usage::Leaf {

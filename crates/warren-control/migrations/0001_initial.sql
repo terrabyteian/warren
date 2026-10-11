@@ -54,6 +54,7 @@ CREATE TABLE devices (
     address_index BIGINT NOT NULL UNIQUE,
     tunnel_v4     TEXT NOT NULL,
     tunnel_v6     TEXT NOT NULL,
+    approved_at   BIGINT,
     created_at    BIGINT NOT NULL,
     updated_at    BIGINT NOT NULL
 );
@@ -122,9 +123,11 @@ CREATE TABLE nodes (
     dns_names_json  TEXT NOT NULL,
     public_key      TEXT NOT NULL,
     created_at      BIGINT NOT NULL,
-    revoked_at      BIGINT,
-    UNIQUE (role, name)
+    revoked_at      BIGINT
 );
+-- Names are unique among nodes that are not revoked; revoked nodes stay so
+-- their revocation stays in every bundle.
+CREATE INDEX nodes_role_name ON nodes (role, name);
 
 CREATE TABLE join_tokens (
     token_hash      TEXT PRIMARY KEY,

@@ -343,12 +343,20 @@ async fn token(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
     let request: SessionRequest = serde_json::from_slice(&payload)
         .map_err(|e| ApiError::bad_request(format!("malformed session request: {e}")))?;
     let skew = app.config.clock_skew.as_secs() as i64;
-    if (request.iat - clock::now_secs()).abs() > skew {
+    if request.iat.abs_diff(clock::now_secs()) > skew.unsigned_abs() {
         return Err(ApiError::bad_request(
             "the session request's time is off; check this device's clock",
         ));
     }
     let invalid = || {
+        let mut r = audit::record(
+            Activity::Create,
+            false,
+            &Actor::Anonymous,
+            "session refused: the sign-in code is unknown, used, expired or its PKCE verifier is wrong",
+        );
+        r.insert("entity".into(), audit::entity("session", ""));
+        app.audit(r);
         ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -399,7 +407,7 @@ async fn token(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
     r.insert("entity".into(), audit::entity("session", &session.id));
     r.insert(
         "unmapped".into(),
-        json!({ "device_key": jose::Jwk::from_key(&key).thumbprint() }),
+        json!({ "device_key": jose::thumbprint(&key) }),
     );
     app.audit(r);
     Ok(json(
@@ -560,6 +568,30 @@ fn device_refusal(status: DeviceStatus) -> Option<ApiError> {
 
 async fn client_certificate(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiError> {
     let (session, user) = app.session(&req).await?;
+    let result = issue_client_certificate(app, req, &session, &user).await;
+    if let Err(e) = &result {
+        let mut r = audit::record(
+            Activity::Create,
+            false,
+            &Actor::User {
+                id: user.id.clone(),
+                email: user.email.clone(),
+            },
+            &format!("user+device certificate refused: {}", e.reason),
+        );
+        r.insert("entity".into(), audit::entity("certificate", ""));
+        r.insert("unmapped".into(), json!({ "session_id": session.id }));
+        app.audit(r);
+    }
+    result
+}
+
+async fn issue_client_certificate(
+    app: &App,
+    req: Request<Incoming>,
+    session: &Session,
+    user: &crate::store::User,
+) -> Result<Response<Body>, ApiError> {
     let body: CertificateRequest = read_json(req).await?;
     let key = csr_key(&body.csr, Some(&session.public_key))?;
     let device = app
@@ -577,9 +609,12 @@ async fn client_certificate(app: &App, req: Request<Incoming>) -> Result<Respons
     if let Some(e) = device_refusal(device.status) {
         return Err(e);
     }
+    // One clock reading for both ends, so notAfter never passes the end of
+    // the session (docs/protocol.md section 10.2).
     let now = clock::now_secs();
-    let lifetime = (app.config.client_cert_lifetime.as_secs() as i64).min(session.expires_at - now);
-    if lifetime < 60 {
+    let not_after =
+        (now + app.config.client_cert_lifetime.as_secs() as i64).min(session.expires_at);
+    if not_after - now < 60 {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "reauth_required",
@@ -599,8 +634,8 @@ async fn client_certificate(app: &App, req: Request<Incoming>) -> Result<Respons
         &user.id,
         &device.id,
         identity,
-        lifetime,
-        app.config.clock_skew.as_secs() as i64,
+        now - app.config.clock_skew.as_secs() as i64,
+        not_after,
     )?;
     app.store
         .insert_certificate(
@@ -748,6 +783,15 @@ pub fn token_secret(token: &str) -> Option<&str> {
 async fn join(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiError> {
     let body: JoinRequest = read_json(req).await?;
     let invalid = || {
+        let mut r = audit::record(
+            Activity::Enroll,
+            false,
+            &Actor::Anonymous,
+            "join refused: the token is unknown, expired or already used",
+        );
+        r.insert("entity".into(), audit::entity("node", ""));
+        r.insert("unmapped".into(), json!({ "name": body.name }));
+        app.audit(r);
         ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_token",
@@ -914,7 +958,15 @@ async fn node_events<B>(
         ),
         None => None,
     };
-    Ok(stream::open(app, node, after, cert.not_after))
+    Ok(stream::open(
+        app,
+        node,
+        after,
+        stream::StreamCert {
+            serial: cert.serial_hex(),
+            not_after: cert.not_after,
+        },
+    ))
 }
 
 async fn node_ack(
@@ -958,7 +1010,8 @@ async fn node_audit(
     let (node, cert) = app.node(peer).await?;
     let body = read_body(req, 4 * MAX_BODY).await?;
     let reporter = cert.uris.first().cloned().unwrap_or(node.id);
-    let records = audit::accept_node_records(&body, &reporter).map_err(ApiError::bad_request)?;
+    let records =
+        audit::accept_node_records(&body, &reporter, &node.role).map_err(ApiError::bad_request)?;
     for r in &records {
         app.audit.write(r);
     }

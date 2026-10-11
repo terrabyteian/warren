@@ -23,7 +23,7 @@ use warren_core::params::{JOIN_TOKEN_LIFETIME, REVOCATION_DEADLINE};
 use crate::Error;
 use crate::app::{App, new_secret, secret_hash};
 use crate::audit::{self, Activity, Actor};
-use crate::store::DeviceStatus;
+use crate::store::{DeviceAction, DeviceStatus};
 use crate::web::{ApiError, Body, Handler, Peer, json, problem, read_json};
 
 /// Every admin route, as (method, path template). The OpenAPI description
@@ -235,37 +235,70 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
                 .device(id)
                 .await?
                 .ok_or_else(|| ApiError::not_found(format!("no device {id}")))?;
-            let (target, activity, message) = match *action {
-                "approve" if device.status == DeviceStatus::Pending => (
+            let (transition, done, activity, message) = match *action {
+                "approve" => (
+                    DeviceAction::Approve,
                     DeviceStatus::Approved,
                     Activity::Activate,
                     "device approved",
                 ),
-                "enable" if device.status == DeviceStatus::Disabled => {
-                    (DeviceStatus::Approved, Activity::Activate, "device enabled")
+                "enable" => (
+                    DeviceAction::Enable,
+                    DeviceStatus::Approved,
+                    Activity::Activate,
+                    "device enabled",
+                ),
+                "disable" => (
+                    DeviceAction::Disable,
+                    DeviceStatus::Disabled,
+                    Activity::Suspend,
+                    "device disabled",
+                ),
+                _ => (
+                    DeviceAction::Revoke,
+                    DeviceStatus::Revoked,
+                    Activity::Unenroll,
+                    "device revoked",
+                ),
+            };
+            let (status, event) = app.store.transition_device(id, transition).await?;
+            app.announce(event.as_ref());
+            match status {
+                Some(status) => {
+                    let mut r = audit::record(activity, true, &Actor::LocalAdmin, message);
+                    r.insert("entity".into(), audit::entity("device", id));
+                    r.insert("unmapped".into(), json!({ "status": status.as_str() }));
+                    app.audit(r);
+                    app.request_publish();
+                    Ok(changed("device", id, true))
                 }
-                "disable" => (DeviceStatus::Disabled, Activity::Suspend, "device disabled"),
-                "revoke" => (DeviceStatus::Revoked, Activity::Unenroll, "device revoked"),
-                _ => {
-                    return Err(ApiError::new(
+                // Already where the action leads: nothing to do.
+                None if device.status == done => Ok(changed("device", id, false)),
+                None => {
+                    let current = app
+                        .store
+                        .device(id)
+                        .await?
+                        .map(|d| d.status)
+                        .unwrap_or(device.status);
+                    let mut r = audit::record(
+                        activity,
+                        false,
+                        &Actor::LocalAdmin,
+                        &format!("refused: the device is {}", current.as_str()),
+                    );
+                    r.insert("entity".into(), audit::entity("device", id));
+                    app.audit(r);
+                    Err(ApiError::new(
                         StatusCode::CONFLICT,
                         "conflict",
                         format!(
                             "device {id} is {}; it cannot be {action}d",
-                            device.status.as_str()
+                            current.as_str()
                         ),
-                    ));
+                    ))
                 }
-            };
-            let (did, event) = app.store.set_device_status(id, target).await?;
-            app.announce(event.as_ref());
-            if did {
-                let mut r = audit::record(activity, true, &Actor::LocalAdmin, message);
-                r.insert("entity".into(), audit::entity("device", id));
-                app.audit(r);
-                app.request_publish();
             }
-            Ok(changed("device", id, did))
         }
         (Method::POST, ["v1", "admin", "certificates", serial, "revoke"]) => {
             let serial = serial.to_ascii_lowercase();
@@ -419,10 +452,27 @@ async fn policy_view(app: &App) -> Result<serde_json::Value, Error> {
     }))
 }
 
+/// How long `warren admin` waits for the control plane.
+const ADMIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Sends one request to the admin socket and returns the status and body.
-/// This is what `warren admin` uses.
+/// This is what `warren admin` uses; it gives up after `ADMIN_TIMEOUT`.
 #[cfg(unix)]
 pub async fn request(
+    socket: &std::path::Path,
+    method: Method,
+    path: &str,
+    body: Option<String>,
+) -> Result<(u16, String), Error> {
+    tokio::time::timeout(ADMIN_TIMEOUT, request_inner(socket, method, path, body))
+        .await
+        .map_err(|_| {
+            Error::Unavailable("the control plane did not answer on its admin socket".into())
+        })?
+}
+
+#[cfg(unix)]
+async fn request_inner(
     socket: &std::path::Path,
     method: Method,
     path: &str,

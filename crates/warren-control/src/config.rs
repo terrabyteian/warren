@@ -94,6 +94,9 @@ pub struct Config {
     pub reserved_names: Vec<String>,
 }
 
+/// The longest sign-in session a deployment may configure.
+const SESSION_MAX_LIFETIME_BOUND: Duration = Duration::from_secs(90 * 86_400);
+
 const KEYS: &[&str] = &[
     "trustDomain",
     "publicUrl",
@@ -168,6 +171,24 @@ impl Reader {
         }
     }
 
+    /// Exact host names: lowercase DNS names, no wildcards, no trailing dot.
+    fn host_names(&mut self, node: &Node, what: &str) -> Vec<String> {
+        let names = self.strings(node, what);
+        names
+            .into_iter()
+            .filter(|n| {
+                let ok = is_host_name(n);
+                if !ok {
+                    self.err(
+                        node,
+                        format!("{what} entry {n:?} must be a lowercase host name"),
+                    );
+                }
+                ok
+            })
+            .collect()
+    }
+
     fn duration(&mut self, node: &Node, what: &str) -> Option<Duration> {
         let text = self.string(node, what)?;
         match parse_duration(&text) {
@@ -202,6 +223,23 @@ pub fn https_host(url: &str) -> Option<String> {
     };
     let host = host.to_ascii_lowercase();
     (is_host_name(&host) || host.parse::<std::net::IpAddr>().is_ok()).then_some(host)
+}
+
+/// The host of any `https://` URL, path or not: what the IdP's issuer
+/// (often `https://host/realms/x` or `https://host/oauth2/default`) puts
+/// on the network.
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.contains('@') {
+        return None;
+    }
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.parse::<u16>().is_ok() => h,
+        _ => authority,
+    };
+    let host = host.to_ascii_lowercase();
+    is_host_name(&host).then_some(host)
 }
 
 impl Config {
@@ -246,7 +284,7 @@ impl Config {
             ));
         }
         let dns_names = get(&f, "dnsNames")
-            .map(|n| r.strings(n, "dnsNames"))
+            .map(|n| r.host_names(n, "dnsNames"))
             .unwrap_or_default();
         let data_dir = PathBuf::from(
             get(&f, "dataDir")
@@ -291,7 +329,11 @@ impl Config {
             if let Some(d) =
                 get(&sf, "sessionMaxLifetime").and_then(|d| r.duration(d, "sessionMaxLifetime"))
             {
-                session_max_lifetime = d;
+                if d > SESSION_MAX_LIFETIME_BOUND {
+                    r.err(n, "sessionMaxLifetime may be at most 90d");
+                } else {
+                    session_max_lifetime = d;
+                }
             }
         }
 
@@ -366,7 +408,7 @@ impl Config {
                 .map(PathBuf::from);
         }
         let reserved_names = get(&f, "reservedNames")
-            .map(|n| r.strings(n, "reservedNames"))
+            .map(|n| r.host_names(n, "reservedNames"))
             .unwrap_or_default();
 
         if !r.errors.is_empty() {
@@ -430,7 +472,7 @@ impl Config {
     pub fn reserved(&self) -> Vec<String> {
         let mut names = vec![self.public_host.clone()];
         names.extend(self.dns_names.iter().cloned());
-        names.extend(https_host(&self.idp.issuer));
+        names.extend(url_host(&self.idp.issuer));
         names.extend(self.reserved_names.iter().cloned());
         names
     }
@@ -534,6 +576,32 @@ mod tests {
         let e = Config::parse(&MINIMAL.replace("https://warren", "http://warren")).unwrap_err();
         assert!(e.contains("publicUrl"), "{e}");
         assert!(Config::parse(&MINIMAL.replace("trustDomain: example.com\n", "")).is_err());
+    }
+
+    #[test]
+    fn issuers_with_paths_reserve_their_host() {
+        let c = Config::parse(&MINIMAL.replace(
+            "https://idp.example.com/",
+            "https://login.example.com/realms/corp",
+        ))
+        .unwrap();
+        assert!(c.reserved().contains(&"login.example.com".to_owned()));
+        assert_eq!(
+            url_host("https://a.example.com:8443/x?y").as_deref(),
+            Some("a.example.com")
+        );
+        assert_eq!(url_host("https://u@a.example.com/"), None);
+    }
+
+    #[test]
+    fn names_and_lifetimes_are_checked() {
+        let e = Config::parse(&format!("{MINIMAL}dnsNames: [\"*.example.com\"]\n")).unwrap_err();
+        assert!(e.contains("dnsNames"), "{e}");
+        let e = Config::parse(&format!("{MINIMAL}reservedNames: [cp.example.com.]\n")).unwrap_err();
+        assert!(e.contains("reservedNames"), "{e}");
+        let e =
+            Config::parse(&format!("{MINIMAL}signIn:\n  sessionMaxLifetime: 1000d\n")).unwrap_err();
+        assert!(e.contains("90d"), "{e}");
     }
 
     #[test]

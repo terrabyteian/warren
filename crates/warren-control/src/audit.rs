@@ -250,9 +250,11 @@ pub const MAX_RECORD: usize = 64 << 10;
 /// Every line must be a JSON object with an integer `class_uid` and an
 /// integer `time`; on any error nothing is accepted and the error names the
 /// line. The control plane overwrites `metadata.log_provider` with the
-/// reporting node and sets `metadata.logged_time`, so a node cannot claim
-/// another node's records.
-pub fn accept_node_records(body: &[u8], reporter: &str) -> Result<Vec<Value>, String> {
+/// reporting node, `metadata.log_name` with its role (`relay` or
+/// `connector`), and sets `metadata.logged_time`, so a node can neither
+/// claim another node's records nor pass its own off as the control
+/// plane's.
+pub fn accept_node_records(body: &[u8], reporter: &str, role: &str) -> Result<Vec<Value>, String> {
     let text = std::str::from_utf8(body).map_err(|_| "audit records must be UTF-8".to_owned())?;
     let now = clock::now_millis();
     let mut out = Vec::new();
@@ -286,6 +288,7 @@ pub fn accept_node_records(body: &[u8], reporter: &str) -> Result<Vec<Value>, St
             return Err(format!("line {}: metadata must be an object", i + 1));
         };
         metadata.insert("log_provider".into(), reporter.into());
+        metadata.insert("log_name".into(), role.into());
         metadata.insert("logged_time".into(), now.into());
         out.push(value);
     }
@@ -311,7 +314,8 @@ mod tests {
     #[test]
     fn node_records_are_checked_and_stamped() {
         let body = b"{\"class_uid\":4001,\"time\":5,\"metadata\":{\"log_provider\":\"forged\"}}\n\n{\"class_uid\":3005,\"time\":6}\n";
-        let records = accept_node_records(body, "warren://example.com/connector/g/n-1").unwrap();
+        let records =
+            accept_node_records(body, "warren://example.com/connector/g/n-1", "connector").unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(
             records[0]["metadata"]["log_provider"],
@@ -326,12 +330,13 @@ mod tests {
             b"{\"class_uid\":1,\"time\":1,\"metadata\":3}",
         ] {
             assert!(
-                accept_node_records(bad, "x").is_err(),
+                accept_node_records(bad, "x", "connector").is_err(),
                 "{}",
                 String::from_utf8_lossy(bad)
             );
         }
-        let err = accept_node_records(b"{\"class_uid\":1,\"time\":1}\n{}", "x").unwrap_err();
+        let err =
+            accept_node_records(b"{\"class_uid\":1,\"time\":1}\n{}", "x", "connector").unwrap_err();
         assert!(err.starts_with("line 2"), "{err}");
     }
 }

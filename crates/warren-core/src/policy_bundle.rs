@@ -90,6 +90,10 @@ pub struct PolicySet {
     pub policies: String,
     /// One entry per compiled policy, in the order they were compiled.
     pub rules: Vec<RuleInfo>,
+    /// The time zones schedules use, by the `context.time` field that holds
+    /// the minute of the week in each.
+    #[serde(default)]
+    pub timezones: BTreeMap<String, String>,
 }
 
 /// One compiled Cedar policy and the conditions it checks, kept separately
@@ -296,7 +300,7 @@ impl Bundle {
         let header = Header {
             alg: "ES256".into(),
             typ: BUNDLE_TYP.into(),
-            kid: Some(Jwk::from_key(key.public_key()).thumbprint()),
+            kid: Some(jose::thumbprint(key.public_key())),
             jwk: None,
             crit: None,
         };
