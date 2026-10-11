@@ -12,16 +12,18 @@ use hyper::body::Incoming;
 use serde_json::json;
 use warren_core::api::{
     CertificateRequest, CertificateResponse, DeviceInfo, Discovery, EnrollRequest, EntitledApp,
-    EntitledDestination, Entitlements, JoinRequest, JoinResponse, Relay, SESSION_REQUEST_TYP,
-    Session as SessionInfo, SessionRequest, UserInfo,
+    EntitledDestination, Entitlements, Relay, SESSION_REQUEST_TYP, Session as SessionInfo,
+    SessionRequest, UserInfo,
 };
+use warren_core::cert;
 use warren_core::clock;
 use warren_core::events::AckRequest;
-use warren_core::identity::{Principal, Role, is_valid_name};
+use warren_core::identity::{AUTH_TIME_UNKNOWN, NodeRole, TrustClass, WarrenIdentity, WarrenUri};
+use warren_core::join::{self, BundleJson, JoinRequest, JoinResponse, JoinToken, sha256_hex};
 use warren_core::jose::{self, b64url};
-use warren_core::keys::{PublicKey, sha256};
+use warren_core::keys::sha256;
 use warren_core::params::{INFRA_CERT_LIFETIME, PROTOCOL_VERSION, REVOCATION_DEADLINE};
-use warren_core::x509::{self, AUTH_TIME_UNKNOWN, Identity};
+use warren_core::pki::NodeIdentity;
 use warren_policy::compile::Access;
 use warren_policy::names::{DomainPattern, is_host_name};
 
@@ -59,6 +61,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/node/events/ack"),
     ("POST", "/v1/node/audit"),
     ("POST", "/v1/node/certificate"),
+    ("GET", "/v1/node/policy-key"),
 ];
 
 /// The HTTPS API handler.
@@ -122,6 +125,7 @@ async fn route(
         (Method::POST, "/v1/node/events/ack") => node_ack(&app, req, &peer).await,
         (Method::POST, "/v1/node/audit") => node_audit(&app, req, &peer).await,
         (Method::POST, "/v1/node/certificate") => node_certificate(&app, req, &peer).await,
+        (Method::GET, "/v1/node/policy-key") => node_policy_key(&app, &peer).await,
         _ => Err(ApiError::not_found(format!("no endpoint {path}"))),
     }
 }
@@ -315,7 +319,7 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
             "idp",
             "the ID token has no auth_time, so how recently the user authenticated is unknown and rules with auth.maxAge will ask them to sign in again",
         );
-        AUTH_TIME_UNKNOWN
+        AUTH_TIME_UNKNOWN as i64
     });
     let (user, changed) = app
         .store
@@ -483,14 +487,26 @@ fn device_info(app: &App, d: &Device) -> DeviceInfo {
     }
 }
 
-/// Parses a base64 PKCS#10 request and checks it is signed by `expected`.
-fn csr_key(csr: &str, expected: Option<&str>) -> Result<PublicKey, ApiError> {
+/// The key of a verified certificate request.
+struct CsrKey {
+    /// Its SubjectPublicKeyInfo, DER, which the certificate carries as is.
+    spki: Vec<u8>,
+    /// Its point, base64url: what sessions and nodes are bound to.
+    point: String,
+}
+
+/// Parses a base64 PKCS#10 request, verifies its signature, and checks it
+/// is signed by `expected` (a base64url point) when given.
+fn csr_key(csr: &str, expected: Option<&str>) -> Result<CsrKey, ApiError> {
     let der = STANDARD
         .decode(csr.trim())
         .map_err(|_| ApiError::bad_request("csr must be base64 DER"))?;
-    let key = x509::verify_csr(&der).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let spki =
+        join::verify_certificate_request(&der).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let point =
+        b64url(cert::spki_key_bits(&spki).map_err(|e| ApiError::bad_request(e.to_string()))?);
     if let Some(expected) = expected
-        && b64url(key.point()) != expected
+        && point != expected
     {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -498,7 +514,7 @@ fn csr_key(csr: &str, expected: Option<&str>) -> Result<PublicKey, ApiError> {
             "The request is not signed by the key this sign-in is bound to. Sign in again from this device.",
         ));
     }
-    Ok(key)
+    Ok(CsrKey { spki, point })
 }
 
 fn clip(s: &str) -> String {
@@ -692,19 +708,21 @@ async fn issue_client_certificate(
             "Your sign-in is about to end. Sign in again.",
         ));
     }
-    let identity = Identity {
+    let identity = WarrenIdentity {
         session_id: session.id.clone(),
-        auth_time: session.auth_time,
+        // A time before the epoch says no more than an unknown one.
+        auth_time: u64::try_from(session.auth_time).unwrap_or(AUTH_TIME_UNKNOWN),
         mfa: session.mfa,
-        trust_class: device.trust_class,
+        trust_class: TrustClass::from_u64(u64::from(device.trust_class))
+            .ok_or_else(ApiError::internal)?,
         tunnel_v4: device.tunnel_v4.parse().map_err(|_| ApiError::internal())?,
         tunnel_v6: device.tunnel_v6.parse().map_err(|_| ApiError::internal())?,
     };
     let issued = app.authority.issue_client(
-        &key,
+        &key.spki,
         &user.id,
         &device.id,
-        identity,
+        &identity,
         now - app.config.clock_skew.as_secs() as i64,
         not_after,
     )?;
@@ -840,53 +858,17 @@ async fn entitlements<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, 
     ))
 }
 
-/// Join tokens: `wj1.<secret>.<root fingerprint>`, where the fingerprint
-/// (base64url SHA-256 of the root CA certificate) lets the joining node pin
-/// the deployment before it trusts anything the control plane says.
-pub fn token_secret(token: &str) -> Option<&str> {
-    let mut parts = token.split('.');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("wj1"), Some(secret), Some(_), None) if secret.len() == 43 => Some(secret),
-        _ => None,
-    }
-}
-
-async fn join(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiError> {
-    let body: JoinRequest = serde_json::from_slice(&read_body(req, PREAUTH_BODY).await?)
-        .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?;
-    let invalid = || {
-        let mut r = audit::record(
-            Activity::Enroll,
-            false,
-            &Actor::Anonymous,
-            "join refused: the token is unknown, expired or already used",
-        );
-        r.insert("entity".into(), audit::entity("node", ""));
-        r.insert("unmapped".into(), json!({ "name": body.name }));
-        app.audit(r);
-        ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "invalid_token",
-            "The join token is unknown, expired or already used. Ask an admin for a new one.",
-        )
-    };
-    let secret = token_secret(&body.token).ok_or_else(invalid)?;
-    if !is_valid_name(&body.name) {
-        return Err(ApiError::bad_request(
-            "name must be 1 to 63 lowercase letters, digits and '-'",
-        ));
-    }
-    if body.dns_names.len() > 16 || !body.dns_names.iter().all(|n| is_host_name(n)) {
+/// Checks the DNS names a relay will listen on: at most 16 host names,
+/// none of them warren's own (a relay certificate naming the control plane
+/// or the IdP could stand in for them) or claimed by an app.
+pub(crate) fn check_relay_names(app: &App, names: &[String]) -> Result<(), ApiError> {
+    if names.len() > 16 || !names.iter().all(|n| is_host_name(n)) {
         return Err(ApiError::bad_request(
             "dns_names must be at most 16 lowercase host names",
         ));
     }
-    let key = csr_key(&body.csr, None)?;
-    // A relay certificate naming the control plane or the IdP could stand in
-    // for them, so warren's own names are never issued to a node.
     let reserved = app.config.reserved();
-    if let Some(name) = body
-        .dns_names
+    if let Some(name) = names
         .iter()
         .find(|n| reserved.iter().any(|r| r.eq_ignore_ascii_case(n)))
     {
@@ -897,7 +879,7 @@ async fn join(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiEr
         ));
     }
     if let Some(compiled) = app.compiled() {
-        for name in &body.dns_names {
+        for name in names {
             let claimed = compiled.objects.apps.iter().any(|a| {
                 a.destinations.iter().any(|d| {
                     matches!(&d.kind, warren_policy::model::DestinationKind::Host { host, .. } if host.matches(name))
@@ -912,39 +894,66 @@ async fn join(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiEr
             }
         }
     }
+    Ok(())
+}
+
+/// The join exchange (docs/protocol.md section 10.3): a single-use token
+/// and a signed certificate request for the node's first certificate.
+async fn join(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiError> {
+    let body: JoinRequest = serde_json::from_slice(&read_body(req, PREAUTH_BODY).await?)
+        .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?;
+    let invalid = || {
+        let mut r = audit::record(
+            Activity::Enroll,
+            false,
+            &Actor::Anonymous,
+            "join refused: the token is unknown, expired, already used or for another deployment",
+        );
+        r.insert("entity".into(), audit::entity("node", ""));
+        app.audit(r);
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "The join token is unknown, expired or already used. Ask an admin for a new one.",
+        )
+    };
+    let token =
+        JoinToken::parse(&body.token, clock::now_secs().unsigned_abs()).map_err(|_| invalid())?;
+    if token.td != app.config.trust_domain || token.root != sha256_hex(&app.authority.root.der) {
+        return Err(invalid());
+    }
+    let key = csr_key(&body.csr, None)?;
+    let token_hash = secret_hash(&token.secret);
+    let dns_names = app
+        .store
+        .minted_dns_names(&token_hash)
+        .await?
+        .ok_or_else(invalid)?;
+    check_relay_names(app, &dns_names)?;
     let draft = Node {
         id: crate::store::new_id("n")?,
         role: String::new(),
         group: None,
-        name: body.name.clone(),
-        dns_names: body.dns_names.clone(),
-        public_key: b64url(key.point()),
+        name: String::new(),
+        dns_names: Vec::new(),
+        public_key: key.point,
         created_at: 0,
         revoked_at: None,
     };
     let node = app
         .store
-        .join(&secret_hash(secret), &draft)
+        .join(&token_hash, &token, &draft)
         .await?
         .ok_or_else(invalid)?;
-    let principal = match (node.role.as_str(), &node.group) {
-        ("connector", Some(group)) => Principal::Connector {
-            group: group.clone(),
-            id: node.id.clone(),
-        },
-        _ => Principal::Node {
-            role: Role::Relay,
-            id: node.id.clone(),
-        },
-    };
-    let dns = if node.role == "relay" {
-        node.dns_names.clone()
-    } else {
-        Vec::new()
+    let role = token.node_role();
+    let dns = match role {
+        NodeRole::Relay => node.dns_names.clone(),
+        _ => Vec::new(),
     };
     let issued = app.authority.issue_node(
-        &key,
-        &principal,
+        &key.spki,
+        &role,
+        &node.id,
         &dns,
         INFRA_CERT_LIFETIME.as_secs() as i64,
         app.config.clock_skew.as_secs() as i64,
@@ -971,28 +980,33 @@ async fn join(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiEr
     r.insert("entity".into(), audit::entity(&node.role, &node.id));
     r.insert(
         "unmapped".into(),
-        json!({ "name": node.name, "group": node.group, "dns_names": node.dns_names }),
+        json!({ "name": node.name, "group": node.group, "dns_names": node.dns_names, "token_id": token.id }),
     );
     app.audit(r);
     app.request_publish();
+    let authority = &app.authority;
     Ok(json(
         StatusCode::OK,
         &JoinResponse {
-            node_id: node.id.clone(),
-            role: node.role.clone(),
-            group: node.group.clone(),
-            trust_domain: app.config.trust_domain.clone(),
-            certificate: CertificateResponse {
-                certificate_chain: app.authority.chain_pem(&issued.der, &app.authority.infra),
-                serial: issued.serial,
-                not_before: issued.not_before,
-                not_after: issued.not_after,
-                renew_at: issued.renew_at,
+            chain: vec![
+                STANDARD.encode(&issued.der),
+                STANDARD.encode(&authority.infra.der),
+            ],
+            trust_bundle: BundleJson {
+                root: STANDARD.encode(&authority.root.der),
+                client_cas: vec![STANDARD.encode(&authority.client.der)],
+                infra_cas: vec![STANDARD.encode(&authority.infra.der)],
             },
-            trust_bundle: app.authority.trust_bundle(),
-            policy_key: app.authority.policy_jwk(),
         },
     ))
+}
+
+/// The policy-signing key, for a joined node to verify bundles with. It is
+/// served on link E, where the node has already verified the control plane
+/// against the trust bundle its join pinned.
+async fn node_policy_key(app: &App, peer: &Peer) -> Result<Response<Body>, ApiError> {
+    app.node(peer).await?;
+    Ok(json(StatusCode::OK, &app.authority.policy_jwk()))
 }
 
 async fn node_bundle(app: &App, peer: &Peer) -> Result<Response<Body>, ApiError> {
@@ -1021,7 +1035,7 @@ async fn node_events<B>(
     req: &Request<B>,
     peer: &Peer,
 ) -> Result<Response<Body>, ApiError> {
-    let (node, cert) = app.node(peer).await?;
+    let (node, identity) = app.node(peer).await?;
     let q = query(req)?;
     let after = match param(&q, "after") {
         Some(a) => Some(
@@ -1035,8 +1049,11 @@ async fn node_events<B>(
         node,
         after,
         stream::StreamCert {
-            serial: cert.serial_hex(),
-            not_after: cert.not_after,
+            serial: identity.serial,
+            not_after: identity
+                .not_after
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64),
         },
     ))
 }
@@ -1079,9 +1096,14 @@ async fn node_audit(
     req: Request<Incoming>,
     peer: &Peer,
 ) -> Result<Response<Body>, ApiError> {
-    let (node, cert) = app.node(peer).await?;
+    let (node, identity) = app.node(peer).await?;
     let body = read_body(req, 4 * MAX_BODY).await?;
-    let reporter = cert.uris.first().cloned().unwrap_or(node.id);
+    let reporter = WarrenUri::Node {
+        td: identity.trust_domain,
+        role: identity.role,
+        id: identity.id,
+    }
+    .to_string();
     let records =
         audit::accept_node_records(&body, &reporter, &node.role).map_err(ApiError::bad_request)?;
     for r in &records {
@@ -1098,8 +1120,8 @@ async fn node_certificate(
     req: Request<Incoming>,
     peer: &Peer,
 ) -> Result<Response<Body>, ApiError> {
-    let (node, cert) = app.node(peer).await?;
-    let result = renew_node_certificate(app, req, &node, &cert).await;
+    let (node, identity) = app.node(peer).await?;
+    let result = renew_node_certificate(app, req, &node, &identity).await;
     if let Err(e) = &result {
         let mut r = audit::record(
             Activity::Create,
@@ -1119,22 +1141,19 @@ async fn renew_node_certificate(
     app: &App,
     req: Request<Incoming>,
     node: &Node,
-    cert: &x509::Certificate,
+    identity: &NodeIdentity,
 ) -> Result<Response<Body>, ApiError> {
     let body: CertificateRequest = read_json(req).await?;
     let key = csr_key(&body.csr, Some(&node.public_key))?;
-    let [uri] = cert.uris.as_slice() else {
-        return Err(ApiError::internal());
-    };
-    let (_, principal) = Principal::parse_uri(uri).map_err(|_| ApiError::internal())?;
     let dns = if node.role == "relay" {
         node.dns_names.clone()
     } else {
         Vec::new()
     };
     let issued = app.authority.issue_node(
-        &key,
-        &principal,
+        &key.spki,
+        &identity.role,
+        &identity.id,
         &dns,
         INFRA_CERT_LIFETIME.as_secs() as i64,
         app.config.clock_skew.as_secs() as i64,
@@ -1207,17 +1226,5 @@ mod tests {
             s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
-    }
-
-    #[test]
-    fn join_tokens() {
-        let secret = "a".repeat(43);
-        assert_eq!(
-            token_secret(&format!("wj1.{secret}.fp")),
-            Some(secret.as_str())
-        );
-        assert_eq!(token_secret(&format!("wj2.{secret}.fp")), None);
-        assert_eq!(token_secret("wj1.short.fp"), None);
-        assert_eq!(token_secret(&format!("wj1.{secret}")), None);
     }
 }

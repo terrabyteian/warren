@@ -27,8 +27,9 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use warren_core::cert;
 use warren_core::clock;
-use warren_core::identity::{Principal, Role};
+use warren_core::identity::NodeRole;
 use warren_core::keys::{SigningKey, sha256};
 use warren_core::params::INFRA_CERT_LIFETIME;
 
@@ -155,18 +156,22 @@ fn issue_own_cert(
     names.extend(config.dns_names.iter().cloned());
     names.dedup();
     let issued = app_authority.issue_node(
-        key.public_key(),
-        &Principal::Node {
-            role: Role::ControlPlane,
-            id: id.into(),
-        },
+        &cert::p256_spki(key.public_key().point()),
+        &NodeRole::ControlPlane,
+        id,
         &names,
         INFRA_CERT_LIFETIME.as_secs() as i64,
         config.clock_skew.as_secs() as i64,
     )?;
     let pkcs8 = key.to_pkcs8().map_err(|e| Error::Internal(e.to_string()))?;
+    // The root rides along so a joining node can find the root its token
+    // pins (docs/protocol.md section 10.3).
     Ok((
-        vec![issued.der, app_authority.infra.der.clone()],
+        vec![
+            issued.der,
+            app_authority.infra.der.clone(),
+            app_authority.root.der.clone(),
+        ],
         pkcs8.to_vec(),
     ))
 }

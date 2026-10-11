@@ -130,39 +130,6 @@ pub fn der_time(secs: i64) -> Vec<u8> {
     out
 }
 
-/// Decodes the contents of an X.509 `Time` given its tag (0x17 UTCTime or
-/// 0x18 GeneralizedTime) into Unix seconds. Only the forms RFC 5280 allows
-/// are accepted: seconds present, `Z` suffix, no fractions.
-pub fn parse_der_time(tag: u8, contents: &[u8]) -> Option<i64> {
-    let text = std::str::from_utf8(contents).ok()?;
-    let digits = text.strip_suffix('Z')?;
-    if !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let num = |s: &str| s.parse::<u32>().ok();
-    let (year, rest) = match (tag, digits.len()) {
-        (0x17, 12) => {
-            let yy = i64::from(num(&digits[..2])?);
-            (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &digits[2..])
-        }
-        // RFC 5280 section 4.1.2.5: GeneralizedTime only from 2050.
-        (0x18, 14) => match i64::from(num(&digits[..4])?) {
-            1950..=2049 => return None,
-            year => (year, &digits[4..]),
-        },
-        _ => return None,
-    };
-    Civil {
-        year,
-        month: num(&rest[0..2])?,
-        day: num(&rest[2..4])?,
-        hour: num(&rest[4..6])?,
-        minute: num(&rest[6..8])?,
-        second: num(&rest[8..10])?,
-    }
-    .to_unix()
-}
-
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
@@ -237,19 +204,8 @@ mod tests {
         assert_eq!(der_time(2_524_608_000), b"\x18\x0f20500101000000Z".to_vec());
         for secs in [0, 1_791_715_800, 2_524_607_999, 2_524_608_000] {
             let der = der_time(secs);
-            assert_eq!(parse_der_time(der[0], &der[2..]), Some(secs));
+            assert_eq!(crate::der::parse_time(der[0], &der[2..]), Ok(secs));
         }
-    }
-
-    #[test]
-    fn malformed_der_times_are_rejected() {
-        assert_eq!(parse_der_time(0x17, b"2610111050Z"), None);
-        assert_eq!(parse_der_time(0x17, b"261011105000"), None);
-        assert_eq!(parse_der_time(0x17, b"261311105000Z"), None);
-        assert_eq!(parse_der_time(0x17, b"260230105000Z"), None);
-        assert_eq!(parse_der_time(0x18, b"20261011105000.5Z"), None);
-        assert_eq!(parse_der_time(0x18, b"20261011105000Z"), None);
-        assert_eq!(parse_der_time(0x04, b"261011105000Z"), None);
     }
 
     #[test]

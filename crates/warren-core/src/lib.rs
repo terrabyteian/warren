@@ -8,14 +8,16 @@
 //! and `docs/protocol.md`.
 //!
 //! It also holds what every role shares with the control plane: the
-//! certificate profile ([`x509`], [`identity`]), the keys and JOSE objects
-//! that sign policy ([`keys`], [`jose`]), and the control-channel messages of
-//! links D and E ([`api`], [`policy_bundle`], [`events`]).
+//! certificate profile ([`pki`], [`identity`], and [`cert`] to issue it), the
+//! join exchange ([`join`]), the keys and JOSE objects that sign policy
+//! ([`keys`], [`jose`]), and the control-channel messages of links D and E
+//! ([`api`], [`policy_bundle`], [`events`]).
 
 pub mod api;
 pub mod audit;
 pub mod base64;
 pub mod bundle;
+pub mod cert;
 pub mod clock;
 pub mod der;
 pub mod events;
@@ -35,4 +37,3 @@ pub mod tls;
 #[cfg(target_os = "linux")]
 pub mod tun;
 pub mod vsock;
-pub mod x509;

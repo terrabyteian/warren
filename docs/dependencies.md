@@ -144,16 +144,15 @@ the workspace crates that use it.
 | cedar-policy 4.13.0 | warren-policy | The policy engine (design section 7.5) | Only the `ipaddr` extension. Behind the `compiler` feature of warren-policy, so the data-path build does not link it yet. |
 | saphyr-parser 0.1.0 | warren-policy | YAML with line numbers for `@source` and diagnostics | Behind the `compiler` feature. The YAML crates built on serde are unmaintained or pull in much more. No `unsafe`. |
 | serde 1.0.229, serde_json 1.0.154 | warren-core, warren-policy, warren-control | JSON for the APIs, bundles, events, Cedar entities and audit records | |
-| yasna 0.6.0 | warren-core | DER for certificates, PKCS#10 requests and the identity extension | One crate, no dependencies, `forbid(unsafe_code)`. General certificate libraries encode object identifiers with 64-bit components only, and warren's arc is UUID-derived (protocol.md section 10.4). |
 | base64 0.22.1 | warren-core, warren-control | base64 and base64url | The version sqlx already uses. |
 | form_urlencoded 1.2.2 | warren-control | Query strings and form bodies in the OIDC flow | Already in the closure through `url`. |
 | zeroize 1.9.1 | warren-core, warren-control | Wiping private keys and secrets after use | Already in the closure through aws-lc-rs. |
 
 | Binary | Third-party crates | Notes |
 | --- | --- | --- |
-| `warren` | 232 | Cedar (about 100, mostly its build-time parser generator) and sqlx with `url` (about 60) are the bulk; the data path's transport stack is most of the rest. |
-| `warren-datapath` | 78 | The transport stack (tokio, quinn, rustls, h2), the aws-lc-rs build (cc, cmake and friends), clap, and base64, yasna and zeroize through warren-core. |
-| `warren-client` | 74 | The data-path set without the clap family. |
+| `warren` | 231 | Cedar (about 100, mostly its build-time parser generator) and sqlx with `url` (about 60) are the bulk; the data path's transport stack is most of the rest. |
+| `warren-datapath` | 77 | The transport stack (tokio, quinn, rustls, h2), the aws-lc-rs build (cc, cmake and friends), clap, and base64 and zeroize through warren-core. |
+| `warren-client` | 73 | The data-path set without the clap family. |
 
 The control plane's crates stay out of both data-path closures:
 `scripts/check-closure.sh` checks them against

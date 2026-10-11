@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use warren_core::identity::is_valid_trust_domain;
+use warren_core::identity::valid_trust_domain;
 use warren_core::params::{CLIENT_CERT_LIFETIME, CLOCK_SKEW_ALLOWANCE};
 use warren_policy::model::parse_duration;
 use warren_policy::names::{Cidr, is_host_name};
@@ -291,7 +291,7 @@ impl Config {
             }
         };
         let trust_domain = required(&mut r, "trustDomain").unwrap_or_default();
-        if !trust_domain.is_empty() && !is_valid_trust_domain(&trust_domain) {
+        if !trust_domain.is_empty() && !valid_trust_domain(&trust_domain) {
             r.errors.push(format!(
                 "trustDomain {trust_domain:?} must be a lowercase DNS name"
             ));

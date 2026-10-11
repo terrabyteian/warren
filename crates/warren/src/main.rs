@@ -208,6 +208,18 @@ fn admin_command() -> Command {
                             Arg::new("group")
                                 .long("group")
                                 .help("The connector group, for connectors"),
+                        )
+                        .arg(
+                            Arg::new("name")
+                                .long("name")
+                                .required(true)
+                                .help("The node's name, unique within its role"),
+                        )
+                        .arg(
+                            Arg::new("dns-name")
+                                .long("dns-name")
+                                .action(clap::ArgAction::Append)
+                                .help("A DNS name the relay listens on (repeatable; relays only)"),
                         ),
                 ),
         )
@@ -458,11 +470,22 @@ fn admin_request(m: &ArgMatches) -> Result<(&'static str, String, Option<String>
                 .subcommand_matches("create")
                 .ok_or("missing arguments")?;
             let role = a.get_one::<String>("role").ok_or("missing --role")?;
-            let group = a.get_one::<String>("group");
-            let body = match group {
-                Some(g) => format!(r#"{{"role":"{role}","group":"{}"}}"#, path_segment(g)?),
-                None => format!(r#"{{"role":"{role}"}}"#),
-            };
+            let mut body = format!(r#"{{"role":"{role}""#);
+            if let Some(g) = a.get_one::<String>("group") {
+                body.push_str(&format!(r#","group":"{}""#, path_segment(g)?));
+            }
+            let name = a.get_one::<String>("name").ok_or("missing --name")?;
+            body.push_str(&format!(r#","name":"{}""#, path_segment(name)?));
+            let dns = a
+                .get_many::<String>("dns-name")
+                .into_iter()
+                .flatten()
+                .map(|d| path_segment(d).map(|d| format!(r#""{d}""#)))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !dns.is_empty() {
+                body.push_str(&format!(r#","dns_names":[{}]"#, dns.join(",")));
+            }
+            body.push('}');
             ("POST", "/v1/admin/join-tokens".into(), Some(body))
         }
         ("nodes", "list") => ("GET", "/v1/admin/nodes".into(), None),
@@ -655,10 +678,31 @@ mod tests {
                     "connector",
                     "--group",
                     "homelab",
+                    "--name",
+                    "lab-1",
                 ],
                 "POST",
                 "/v1/admin/join-tokens",
-                Some(r#"{"role":"connector","group":"homelab"}"#),
+                Some(r#"{"role":"connector","group":"homelab","name":"lab-1"}"#),
+            ),
+            (
+                &[
+                    "join-token",
+                    "create",
+                    "--role",
+                    "relay",
+                    "--name",
+                    "relay-1",
+                    "--dns-name",
+                    "relay1.example.com",
+                    "--dns-name",
+                    "relay1.example.net",
+                ],
+                "POST",
+                "/v1/admin/join-tokens",
+                Some(
+                    r#"{"role":"relay","name":"relay-1","dns_names":["relay1.example.com","relay1.example.net"]}"#,
+                ),
             ),
             (
                 &["revocation-latency"],

@@ -16,6 +16,7 @@ use sqlx::{Row, SqlSafeStr, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use warren_core::api::Platform;
 use warren_core::clock;
 use warren_core::events::{Event, EventBody};
+use warren_core::join::JoinToken;
 use warren_core::keys::{hex, random_bytes};
 use warren_core::policy_bundle::{Revocations, RevokedCertificate};
 
@@ -1164,17 +1165,25 @@ impl Store {
     // Nodes and join tokens.
 
     /// Stores a join token's hash.
+    /// Stores a join token, by the hash of its secret, with the names the
+    /// node it admits will have.
     pub async fn insert_join_token(
         &self,
         token_hash: &str,
-        role: &str,
-        group: Option<&str>,
-        expires_at: i64,
+        token: &JoinToken,
+        name: &str,
+        dns_names: &[String],
     ) -> Result<(), Error> {
-        sqlx::query("INSERT INTO join_tokens (token_hash, role, connector_group, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
+        let dns = serde_json::to_string(dns_names).map_err(|e| Error::Internal(e.to_string()))?;
+        let expires_at =
+            i64::try_from(token.exp).map_err(|_| Error::Internal("token expiry".into()))?;
+        sqlx::query("INSERT INTO join_tokens (token_hash, token_id, role, connector_group, name, dns_names_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(token_hash)
-            .bind(role)
-            .bind(group)
+            .bind(&token.id)
+            .bind(&token.role)
+            .bind(&token.group)
+            .bind(name)
+            .bind(dns)
             .bind(clock::now_secs())
             .bind(expires_at)
             .execute(&self.pool)
@@ -1183,25 +1192,57 @@ impl Store {
         Ok(())
     }
 
+    /// The DNS names an unused, unexpired join token was minted for.
+    pub async fn minted_dns_names(&self, token_hash: &str) -> Result<Option<Vec<String>>, Error> {
+        let dns: Option<String> = sqlx::query_scalar(
+            "SELECT dns_names_json FROM join_tokens \
+             WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+        )
+        .bind(token_hash)
+        .bind(clock::now_secs())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        dns.map(|d| serde_json::from_str(&d).map_err(|e| Error::Internal(e.to_string())))
+            .transpose()
+    }
+
     /// Spends a join token and creates the node it admits, atomically, so
-    /// a token admits exactly one node. Returns `None` if the token is
-    /// unknown, used or expired, and an error if the name is taken.
-    pub async fn join(&self, token_hash: &str, node: &Node) -> Result<Option<Node>, Error> {
+    /// a token admits exactly one node. The token must be unused, unexpired
+    /// and minted with this ID, role and group; the node gets the name and
+    /// DNS names it was minted for. Returns `None` for any other token, and
+    /// an error if the name is taken.
+    pub async fn join(
+        &self,
+        token_hash: &str,
+        token: &JoinToken,
+        node: &Node,
+    ) -> Result<Option<Node>, Error> {
         let mut tx = self.begin().await?;
         let now = clock::now_secs();
-        let scope: Option<(String, Option<String>)> = sqlx::query_as(
+        let minted: Option<(String, String)> = sqlx::query_as(
             "UPDATE join_tokens SET used_at = ?, used_by = ? \
-             WHERE token_hash = ? AND used_at IS NULL AND expires_at > ? RETURNING role, connector_group",
+             WHERE token_hash = ? AND token_id = ? AND role = ? AND connector_group IS ? \
+             AND used_at IS NULL AND expires_at > ? RETURNING name, dns_names_json",
         )
         .bind(now)
         .bind(&node.id)
         .bind(token_hash)
+        .bind(&token.id)
+        .bind(&token.role)
+        .bind(&token.group)
         .bind(now)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db)?;
-        let Some((role, group)) = scope else {
+        let Some((name, dns)) = minted else {
             return Ok(None);
+        };
+        let (role, group) = (token.role.clone(), token.group.clone());
+        let node = Node {
+            name,
+            dns_names: serde_json::from_str(&dns).map_err(|e| Error::Internal(e.to_string()))?,
+            ..node.clone()
         };
         let taken: Option<String> = sqlx::query_scalar(
             "SELECT id FROM nodes WHERE role = ? AND name = ? AND revoked_at IS NULL",

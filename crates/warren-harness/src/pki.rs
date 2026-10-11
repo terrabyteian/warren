@@ -13,13 +13,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{self, EcdsaKeyPair, KeyPair as _};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use warren_core::der::{self, tag};
+use warren_core::cert;
+pub use warren_core::cert::{CertSpec, name};
 use warren_core::identity::{self, WarrenIdentity};
 use warren_core::pki::{TrustBundle, oid};
 use warren_core::tls::Credentials;
-
-const ECDSA_WITH_SHA256: &[u128] = &[1, 2, 840, 10045, 4, 3, 2];
-const COMMON_NAME: &[u128] = &[2, 5, 4, 3];
 
 /// An ECDSA P-256 key pair.
 pub struct KeyPair {
@@ -47,13 +45,7 @@ impl KeyPair {
 
     /// The SubjectPublicKeyInfo, DER.
     pub fn spki(&self) -> Vec<u8> {
-        let alg = der::sequence(&[
-            &der::tlv(tag::OID, oid::EC_PUBLIC_KEY),
-            &der::tlv(tag::OID, oid::P256),
-        ]);
-        let mut bits = vec![0u8];
-        bits.extend_from_slice(self.pair.public_key().as_ref());
-        der::sequence(&[&alg, &der::tlv(tag::BIT_STRING, &bits)])
+        cert::p256_spki(self.pair.public_key().as_ref())
     }
 
     /// Signs with ECDSA P-256 SHA-256, DER signature.
@@ -75,41 +67,13 @@ impl KeyPair {
         pem("PRIVATE KEY", &self.pkcs8)
     }
 
-    fn key_id(&self) -> Vec<u8> {
+    /// The key identifier: the leftmost 160 bits of the SHA-256 of the
+    /// public key.
+    pub fn key_id(&self) -> Vec<u8> {
         aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, self.pair.public_key().as_ref())
             .as_ref()[..20]
             .to_vec()
     }
-}
-
-/// Everything that goes into a certificate; tests change fields to break
-/// the profile.
-#[derive(Debug, Clone)]
-pub struct CertSpec {
-    /// Serial number content octets.
-    pub serial: Vec<u8>,
-    /// Subject common name; `None` for an empty subject.
-    pub subject_cn: Option<String>,
-    /// notBefore, Unix seconds.
-    pub not_before: i64,
-    /// notAfter, Unix seconds.
-    pub not_after: i64,
-    /// basicConstraints: `None` to omit, `Some(ca)` otherwise.
-    pub ca: Option<bool>,
-    /// keyUsage first octet and criticality.
-    pub key_usage: Option<(u8, bool)>,
-    /// extKeyUsage OIDs (content octets); empty to omit.
-    pub eku: Vec<Vec<u8>>,
-    /// SAN URIs.
-    pub san_uris: Vec<String>,
-    /// SAN DNS names.
-    pub san_dns: Vec<String>,
-    /// SAN criticality.
-    pub san_critical: bool,
-    /// Whether to include subject and authority key identifiers.
-    pub key_ids: bool,
-    /// Further extensions: OID content octets, criticality, value.
-    pub extra: Vec<(Vec<u8>, bool, Vec<u8>)>,
 }
 
 /// Seconds since the Unix epoch now.
@@ -118,103 +82,6 @@ pub fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")
         .as_secs() as i64
-}
-
-fn random_serial() -> Vec<u8> {
-    let mut s = [0u8; 16];
-    rustls::crypto::aws_lc_rs::default_provider()
-        .secure_random
-        .fill(&mut s)
-        .expect("CSPRNG");
-    s[0] &= 0x7f;
-    s[0] |= 0x40;
-    s.to_vec()
-}
-
-impl CertSpec {
-    /// A CA certificate valid for ten years.
-    pub fn ca(cn: &str) -> CertSpec {
-        let now = unix_now();
-        CertSpec {
-            serial: random_serial(),
-            subject_cn: Some(cn.into()),
-            not_before: now - 3600,
-            not_after: now + 10 * 365 * 86_400,
-            ca: Some(true),
-            key_usage: Some((0x06, true)),
-            eku: Vec::new(),
-            san_uris: Vec::new(),
-            san_dns: Vec::new(),
-            san_critical: false,
-            key_ids: true,
-            extra: Vec::new(),
-        }
-    }
-
-    /// A leaf with the given lifetime starting now (backdated a minute).
-    pub fn leaf(lifetime_secs: i64) -> CertSpec {
-        let now = unix_now();
-        CertSpec {
-            serial: random_serial(),
-            subject_cn: None,
-            not_before: now - 60,
-            not_after: now - 60 + lifetime_secs,
-            ca: Some(false),
-            key_usage: Some((0x80, true)),
-            eku: Vec::new(),
-            san_uris: Vec::new(),
-            san_dns: Vec::new(),
-            san_critical: true,
-            key_ids: true,
-            extra: Vec::new(),
-        }
-    }
-}
-
-fn name(cn: Option<&str>) -> Vec<u8> {
-    match cn {
-        None => der::sequence(&[]),
-        Some(cn) => {
-            let atv = der::sequence(&[
-                &der::oid(COMMON_NAME),
-                &der::tlv(tag::UTF8_STRING, cn.as_bytes()),
-            ]);
-            der::sequence(&[&der::tlv(tag::SET, &atv)])
-        }
-    }
-}
-
-fn time(secs: i64) -> Vec<u8> {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    // Civil date from days since the epoch (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    let (h, mi, s) = (rem / 3600, rem % 3600 / 60, rem % 60);
-    if (1950..2050).contains(&y) {
-        let v = format!("{:02}{m:02}{d:02}{h:02}{mi:02}{s:02}Z", y % 100);
-        der::tlv(tag::UTC_TIME, v.as_bytes())
-    } else {
-        let v = format!("{y:04}{m:02}{d:02}{h:02}{mi:02}{s:02}Z");
-        der::tlv(tag::GENERALIZED_TIME, v.as_bytes())
-    }
-}
-
-fn extension(oid_value: &[u8], critical: bool, value: &[u8]) -> Vec<u8> {
-    let mut parts = vec![der::tlv(tag::OID, oid_value)];
-    if critical {
-        parts.push(der::boolean(true));
-    }
-    parts.push(der::tlv(tag::OCTET_STRING, value));
-    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    der::sequence(&refs)
 }
 
 /// An issuer: its key, subject name and key identifier.
@@ -235,91 +102,17 @@ pub fn issue(spec: &CertSpec, subject_key: &KeyPair, issuer: Option<&Issuer<'_>>
     issue_for(spec, &subject_key.spki(), issuer.unwrap_or(&own))
 }
 
-/// The key identifier of a SubjectPublicKeyInfo: the first 20 bytes of
-/// the SHA-256 of its public key bits.
-fn spki_key_id(spki: &[u8]) -> Vec<u8> {
-    let mut outer = warren_core::der::Reader::new(spki);
-    let mut seq = warren_core::der::Reader::new(outer.read(tag::SEQUENCE).expect("SPKI"));
-    seq.read(tag::SEQUENCE).expect("algorithm");
-    let bits = seq.read(tag::BIT_STRING).expect("key bits");
-    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &bits[1..]).as_ref()[..20].to_vec()
-}
-
 /// Builds and signs a certificate for a public key (from a certificate
 /// request, say) whose private key this process never sees.
 pub fn issue_for(spec: &CertSpec, subject_spki: &[u8], issuer: &Issuer<'_>) -> Vec<u8> {
-    let subject = name(spec.subject_cn.as_deref());
-    let (issuer_key, issuer_name) = (issuer.key, issuer.name.clone());
-    let mut exts = Vec::new();
-    if let Some(ca) = spec.ca {
-        let bc = if ca {
-            der::sequence(&[&der::boolean(true)])
-        } else {
-            der::sequence(&[])
-        };
-        exts.push(extension(oid::BASIC_CONSTRAINTS, true, &bc));
-    }
-    if let Some((bits, critical)) = spec.key_usage {
-        let unused = bits.trailing_zeros().min(7) as u8;
-        exts.push(extension(
-            oid::KEY_USAGE,
-            critical,
-            &der::tlv(tag::BIT_STRING, &[unused, bits]),
-        ));
-    }
-    if !spec.eku.is_empty() {
-        let oids: Vec<Vec<u8>> = spec.eku.iter().map(|o| der::tlv(tag::OID, o)).collect();
-        let refs: Vec<&[u8]> = oids.iter().map(Vec::as_slice).collect();
-        exts.push(extension(oid::EXT_KEY_USAGE, false, &der::sequence(&refs)));
-    }
-    if !spec.san_uris.is_empty() || !spec.san_dns.is_empty() {
-        let mut names: Vec<Vec<u8>> = spec
-            .san_uris
-            .iter()
-            .map(|u| der::tlv(tag::context_primitive(6), u.as_bytes()))
-            .collect();
-        names.extend(
-            spec.san_dns
-                .iter()
-                .map(|d| der::tlv(tag::context_primitive(2), d.as_bytes())),
-        );
-        let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
-        exts.push(extension(
-            oid::SAN,
-            spec.san_critical,
-            &der::sequence(&refs),
-        ));
-    }
-    if spec.key_ids {
-        exts.push(extension(
-            oid::SKI,
-            false,
-            &der::tlv(tag::OCTET_STRING, &spki_key_id(subject_spki)),
-        ));
-        let aki = der::sequence(&[&der::tlv(tag::context_primitive(0), &issuer_key.key_id())]);
-        exts.push(extension(oid::AKI, false, &aki));
-    }
-    for (o, critical, value) in &spec.extra {
-        exts.push(extension(o, *critical, value));
-    }
-    let ext_refs: Vec<&[u8]> = exts.iter().map(Vec::as_slice).collect();
-    let sig_alg = der::sequence(&[&der::oid(ECDSA_WITH_SHA256)]);
-    let version = der::tlv(tag::context(0), &der::uint(tag::INTEGER, 2));
-    let validity = der::sequence(&[&time(spec.not_before), &time(spec.not_after)]);
-    let extensions = der::tlv(tag::context(3), &der::sequence(&ext_refs));
-    let tbs = der::sequence(&[
-        &version,
-        &der::tlv(tag::INTEGER, &spec.serial),
-        &sig_alg,
-        &issuer_name,
-        &validity,
-        &subject,
+    cert::issue(
+        spec,
         subject_spki,
-        &extensions,
-    ]);
-    let mut sig = vec![0u8];
-    sig.extend_from_slice(&issuer_key.sign(&tbs));
-    der::sequence(&[&tbs, &sig_alg, &der::tlv(tag::BIT_STRING, &sig)])
+        &issuer.name,
+        &issuer.key.key_id(),
+        |tbs| Ok::<_, std::convert::Infallible>(issuer.key.sign(tbs)),
+    )
+    .unwrap_or_else(|e| match e {})
 }
 
 /// A CA: key, certificate and subject name.

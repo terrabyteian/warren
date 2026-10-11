@@ -11,17 +11,19 @@ use std::time::{Duration, Instant};
 
 use http::{Method, StatusCode};
 use serde_json::{Value, json};
-use support::{IdpUser, RunningIdp, StubNode, TempDir, TestClient, free_port, write};
+use support::{IdpUser, RunningIdp, StubNode, TempDir, TestClient, free_port, pem_certs, write};
 use tokio::sync::mpsc;
 use warren_control::config::Config;
 use warren_control::{ControlPlane, admin_request, audit};
+use warren_core::cert;
+use warren_core::clock;
 use warren_core::events::{EventBody, Line};
-use warren_core::identity::Principal;
+use warren_core::identity::{AUTH_TIME_UNKNOWN, NodeRole, TrustClass};
+use warren_core::join::{JoinToken, sha256_hex};
 use warren_core::keys::SigningKey;
 use warren_core::params::REVOCATION_DEADLINE;
+use warren_core::pki;
 use warren_core::policy_bundle::{Bundle, View};
-use warren_core::x509::{self, Certificate};
-use warren_core::{clock, jose};
 
 const GROUP: &str = r#"
 apiVersion: warren.dev/v1alpha1
@@ -161,25 +163,32 @@ impl Deployment {
             .collect()
     }
 
+    /// Mints a join token, as `warren admin join-token create` does.
+    async fn mint(
+        &self,
+        role: &str,
+        group: Option<&str>,
+        name: &str,
+        dns: &[&str],
+    ) -> (u16, Value) {
+        self.admin(
+            "POST",
+            "/v1/admin/join-tokens",
+            Some(json!({ "role": role, "group": group, "name": name, "dns_names": dns })),
+        )
+        .await
+    }
+
     async fn join(&self, role: &str, group: Option<&str>, name: &str, dns: &[&str]) -> StubNode {
-        let (status, body) = self
-            .admin(
-                "POST",
-                "/v1/admin/join-tokens",
-                Some(json!({ "role": role, "group": group })),
-            )
-            .await;
+        let (status, body) = self.mint(role, group, name, dns).await;
         assert_eq!(status, 201, "{body}");
         let token = body["token"].as_str().unwrap();
-        // The token pins the root CA.
-        let fingerprint = token.rsplit('.').next().unwrap();
-        let root = x509::pem_decode("CERTIFICATE", &self.bundle)
-            .unwrap()
-            .remove(0);
-        assert_eq!(fingerprint, jose::b64url(&warren_core::keys::sha256(&root)));
-        StubNode::join(&self.base, token, name, dns, &self.bundle)
-            .await
-            .unwrap()
+        // The token pins the root CA and names where nodes join.
+        let parsed = JoinToken::parse(token, clock::now_secs().unsigned_abs()).unwrap();
+        let root = pem_certs(&self.bundle).remove(0);
+        assert_eq!(parsed.root, sha256_hex(&root));
+        assert_eq!(format!("https://{}", parsed.cp), self.base);
+        StubNode::join(&self.base, token).await.unwrap()
     }
 }
 
@@ -310,16 +319,30 @@ async fn sign_in_enroll_certify_and_revoke() {
     let asked = clock::now_secs();
     let issued = client.certificate().await.unwrap();
     let answered = clock::now_secs();
-    let chain = x509::pem_decode("CERTIFICATE", &issued.certificate_chain).unwrap();
+    let chain = pem_certs(&issued.certificate_chain);
     assert_eq!(chain.len(), 2);
-    let cert = Certificate::parse(&chain[0]).unwrap();
     let app = d.cp.app();
-    cert.verify_signature(app.authority.client.public_key())
-        .unwrap();
     assert_eq!(chain[1], app.authority.client.der);
-    assert!(cert.client_auth && !cert.server_auth && !cert.is_ca && cert.san_critical);
-    assert_eq!(cert.subject, x509::EMPTY_NAME);
-    assert_eq!(cert.public_key, *client.key.public_key());
+    // It chains to the root through the client CA only, and passes the
+    // profile connectors check (empty subject, critical SAN, clientAuth
+    // only, the identity extension).
+    let leaf = rustls::pki_types::CertificateDer::from(chain[0].clone());
+    let at = pki::unix_time(std::time::SystemTime::now());
+    let bundle = &app.authority.bundle;
+    bundle
+        .verify_chain(&leaf, pki::Issuer::Client, false, at)
+        .unwrap();
+    assert!(
+        bundle
+            .verify_chain(&leaf, pki::Issuer::Infrastructure, false, at)
+            .is_err()
+    );
+    let profile = pki::check_client_profile(&chain[0], "example.test").unwrap();
+    assert_eq!(
+        profile.spki,
+        cert::p256_spki(client.key.public_key().point())
+    );
+    let cert = pki::parse_cert(&chain[0]).unwrap();
     assert!(cert.not_after - cert.not_before <= 4 * 3600 + 120);
     assert!(cert.not_after - clock::now_secs() <= 4 * 3600);
     // Half-life counts from issuance, not from the backdated notBefore.
@@ -331,45 +354,14 @@ async fn sign_in_enroll_certify_and_revoke() {
         issued.renew_at,
         cert.not_after
     );
-    assert!(cert.serial.len() >= 8);
     let user_id = session.user.id.clone();
-    assert_eq!(
-        cert.uris,
-        [
-            Principal::User(user_id.clone()).to_uri("example.test"),
-            Principal::Device(device_id.clone()).to_uri("example.test"),
-        ]
-    );
-    let identity = cert.identity.clone().unwrap();
+    assert_eq!((&profile.user, &profile.device), (&user_id, &device_id));
+    let identity = &profile.identity;
     assert_eq!(identity.session_id, session.session_id);
     assert!(identity.mfa);
-    assert_eq!(identity.auth_time, session.auth_time);
-    assert_eq!(identity.trust_class, 1);
+    assert_eq!(identity.auth_time, session.auth_time as u64);
+    assert_eq!(identity.trust_class, TrustClass::DeviceReported);
     assert_eq!(identity.tunnel_v4.to_string(), "100.96.0.1");
-
-    // rustls accepts it against the client CA and not the infrastructure CA.
-    let verifier = |anchor: &[u8]| {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(anchor.to_vec().into()).unwrap();
-        rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(roots),
-            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
-        )
-        .build()
-        .unwrap()
-    };
-    let now = rustls::pki_types::UnixTime::now();
-    let leaf = rustls::pki_types::CertificateDer::from(chain[0].clone());
-    assert!(
-        verifier(&app.authority.client.der)
-            .verify_client_cert(&leaf, &[], now)
-            .is_ok()
-    );
-    assert!(
-        verifier(&app.authority.infra.der)
-            .verify_client_cert(&leaf, &[], now)
-            .is_err()
-    );
 
     // Entitlements name only what Ada may reach.
     let ent = client.entitlements().await;
@@ -390,66 +382,47 @@ async fn sign_in_enroll_certify_and_revoke() {
     }
 
     // No node may be issued the control plane's own name.
-    let (_, token) = d
-        .admin(
-            "POST",
-            "/v1/admin/join-tokens",
-            Some(json!({ "role": "relay" })),
-        )
-        .await;
-    let refused = StubNode::join(
-        &d.base,
-        token["token"].as_str().unwrap(),
-        "impostor",
-        &["localhost"],
-        &d.bundle,
-    )
-    .await
-    .err()
-    .unwrap();
-    assert_eq!(refused.status, StatusCode::CONFLICT);
+    let (status, refused) = d.mint("relay", None, "impostor", &["localhost"]).await;
+    assert_eq!(
+        (status, refused["reason"].clone()),
+        (409, json!("name_reserved"))
+    );
 
     // A relay and a connector join; each token works once.
     let relay = d
         .join("relay", None, "relay-1", &["relay1.example.test"])
         .await;
     let connector = d.join("connector", Some("homelab"), "lab-1", &[]).await;
-    assert_eq!(connector.joined.group.as_deref(), Some("homelab"));
-    let node_cert = Certificate::parse(
-        &x509::pem_decode(
-            "CERTIFICATE",
-            &connector.joined.certificate.certificate_chain,
-        )
-        .unwrap()[0],
-    )
-    .unwrap();
-    node_cert
-        .verify_signature(app.authority.infra.public_key())
-        .unwrap();
-    assert!(node_cert.server_auth && node_cert.client_auth);
     assert_eq!(
-        node_cert.uris,
-        [format!(
-            "warren://example.test/connector/homelab/{}",
-            connector.joined.node_id
-        )]
+        connector.role,
+        NodeRole::Connector {
+            group: "homelab".into()
+        }
     );
-    let (_, token) = d
-        .admin(
-            "POST",
-            "/v1/admin/join-tokens",
-            Some(json!({ "role": "connector", "group": "homelab" })),
-        )
-        .await;
+    // The chain verifies as main's nodes verify it: through the
+    // infrastructure CA, for both TLS roles, in the infrastructure profile.
+    let node_leaf = rustls::pki_types::CertificateDer::from(connector.chain[0].clone());
+    let at = pki::unix_time(std::time::SystemTime::now());
+    for server_use in [false, true] {
+        connector
+            .trust
+            .verify_chain(&node_leaf, pki::Issuer::Infrastructure, server_use, at)
+            .unwrap();
+    }
+    let node_uri = format!("warren://example.test/connector/homelab/{}", connector.id);
+    assert_eq!(
+        pki::parse_cert(&connector.chain[0])
+            .unwrap()
+            .subject_alt_names()
+            .unwrap()
+            .uris,
+        std::slice::from_ref(&node_uri)
+    );
+    let (_, token) = d.mint("connector", Some("homelab"), "lab-2", &[]).await;
     let token = token["token"].as_str().unwrap();
-    StubNode::join(&d.base, token, "lab-2", &[], &d.bundle)
-        .await
-        .unwrap();
-    let reused = StubNode::join(&d.base, token, "lab-3", &[], &d.bundle)
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(reused.status, StatusCode::UNAUTHORIZED);
+    StubNode::join(&d.base, token).await.unwrap();
+    let reused = StubNode::join(&d.base, token).await.err().unwrap();
+    assert!(reused.contains("(401)"), "{reused}");
     // Entitlements now list the relay.
     let ent = client.entitlements().await;
     assert_eq!(ent.relays.len(), 1);
@@ -462,7 +435,7 @@ async fn sign_in_enroll_certify_and_revoke() {
     );
 
     // Bundles verify with the policy key from the join, per view.
-    let policy_key = connector.joined.policy_key.to_key().unwrap();
+    let policy_key = connector.policy_key.to_key().unwrap();
     let reply = connector.get("/v1/node/bundle").await;
     assert_eq!(reply.status, StatusCode::OK);
     let jws = String::from_utf8(reply.body.to_vec()).unwrap();
@@ -668,7 +641,7 @@ async fn sign_in_enroll_certify_and_revoke() {
     relay_events.recv().await.unwrap();
     d.admin(
         "POST",
-        &format!("/v1/admin/nodes/{}/revoke", relay.joined.node_id),
+        &format!("/v1/admin/nodes/{}/revoke", relay.id),
         None,
     )
     .await;
@@ -699,7 +672,7 @@ async fn sign_in_enroll_certify_and_revoke() {
         refused["unmapped"]["certificate_uris"][0]
             .as_str()
             .unwrap()
-            .contains(&relay.joined.node_id)
+            .contains(&relay.id)
     );
 
     // A node resuming from a retained sequence number gets what it missed.
@@ -709,23 +682,23 @@ async fn sign_in_enroll_certify_and_revoke() {
 
     // The revoked relay's certificate is in the revocation state by serial,
     // and reusing its name does not drop the node's revocation.
-    let relay_serial = relay.joined.certificate.serial.clone();
+    let relay_serial = relay.serial.clone();
     let after_revoke = wait_for_bundle(&connector, &policy_key, changed.version, |b| {
         b.revocations
             .certificates
             .iter()
             .any(|c| c.serial == relay_serial)
-            && b.revocations.nodes.contains(&relay.joined.node_id)
+            && b.revocations.nodes.contains(&relay.id)
     })
     .await;
     let reused = d
         .join("relay", None, "relay-1", &["relay1.example.test"])
         .await;
     let kept = wait_for_bundle(&connector, &policy_key, after_revoke.version, |b| {
-        b.nodes.iter().any(|n| n.id == reused.joined.node_id)
+        b.nodes.iter().any(|n| n.id == reused.id)
     })
     .await;
-    assert!(kept.revocations.nodes.contains(&relay.joined.node_id));
+    assert!(kept.revocations.nodes.contains(&relay.id));
 
     // Revoking a node's certificate by serial closes that node's stream.
     let lab4 = d.join("connector", Some("homelab"), "lab-4", &[]).await;
@@ -733,10 +706,7 @@ async fn sign_in_enroll_certify_and_revoke() {
     lab4_events.recv().await.unwrap();
     d.admin(
         "POST",
-        &format!(
-            "/v1/admin/certificates/{}/revoke",
-            lab4.joined.certificate.serial
-        ),
+        &format!("/v1/admin/certificates/{}/revoke", lab4.serial),
         None,
     )
     .await;
@@ -782,7 +752,7 @@ async fn sign_in_enroll_certify_and_revoke() {
         .iter()
         .find(|r| r["message"] == "flow allowed")
         .unwrap();
-    assert_eq!(decision["metadata"]["log_provider"], node_cert.uris[0]);
+    assert_eq!(decision["metadata"]["log_provider"], node_uri);
     // The control plane audited its own decisions too.
     for message in [
         "signed in at the IdP",
@@ -959,12 +929,14 @@ async fn sign_in_asks_for_and_records_freshness() {
     *d.idp.idp.omit_auth_time.lock().unwrap() = true;
     let mut unsure = d.client();
     let session = unsure.sign_in().await;
-    assert_eq!(session.auth_time, x509::AUTH_TIME_UNKNOWN);
+    assert_eq!(session.auth_time, AUTH_TIME_UNKNOWN as i64);
     unsure.enroll().await;
     let issued = unsure.certificate().await.unwrap();
-    let chain = x509::pem_decode("CERTIFICATE", &issued.certificate_chain).unwrap();
-    let identity = Certificate::parse(&chain[0]).unwrap().identity.unwrap();
-    assert_eq!(identity.auth_time, x509::AUTH_TIME_UNKNOWN);
+    let chain = pem_certs(&issued.certificate_chain);
+    let identity = pki::check_client_profile(&chain[0], "example.test")
+        .unwrap()
+        .identity;
+    assert_eq!(identity.auth_time, AUTH_TIME_UNKNOWN);
     d.cp.shutdown().await;
 }
 

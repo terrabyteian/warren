@@ -15,18 +15,22 @@ use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use rustls::pki_types::PrivateKeyDer;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use warren_control::web::{self, Body, Client, Handler, Peer, Reply};
 use warren_core::api::{
-    CertificateRequest, CertificateResponse, DeviceInfo, EnrollRequest, Entitlements, JoinRequest,
-    JoinResponse, Platform, SESSION_REQUEST_TYP, Session, SessionRequest,
+    CertificateRequest, CertificateResponse, DeviceInfo, EnrollRequest, Entitlements, Platform,
+    SESSION_REQUEST_TYP, Session, SessionRequest,
 };
+use warren_core::cert::{self, CertSpec};
 use warren_core::clock;
 use warren_core::events::{Ack, AckRequest, Line};
+use warren_core::identity::NodeRole;
+use warren_core::join::{self, JoinToken, NodeKey};
 use warren_core::jose::{self, Header, Jwk, b64url};
 use warren_core::keys::{SigningKey, hex, random_bytes, sha256};
-use warren_core::x509::{self, CertificateSpec, EMPTY_NAME, IssuerInfo, Usage};
+use warren_core::pki::{TrustBundle, oid};
 
 /// A directory removed when dropped.
 pub struct TempDir(pub PathBuf);
@@ -61,6 +65,58 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// A throwaway CA for test servers and clients.
+pub struct TestCa {
+    key: SigningKey,
+    /// The CA certificate, DER.
+    pub der: Vec<u8>,
+    name: Vec<u8>,
+    key_id: Vec<u8>,
+}
+
+impl TestCa {
+    pub fn new(cn: &str) -> TestCa {
+        let key = SigningKey::generate().unwrap();
+        let spki = cert::p256_spki(key.public_key().point());
+        let name = cert::name(Some(cn));
+        let key_id = cert::spki_key_id(&spki).unwrap();
+        let der = cert::issue(&CertSpec::ca(cn), &spki, &name, &key_id, |tbs| {
+            key.sign_der(tbs)
+        })
+        .unwrap();
+        TestCa {
+            key,
+            der,
+            name,
+            key_id,
+        }
+    }
+
+    /// A day-long leaf for `key` with these names and extended key usages.
+    pub fn leaf(&self, key: &SigningKey, dns: &[&str], uris: &[&str], eku: &[&[u8]]) -> Vec<u8> {
+        let mut spec = CertSpec::leaf(86_400);
+        spec.san_dns = dns.iter().map(|d| (*d).to_owned()).collect();
+        spec.san_uris = uris.iter().map(|u| (*u).to_owned()).collect();
+        spec.eku = eku.iter().map(|o| o.to_vec()).collect();
+        cert::issue(
+            &spec,
+            &cert::p256_spki(key.public_key().point()),
+            &self.name,
+            &self.key_id,
+            |tbs| self.key.sign_der(tbs),
+        )
+        .unwrap()
+    }
+}
+
+/// Every certificate in PEM text, DER.
+pub fn pem_certs(text: &str) -> Vec<Vec<u8>> {
+    use rustls::pki_types::pem::PemObject;
+    rustls::pki_types::CertificateDer::pem_slice_iter(text.as_bytes())
+        .map(|c| c.unwrap().to_vec())
+        .collect()
+}
+
 /// A CA and a TLS server certificate for `localhost`, for the test IdP.
 pub struct TestPki {
     pub ca_pem: String,
@@ -70,54 +126,12 @@ pub struct TestPki {
 
 impl TestPki {
     pub fn new() -> TestPki {
-        let ca_key = SigningKey::generate().unwrap();
-        let name = x509::common_name("test IdP CA");
-        let now = clock::now_secs();
-        let ca = x509::build_certificate(
-            &CertificateSpec {
-                serial: [1; 16],
-                not_before: now - 60,
-                not_after: now + 86_400,
-                subject: name.clone(),
-                public_key: ca_key.public_key(),
-                usage: Usage::Ca { path_len: 0 },
-                uris: vec![],
-                dns_names: vec![],
-                identity: None,
-            },
-            &IssuerInfo {
-                name: name.clone(),
-                key_id: ca_key.public_key().key_id(),
-            },
-            |tbs| ca_key.sign_der(tbs),
-        )
-        .unwrap();
+        let ca = TestCa::new("test IdP CA");
         let key = SigningKey::generate().unwrap();
-        let leaf = x509::build_certificate(
-            &CertificateSpec {
-                serial: [2; 16],
-                not_before: now - 60,
-                not_after: now + 86_400,
-                subject: EMPTY_NAME.to_vec(),
-                public_key: key.public_key(),
-                usage: Usage::Leaf {
-                    server_auth: true,
-                    client_auth: false,
-                },
-                uris: vec![],
-                dns_names: vec!["localhost".into()],
-                identity: None,
-            },
-            &IssuerInfo {
-                name,
-                key_id: ca_key.public_key().key_id(),
-            },
-            |tbs| ca_key.sign_der(tbs),
-        )
-        .unwrap();
+        let leaf = ca.leaf(&key, &["localhost"], &[], &[oid::SERVER_AUTH]);
         TestPki {
-            ca_pem: x509::pem_encode("CERTIFICATE", &ca),
-            chain: vec![leaf, ca],
+            ca_pem: warren_core::base64::pem("CERTIFICATE", &ca.der),
+            chain: vec![leaf, ca.der],
             key_pkcs8: key.to_pkcs8().unwrap().to_vec(),
         }
     }
@@ -500,8 +514,8 @@ impl TestClient {
     }
 
     pub fn csr(&self) -> String {
-        STANDARD
-            .encode(x509::build_csr(self.key.public_key(), |info| self.key.sign_der(info)).unwrap())
+        let spki = cert::p256_spki(self.key.public_key().point());
+        STANDARD.encode(join::certificate_request(&spki, |info| self.key.sign_der(info)).unwrap())
     }
 
     pub async fn enroll(&self) -> (StatusCode, Value) {
@@ -559,51 +573,62 @@ pub struct Received {
 /// A stub relay or connector.
 pub struct StubNode {
     pub base: String,
-    pub key: SigningKey,
-    pub joined: JoinResponse,
+    /// The node ID the control plane assigned.
+    pub id: String,
+    /// Its certificate's serial, hex.
+    pub serial: String,
+    /// The role its certificate names.
+    pub role: NodeRole,
+    /// Its certificate chain, leaf first, DER.
+    pub chain: Vec<Vec<u8>>,
+    /// The trust bundle the join returned.
+    pub trust: TrustBundle,
+    /// The policy-signing key, fetched on link E after joining.
+    pub policy_key: Jwk,
     pub http: Client,
 }
 
 impl StubNode {
-    pub async fn join(
-        base: &str,
-        token: &str,
-        name: &str,
-        dns_names: &[&str],
-        trust_bundle: &str,
-    ) -> Result<StubNode, Box<Reply>> {
-        let key = SigningKey::generate().unwrap();
-        let plain = Client::new(Client::roots_from_pem(trust_bundle).unwrap(), None).unwrap();
-        let csr = STANDARD.encode(x509::build_csr(key.public_key(), |i| key.sign_der(i)).unwrap());
-        let body = JoinRequest {
-            token: token.into(),
-            csr,
-            name: name.into(),
-            dns_names: dns_names.iter().map(|s| (*s).to_owned()).collect(),
+    /// Joins with `token` the way `warren relay` and `warren connector` do,
+    /// through warren-masque's node side of the exchange, then talks link E
+    /// at `base`.
+    pub async fn join(base: &str, token: &str) -> Result<StubNode, String> {
+        let token =
+            JoinToken::parse(token, clock::now_secs().unsigned_abs()).map_err(|e| e.to_string())?;
+        let key = NodeKey::generate().unwrap();
+        let joined = warren_masque::join::join(&token, &key)
+            .await
+            .map_err(|e| e.to_string())?;
+        let PrivateKeyDer::Pkcs8(pkcs8) = key.private_key() else {
+            unreachable!("node keys are PKCS#8")
         };
-        let reply = plain
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(joined.trust.root.clone()).unwrap();
+        let chain: Vec<Vec<u8>> = joined
+            .credentials
+            .chain
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        let http = Client::new(roots, Some((chain.clone(), pkcs8.secret_pkcs8_der()))).unwrap();
+        let reply = http
             .request(
-                Method::POST,
-                &format!("{base}/v1/join"),
-                &[("content-type", "application/json")],
-                Some(Bytes::from(serde_json::to_vec(&body).unwrap())),
+                Method::GET,
+                &format!("{base}/v1/node/policy-key"),
+                &[],
+                None,
             )
             .await
             .unwrap();
-        if reply.status != StatusCode::OK {
-            return Err(Box::new(reply));
-        }
-        let joined: JoinResponse = reply.json().unwrap();
-        let chain = x509::pem_decode("CERTIFICATE", &joined.certificate.certificate_chain).unwrap();
-        let http = Client::new(
-            Client::roots_from_pem(&joined.trust_bundle).unwrap(),
-            Some((chain, &key.to_pkcs8().unwrap())),
-        )
-        .unwrap();
+        assert_eq!(reply.status, StatusCode::OK);
         Ok(StubNode {
             base: base.into(),
-            key,
-            joined,
+            id: joined.identity.id,
+            serial: joined.identity.serial,
+            role: joined.identity.role,
+            chain,
+            trust: joined.trust,
+            policy_key: reply.json().unwrap(),
             http,
         })
     }

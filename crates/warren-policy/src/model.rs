@@ -6,7 +6,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
 
-use warren_core::identity::is_valid_name;
+use warren_core::identity::valid_id;
 use warren_core::policy_bundle::PortRange;
 
 use crate::names::{Cidr, DomainPattern};
@@ -527,7 +527,7 @@ impl Ctx<'_> {
 
     fn name(&mut self, node: &Node, what: &str) -> Option<String> {
         let s = self.string(node, what)?;
-        if is_valid_name(&s) {
+        if valid_id(&s) {
             Some(s)
         } else {
             self.error(
@@ -1301,7 +1301,7 @@ fn parse_what(ctx: &mut Ctx<'_>, node: &Node) -> Option<What> {
     };
     if let Some(a) = f.get("apps") {
         for (name, line) in ctx.strings(a, "apps") {
-            if is_valid_name(&name) {
+            if valid_id(&name) {
                 what.apps.push(name);
             } else {
                 ctx.error(line, format!("{name:?} is not a valid app name"));

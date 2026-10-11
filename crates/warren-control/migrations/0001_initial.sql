@@ -131,8 +131,11 @@ CREATE INDEX nodes_role_name ON nodes (role, name);
 
 CREATE TABLE join_tokens (
     token_hash      TEXT PRIMARY KEY,
+    token_id        TEXT NOT NULL UNIQUE,
     role            TEXT NOT NULL,
     connector_group TEXT,
+    name            TEXT NOT NULL,
+    dns_names_json  TEXT NOT NULL,
     created_at      BIGINT NOT NULL,
     expires_at      BIGINT NOT NULL,
     used_at         BIGINT,

@@ -15,9 +15,8 @@ use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use warren_core::clock;
-use warren_core::identity::{Role, is_valid_name};
-use warren_core::jose::b64url;
-use warren_core::keys::sha256;
+use warren_core::identity::valid_id;
+use warren_core::join::{JoinToken, sha256_hex};
 use warren_core::params::{JOIN_TOKEN_LIFETIME, REVOCATION_DEADLINE};
 
 use crate::Error;
@@ -94,10 +93,14 @@ struct SessionView {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JoinTokenRequest {
     role: String,
     #[serde(default)]
     group: Option<String>,
+    name: String,
+    #[serde(default)]
+    dns_names: Vec<String>,
 }
 
 fn changed(what: &str, id: &str, changed: bool) -> Response<Body> {
@@ -331,43 +334,61 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
         }
         (Method::POST, ["v1", "admin", "join-tokens"]) => {
             let body: JoinTokenRequest = read_json(req).await?;
-            let role = Role::parse(&body.role)
-                .filter(|r| *r != Role::ControlPlane)
-                .ok_or_else(|| ApiError::bad_request("role must be relay or connector"))?;
-            match (role, &body.group) {
-                (Role::Connector, Some(g)) => {
+            match (body.role.as_str(), &body.group) {
+                ("connector", Some(g)) => {
                     let known = app
                         .compiled()
                         .is_some_and(|c| c.groups.iter().any(|x| &x.name == g));
-                    if !is_valid_name(g) || !known {
+                    if !valid_id(g) || !known {
                         return Err(ApiError::bad_request(format!(
                             "connector group {g} is not defined in policy"
                         )));
                     }
+                    if !body.dns_names.is_empty() {
+                        return Err(ApiError::bad_request(
+                            "connectors listen on no DNS names; only relay join tokens take them",
+                        ));
+                    }
                 }
-                (Role::Connector, None) => {
+                ("connector", None) => {
                     return Err(ApiError::bad_request(
                         "a connector join token needs a group",
                     ));
                 }
-                (_, Some(_)) => {
+                ("relay", None) => crate::api::check_relay_names(app, &body.dns_names)?,
+                ("relay", Some(_)) => {
                     return Err(ApiError::bad_request(
                         "only connector join tokens name a group",
                     ));
                 }
-                _ => {}
+                _ => return Err(ApiError::bad_request("role must be relay or connector")),
             }
+            if !valid_id(&body.name) {
+                return Err(ApiError::bad_request(
+                    "name must be 1 to 63 lowercase letters, digits and '-'",
+                ));
+            }
+            let id = crate::store::new_id("jt")?;
             let secret = new_secret()?;
-            let fingerprint = b64url(&sha256(&app.authority.root.der));
-            let token = format!("wj1.{secret}.{fingerprint}");
-            let expires_at = clock::now_secs() + JOIN_TOKEN_LIFETIME.as_secs() as i64;
+            let exp = clock::now_secs() + JOIN_TOKEN_LIFETIME.as_secs() as i64;
+            let internal = app.config.internal_url();
+            let authority = internal.strip_prefix("https://").unwrap_or(&internal);
+            let token = JoinToken {
+                td: app.config.trust_domain.clone(),
+                cp: if authority.contains(':') {
+                    authority.to_owned()
+                } else {
+                    format!("{authority}:443")
+                },
+                role: body.role.clone(),
+                group: body.group.clone(),
+                root: sha256_hex(&app.authority.root.der),
+                id: id.clone(),
+                secret: secret.clone(),
+                exp: exp.unsigned_abs(),
+            };
             app.store
-                .insert_join_token(
-                    &secret_hash(&secret),
-                    role.as_str(),
-                    body.group.as_deref(),
-                    expires_at,
-                )
+                .insert_join_token(&secret_hash(&secret), &token, &body.name, &body.dns_names)
                 .await?;
             let mut r = audit::record(
                 Activity::Create,
@@ -375,23 +396,22 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
                 &Actor::LocalAdmin,
                 "join token created",
             );
-            r.insert(
-                "entity".into(),
-                audit::entity("join-token", &secret_hash(&secret)[..16]),
-            );
+            r.insert("entity".into(), audit::entity("join-token", &id));
             r.insert(
                 "unmapped".into(),
-                json!({ "role": role.as_str(), "group": body.group, "expires_at": expires_at }),
+                json!({ "role": body.role, "group": body.group, "name": body.name, "dns_names": body.dns_names, "expires_at": exp }),
             );
             app.audit(r);
             Ok(json(
                 StatusCode::CREATED,
                 &json!({
-                    "token": token,
-                    "role": role.as_str(),
+                    "token": token.encode(),
+                    "role": body.role,
                     "group": body.group,
-                    "expires_at": expires_at,
-                    "control_plane": app.config.internal_url(),
+                    "name": body.name,
+                    "dns_names": body.dns_names,
+                    "expires_at": exp,
+                    "control_plane": internal,
                 }),
             ))
         }

@@ -1256,11 +1256,6 @@ version = "0.6.4"
 criteria = "safe-to-deploy"
 notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
 
-[[exemptions.yasna]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
-
 [[exemptions.yoke]]
 version = "0.8.3"
 criteria = "safe-to-deploy"

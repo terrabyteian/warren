@@ -4,17 +4,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use http::StatusCode;
 use serde_json::json;
 use tokio::sync::{Mutex, Notify, watch};
 use warren_core::clock;
 use warren_core::events::Event;
-use warren_core::identity::{Principal, Role};
+use warren_core::identity::NodeRole;
 use warren_core::jose::{Jwk, b64url};
 use warren_core::keys::{hex, sha256};
+use warren_core::pki::{self, NodeIdentity};
 use warren_core::policy_bundle::{self, BUNDLE_FORMAT, Bundle, View};
-use warren_core::x509::Certificate;
 use warren_policy::compile::{self, Compiled, UserEntity};
 use warren_policy::model;
 
@@ -431,14 +432,14 @@ impl App {
     /// `peer`: issued by the infrastructure CA, naming a node of this
     /// deployment that is still enabled, and not itself revoked. Refusals
     /// are audited with the identity the certificate claimed.
-    pub async fn node(&self, peer: &Peer) -> Result<(Node, Certificate), ApiError> {
+    pub async fn node(&self, peer: &Peer) -> Result<(Node, NodeIdentity), ApiError> {
         let result = self.check_node(peer).await;
         if let Err(e) = &result {
-            let claimed = peer
-                .certificates
-                .first()
-                .and_then(|der| Certificate::parse(der).ok())
-                .map(|c| (c.serial_hex(), c.uris));
+            let claimed = peer.certificates.first().and_then(|der| {
+                let c = pki::parse_cert(der).ok()?;
+                let serial = hex(c.serial.strip_prefix(&[0]).unwrap_or(c.serial));
+                Some((serial, c.subject_alt_names().ok()?.uris))
+            });
             let mut r = audit::record(
                 Activity::Logon,
                 false,
@@ -459,49 +460,40 @@ impl App {
         result
     }
 
-    async fn check_node(&self, peer: &Peer) -> Result<(Node, Certificate), ApiError> {
+    async fn check_node(&self, peer: &Peer) -> Result<(Node, NodeIdentity), ApiError> {
         let denied =
             |why: &str| ApiError::new(StatusCode::FORBIDDEN, "node_not_allowed", why.to_owned());
         let leaf = peer.certificates.first().ok_or_else(|| {
             ApiError::unauthenticated("A relay or connector certificate is required.")
         })?;
-        let cert = Certificate::parse(leaf).map_err(|_| denied("unreadable certificate"))?;
-        if !self.authority.infra.issued(&cert) {
-            return Err(denied("not an infrastructure certificate"));
-        }
-        let now = clock::now_secs();
-        if now >= cert.not_after
-            || now + (self.config.clock_skew.as_secs() as i64) < cert.not_before
-        {
-            return Err(denied("the certificate is not valid now"));
-        }
-        let [uri] = cert.uris.as_slice() else {
-            return Err(denied("the certificate must name exactly one node"));
-        };
-        let (td, principal) = Principal::parse_uri(uri).map_err(|_| denied("unknown identity"))?;
-        if td != self.config.trust_domain {
-            return Err(denied("another deployment's certificate"));
-        }
-        let (role, group, id) = match principal {
-            Principal::Node {
-                role: Role::Relay,
-                id,
-            } => ("relay", None, id),
-            Principal::Connector { group, id } => ("connector", Some(group), id),
-            _ => return Err(denied("not a relay or connector")),
+        self.authority
+            .bundle
+            .verify_chain(
+                leaf,
+                pki::Issuer::Infrastructure,
+                false,
+                pki::unix_time(SystemTime::now()),
+            )
+            .map_err(|_| denied("not a valid infrastructure certificate"))?;
+        let identity = pki::check_infra_profile(leaf, &self.config.trust_domain)
+            .map_err(|_| denied("the certificate must name exactly one node of this deployment"))?;
+        let (role, group) = match &identity.role {
+            NodeRole::Relay => ("relay", None),
+            NodeRole::Connector { group } => ("connector", Some(group.clone())),
+            NodeRole::ControlPlane => return Err(denied("not a relay or connector")),
         };
         let node = self
             .store
-            .node(&id)
+            .node(&identity.id)
             .await?
             .ok_or_else(|| denied("unknown node"))?;
         if node.revoked_at.is_some() || node.role != role || node.group != group {
             return Err(denied("this node has been revoked"));
         }
-        if self.store.certificate_revoked(&cert.serial_hex()).await? {
+        if self.store.certificate_revoked(&identity.serial).await? {
             return Err(denied("this certificate has been revoked"));
         }
-        Ok((node, cert))
+        Ok((node, identity))
     }
 
     /// The user as policy sees them.

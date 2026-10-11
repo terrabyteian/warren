@@ -22,6 +22,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::RootCertStore;
+use rustls::pki_types::pem::{PemObject, SectionKind};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
@@ -399,21 +400,23 @@ impl ServerCert {
     /// (`PRIVATE KEY`, `EC PRIVATE KEY` or `RSA PRIVATE KEY`) that must
     /// match the leaf.
     pub fn set_operator(&self, chain_pem: &str, key_pem: &str) -> Result<(), Error> {
-        let pem = |e: warren_core::x509::X509Error| Error::Tls(e.to_string());
-        let chain = warren_core::x509::pem_decode("CERTIFICATE", chain_pem).map_err(pem)?;
+        let pem = |e: rustls::pki_types::pem::Error| Error::Tls(format!("PEM: {e}"));
+        let chain: Vec<Vec<u8>> = CertificateDer::pem_slice_iter(chain_pem.as_bytes())
+            .map(|c| c.map(|c| c.to_vec()))
+            .collect::<Result<_, _>>()
+            .map_err(pem)?;
         if chain.is_empty() {
             return Err(Error::Tls(
                 "no CERTIFICATE block in the certificate file".into(),
             ));
         }
         let mut keys = Vec::new();
-        for label in ["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"] {
-            for der in warren_core::x509::pem_decode(label, key_pem).map_err(pem)? {
-                keys.push(match label {
-                    "PRIVATE KEY" => PrivateKeyDer::Pkcs8(der.into()),
-                    "EC PRIVATE KEY" => PrivateKeyDer::Sec1(der.into()),
-                    _ => PrivateKeyDer::Pkcs1(der.into()),
-                });
+        for section in <(SectionKind, Vec<u8>)>::pem_slice_iter(key_pem.as_bytes()) {
+            match section.map_err(pem)? {
+                (SectionKind::PrivateKey, der) => keys.push(PrivateKeyDer::Pkcs8(der.into())),
+                (SectionKind::EcPrivateKey, der) => keys.push(PrivateKeyDer::Sec1(der.into())),
+                (SectionKind::RsaPrivateKey, der) => keys.push(PrivateKeyDer::Pkcs1(der.into())),
+                _ => {}
             }
         }
         let [key] = <[_; 1]>::try_from(keys).map_err(|_| {
@@ -933,15 +936,14 @@ impl Client {
     /// Roots from PEM text.
     pub fn roots_from_pem(pem: &str) -> Result<RootCertStore, Error> {
         let mut roots = RootCertStore::empty();
-        let certs = warren_core::x509::pem_decode("CERTIFICATE", pem)
-            .map_err(|e| Error::Tls(e.to_string()))?;
+        let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Tls(format!("PEM: {e}")))?;
         if certs.is_empty() {
             return Err(Error::Tls("no certificates in PEM".into()));
         }
         for der in certs {
-            roots
-                .add(CertificateDer::from(der))
-                .map_err(|e| Error::Tls(e.to_string()))?;
+            roots.add(der).map_err(|e| Error::Tls(e.to_string()))?;
         }
         Ok(roots)
     }

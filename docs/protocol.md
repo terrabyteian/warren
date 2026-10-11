@@ -554,11 +554,12 @@ Requirements:
   and B and dial out on link E.
 - Bootstrap: a single-use join token, valid for `JOIN_TOKEN_LIFETIME` and scoped
   to one role (and one connector group), is exchanged with a signed request for
-  the first certificate. The token is `wj1.<secret>.<fingerprint>`: 32 random
-  bytes and the SHA-256 of the root CA certificate's DER, both base64url. The
-  joining node pins the deployment by checking the root it receives against
-  the fingerprint before it trusts anything else in the answer. The control
-  plane stores only a hash of the secret.
+  the first certificate, as the join exchange below describes. An
+  administrator mints it for one node, naming the node and, for a relay, the
+  DNS names it listens on (`warren admin join-token create --role relay
+  --name relay-1 --dns-name relay1.example.com`); those are fixed in the
+  token's record and are what the certificate names. The control plane
+  stores only a hash of the token's secret.
 
 #### Join exchange
 
@@ -574,10 +575,10 @@ Requirements:
   verifies the endpoint's certificate against the root the token pins: the
   control plane presents the root in its chain, and its certificate must
   name the control-plane role in the token's trust domain.
-- The control plane checks the token (known, secret compared in constant
-  time, unused, unexpired, role and group as minted) and the request's
-  signature, spends the token, assigns the node ID and the names the token
-  was minted for, and answers `{"chain": [<base64 DER>, ...], "trustBundle":
+- The control plane checks the token (for its trust domain and root, known by
+  its secret's hash, unused, unexpired, ID, role and group as minted) and the
+  request's signature, spends the token, assigns the node ID and the names
+  the token was minted for, and answers `{"chain": [<base64 DER>, ...], "trustBundle":
   {"root": ..., "clientCas": [...], "infraCas": [...]}}`. Refusals are 4xx
   with an RFC 9457 problem body.
 - The node accepts the result only if the bundle's root is the pinned one,
@@ -687,11 +688,12 @@ posture evaluation in M2.
 
 Encodings and endpoints ([api/openapi.yaml](api/openapi.yaml)):
 
-- **Joining.** `POST /v1/join` with the join token, a PKCS#10 request signed
-  by the node's key, the node's name and, for relays, the DNS names it
-  listens on. The answer carries the node ID, the certificate, the trust
-  bundle and the policy-signing public key (a JWK). Renewal at half-life is
-  `POST /v1/node/certificate` with a request signed by the same key.
+- **Joining.** The join exchange of [section 10.3](#103-infrastructure-certificates).
+  A joined node then fetches the policy-signing public key (a JWK) with
+  `GET /v1/node/policy-key` on this link, where it has verified the control
+  plane against the trust bundle its join pinned, and keeps it. Renewal at
+  half-life is `POST /v1/node/certificate` with a request signed by the same
+  key.
 - **Bundles.** `GET /v1/node/bundle` returns the latest bundle as a JWS in
   compact serialization (RFC 7515), ES256, `typ` `warren-bundle+jws`, `kid`
   the RFC 7638 thumbprint of the policy-signing key. The payload is JSON with

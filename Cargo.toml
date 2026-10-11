@@ -39,7 +39,6 @@ tokio = { version = "=1.53.2", default-features = false, features = ["rt-multi-t
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std", "json"] }
-yasna = { version = "=0.6.0", default-features = false, features = ["std"] }
 zeroize = { version = "=1.9.1", default-features = false, features = ["alloc"] }
 
 # Workspace crates.

@@ -30,5 +30,8 @@ warren-core.workspace = true
 warren-policy = { workspace = true, features = ["compiler"] }
 zeroize.workspace = true
 
+[dev-dependencies]
+warren-masque.workspace = true
+
 [lints]
 workspace = true

@@ -222,7 +222,6 @@ version_check v0.9.5
 walkdir v2.5.0
 want v0.3.2
 writeable v0.6.4
-yasna v0.6.0
 yoke v0.8.3
 yoke-derive v0.8.4
 zerofrom v0.1.8

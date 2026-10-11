@@ -15,14 +15,17 @@ use std::path::Path;
 use aws_lc_rs::aead::{AES_256_GCM, Aad, Nonce, RandomizedNonceKey};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
+use warren_core::base64::pem;
+use warren_core::cert::{self, CertSpec};
 use warren_core::clock;
-use warren_core::identity::Principal;
+use warren_core::der;
+use warren_core::identity::{self, NodeRole, WarrenIdentity, WarrenUri};
 use warren_core::jose::Jwk;
-use warren_core::keys::{PublicKey, SigningKey, random_bytes};
+use warren_core::keys::{SigningKey, hex, random_bytes};
 use warren_core::params;
-use warren_core::x509::{
-    self, Certificate, CertificateSpec, EMPTY_NAME, Identity, IssuerInfo, Usage,
-};
+use warren_core::pki::{self, TrustBundle, oid};
 use zeroize::Zeroizing;
 
 use crate::Error;
@@ -150,26 +153,39 @@ pub struct Ca {
     key: SigningKey,
     /// The CA certificate, DER.
     pub der: Vec<u8>,
-    /// The CA certificate, parsed.
-    pub cert: Certificate,
+    /// Its subject Name, DER: the issuer name of everything it signs.
+    subject: Vec<u8>,
+    /// Its key identifier, for the authority key identifier of what it
+    /// signs.
+    key_id: Vec<u8>,
+    /// Start of validity, Unix seconds.
+    pub not_before: i64,
+    /// End of validity, Unix seconds.
+    pub not_after: i64,
 }
 
 impl Ca {
-    fn issuer(&self) -> IssuerInfo {
-        IssuerInfo {
-            name: self.cert.subject.clone(),
-            key_id: self.key.public_key().key_id(),
+    /// A CA from its key and certificate, which must certify that key.
+    fn new(name: &str, key: SigningKey, der: Vec<u8>) -> Result<Ca, Error> {
+        let bad = |e: &dyn std::fmt::Display| Error::Internal(format!("{name} certificate: {e}"));
+        let parsed = pki::parse_cert(&der).map_err(|e| bad(&e))?;
+        let spki = cert::p256_spki(key.public_key().point());
+        if parsed.spki != spki {
+            return Err(Error::Internal(format!(
+                "{name} certificate does not match its key"
+            )));
         }
-    }
-
-    /// The CA's public key.
-    pub fn public_key(&self) -> &PublicKey {
-        self.key.public_key()
-    }
-
-    /// Whether `cert` was signed by this CA.
-    pub fn issued(&self, cert: &Certificate) -> bool {
-        cert.issuer == self.cert.subject && cert.verify_signature(self.public_key()).is_ok()
+        let subject = der::tlv(der::tag::SEQUENCE, parsed.subject);
+        let (not_before, not_after) = (parsed.not_before, parsed.not_after);
+        Ok(Ca {
+            name: name.into(),
+            key_id: cert::spki_key_id(&spki).map_err(|e| bad(&e))?,
+            key,
+            subject,
+            not_before,
+            not_after,
+            der,
+        })
     }
 }
 
@@ -197,6 +213,8 @@ pub struct Authority {
     pub client: Ca,
     /// The infrastructure CA.
     pub infra: Ca,
+    /// The trust bundle of the three, for verifying what they issued.
+    pub bundle: TrustBundle,
     /// Signs policy bundles.
     pub policy_key: SigningKey,
     /// Signs posture statements.
@@ -210,11 +228,38 @@ const ISSUING_LIFETIME: i64 = 5 * 365 * 86_400;
 /// How long before a CA expires the control plane starts warning about it.
 const CA_EXPIRY_WARNING: i64 = 90 * 86_400;
 
-fn serial() -> Result<[u8; 16], Error> {
+fn serial() -> Result<Vec<u8>, Error> {
     let mut serial: [u8; 16] = random_bytes().map_err(|e| Error::Internal(e.to_string()))?;
     // Positive and non-zero, with at least 120 random bits left.
     serial[0] = (serial[0] & 0x7f) | 0x40;
-    Ok(serial)
+    Ok(serial.to_vec())
+}
+
+/// A leaf in the profile both certificate kinds share: empty subject,
+/// critical digitalSignature and subject alternative name, CA:FALSE, key
+/// identifiers.
+fn leaf_spec(
+    not_before: i64,
+    not_after: i64,
+    eku: &[&[u8]],
+    uris: Vec<String>,
+    dns_names: Vec<String>,
+) -> Result<CertSpec, Error> {
+    Ok(CertSpec {
+        serial: serial()?,
+        subject_cn: None,
+        not_before,
+        not_after,
+        ca: Some(false),
+        path_len: None,
+        key_usage: Some((0x80, true)),
+        eku: eku.iter().map(|o| o.to_vec()).collect(),
+        san_uris: uris,
+        san_dns: dns_names,
+        san_critical: true,
+        key_ids: true,
+        extra: Vec::new(),
+    })
 }
 
 impl Authority {
@@ -255,11 +300,19 @@ impl Authority {
             Some(&root),
         )
         .await?;
+        let bundle = TrustBundle::new(
+            trust_domain,
+            CertificateDer::from(root.der.clone()),
+            vec![CertificateDer::from(client.der.clone())],
+            vec![CertificateDer::from(infra.der.clone())],
+        )
+        .map_err(|e| Error::Internal(e.to_string()))?;
         Ok(Authority {
             trust_domain: trust_domain.to_owned(),
             root,
             client,
             infra,
+            bundle,
             policy_key: load_key(store, kek, "policy-signing").await?,
             posture_key: load_key(store, kek, "posture-signing").await?,
             assertion_key: load_key(store, kek, "session-assertion-signing").await?,
@@ -273,13 +326,13 @@ impl Authority {
     pub fn warn_if_expiring(&self) {
         let now = clock::now_secs();
         for ca in [&self.root, &self.client, &self.infra] {
-            if ca.cert.not_after - now < CA_EXPIRY_WARNING {
+            if ca.not_after - now < CA_EXPIRY_WARNING {
                 crate::log::warn(
                     "keys",
                     &format!(
                         "the {} expires at {}; certificates it issues cannot outlive it, so replace it before then",
                         ca.name,
-                        clock::rfc3339(ca.cert.not_after)
+                        clock::rfc3339(ca.not_after)
                     ),
                 );
             }
@@ -295,7 +348,7 @@ impl Authority {
     pub fn trust_bundle(&self) -> String {
         [&self.root, &self.client, &self.infra]
             .iter()
-            .map(|ca| x509::pem_encode("CERTIFICATE", &ca.der))
+            .map(|ca| pem("CERTIFICATE", &ca.der))
             .collect()
     }
 
@@ -305,89 +358,99 @@ impl Authority {
     }
 
     /// Issues a user+device certificate (docs/protocol.md section 10.2)
-    /// valid from `not_before` to `not_after`, Unix seconds.
+    /// for the key in `spki`, valid from `not_before` to `not_after`, Unix
+    /// seconds.
     pub fn issue_client(
         &self,
-        key: &PublicKey,
+        spki: &[u8],
         user_id: &str,
         device_id: &str,
-        identity: Identity,
+        identity: &WarrenIdentity,
         not_before: i64,
         not_after: i64,
     ) -> Result<Issued, Error> {
-        let spec = CertificateSpec {
-            serial: serial()?,
+        let td = self.trust_domain.clone();
+        let mut spec = leaf_spec(
             not_before,
             not_after,
-            subject: EMPTY_NAME.to_vec(),
-            public_key: key,
-            usage: Usage::Leaf {
-                server_auth: false,
-                client_auth: true,
-            },
-            uris: vec![
-                Principal::User(user_id.into()).to_uri(&self.trust_domain),
-                Principal::Device(device_id.into()).to_uri(&self.trust_domain),
+            &[oid::CLIENT_AUTH],
+            vec![
+                WarrenUri::User {
+                    td: td.clone(),
+                    id: user_id.into(),
+                }
+                .to_string(),
+                WarrenUri::Device {
+                    td,
+                    id: device_id.into(),
+                }
+                .to_string(),
             ],
-            dns_names: vec![],
-            identity: Some(identity),
-        };
-        issue(&spec, &self.client)
+            Vec::new(),
+        )?;
+        spec.extra = vec![(identity::identity_extension_oid(), false, identity.to_der())];
+        issue(&spec, spki, &self.client)
     }
 
-    /// Issues an infrastructure certificate (docs/protocol.md section 10.3).
-    /// Connectors and relays get both server and client authentication;
-    /// they listen on one link and dial out on another.
+    /// Issues an infrastructure certificate (docs/protocol.md section 10.3)
+    /// for the key in `spki`. Connectors and relays get both server and
+    /// client authentication; they listen on one link and dial out on
+    /// another.
     pub fn issue_node(
         &self,
-        key: &PublicKey,
-        principal: &Principal,
+        spki: &[u8],
+        role: &NodeRole,
+        id: &str,
         dns_names: &[String],
         lifetime_secs: i64,
         skew_secs: i64,
     ) -> Result<Issued, Error> {
         let now = clock::now_secs();
-        let spec = CertificateSpec {
-            serial: serial()?,
-            not_before: now - skew_secs,
-            not_after: now + lifetime_secs,
-            subject: EMPTY_NAME.to_vec(),
-            public_key: key,
-            usage: Usage::Leaf {
-                server_auth: true,
-                client_auth: true,
-            },
-            uris: vec![principal.to_uri(&self.trust_domain)],
-            dns_names: dns_names.to_vec(),
-            identity: None,
+        let uri = WarrenUri::Node {
+            td: self.trust_domain.clone(),
+            role: role.clone(),
+            id: id.into(),
         };
-        issue(&spec, &self.infra)
+        let spec = leaf_spec(
+            now - skew_secs,
+            now + lifetime_secs,
+            &[oid::SERVER_AUTH, oid::CLIENT_AUTH],
+            vec![uri.to_string()],
+            dns_names.to_vec(),
+        )?;
+        issue(&spec, spki, &self.infra)
     }
 
     /// A certificate chain as PEM: the leaf, then its issuing CA.
     pub fn chain_pem(&self, leaf: &[u8], issuer: &Ca) -> String {
-        x509::pem_encode("CERTIFICATE", leaf) + &x509::pem_encode("CERTIFICATE", &issuer.der)
+        pem("CERTIFICATE", leaf) + &pem("CERTIFICATE", &issuer.der)
     }
 }
 
 /// Signs a leaf with `ca`, refusing one that would be valid outside the
 /// CA's own validity, which verifiers anchored at the root would reject.
-fn issue(spec: &CertificateSpec<'_>, ca: &Ca) -> Result<Issued, Error> {
+fn issue(spec: &CertSpec, spki: &[u8], ca: &Ca) -> Result<Issued, Error> {
     let now = clock::now_secs();
-    if now < ca.cert.not_before || spec.not_after > ca.cert.not_after {
+    if now < ca.not_before || spec.not_after > ca.not_after {
         return Err(Error::Unavailable(format!(
             "the {} is valid from {} until {}, so it cannot issue a certificate valid until {}",
             ca.name,
-            clock::rfc3339(ca.cert.not_before),
-            clock::rfc3339(ca.cert.not_after),
+            clock::rfc3339(ca.not_before),
+            clock::rfc3339(ca.not_after),
             clock::rfc3339(spec.not_after)
         )));
     }
-    let der = x509::build_certificate(spec, &ca.issuer(), |tbs| ca.key.sign_der(tbs))
-        .map_err(|e| Error::Internal(e.to_string()))?;
-    let parsed = Certificate::parse(&der).map_err(|e| Error::Internal(e.to_string()))?;
+    if spec.not_after <= spec.not_before {
+        return Err(Error::Internal(
+            "certificate validity ends before it starts".into(),
+        ));
+    }
+    let der = cert::issue(spec, spki, &ca.subject, &ca.key_id, |tbs| {
+        ca.key.sign_der(tbs)
+    })
+    .map_err(|e| Error::Internal(e.to_string()))?;
     Ok(Issued {
-        serial: parsed.serial_hex(),
+        serial: hex(&spec.serial),
         not_before: spec.not_before,
         not_after: spec.not_after,
         renew_at: params::renew_at(clock::now_secs(), spec.not_after),
@@ -418,22 +481,11 @@ async fn load_ca(
     if let Some((sealed, Some(pem))) = store.signing_key(name).await? {
         let pkcs8 = kek.open(name, &sealed)?;
         let key = SigningKey::from_pkcs8(&pkcs8).map_err(|e| Error::Internal(e.to_string()))?;
-        let der = x509::pem_decode("CERTIFICATE", &pem)
-            .ok()
-            .and_then(|mut v| v.pop())
+        let der = CertificateDer::pem_slice_iter(pem.as_bytes())
+            .last()
+            .and_then(Result::ok)
             .ok_or_else(|| Error::Internal(format!("{name} certificate is unreadable")))?;
-        let cert = Certificate::parse(&der).map_err(|e| Error::Internal(e.to_string()))?;
-        if cert.public_key != *key.public_key() {
-            return Err(Error::Internal(format!(
-                "{name} certificate does not match its key"
-            )));
-        }
-        return Ok(Ca {
-            name: name.into(),
-            key,
-            der,
-            cert,
-        });
+        return Ca::new(name, key, der.to_vec());
     }
     let lifetime = match parent {
         None => ROOT_LIFETIME,
@@ -444,7 +496,7 @@ async fn load_ca(
         .insert_signing_key(
             name,
             &kek.seal(name, &pkcs8)?,
-            Some(&x509::pem_encode("CERTIFICATE", &ca.der)),
+            Some(&pem("CERTIFICATE", &ca.der)),
         )
         .await?;
     Ok(ca)
@@ -460,47 +512,34 @@ fn create_ca(
 ) -> Result<(Ca, Zeroizing<Vec<u8>>), Error> {
     let key = SigningKey::generate().map_err(|e| Error::Internal(e.to_string()))?;
     let now = clock::now_secs();
-    let subject = x509::common_name(cn);
-    let usage = match parent {
-        None => Usage::Ca { path_len: 1 },
-        Some(_) => Usage::Ca { path_len: 0 },
-    };
-    let spec = CertificateSpec {
+    let spki = cert::p256_spki(key.public_key().point());
+    let spec = CertSpec {
         serial: serial()?,
+        subject_cn: Some(cn.into()),
         not_before: now - 3600,
         not_after: now + lifetime,
-        subject: subject.clone(),
-        public_key: key.public_key(),
-        usage,
-        uris: vec![],
-        dns_names: vec![],
-        identity: None,
+        ca: Some(true),
+        path_len: Some(if parent.is_none() { 1 } else { 0 }),
+        key_usage: Some((0x04, true)),
+        eku: Vec::new(),
+        san_uris: Vec::new(),
+        san_dns: Vec::new(),
+        san_critical: false,
+        key_ids: true,
+        extra: Vec::new(),
     };
+    let own_id = cert::spki_key_id(&spki).map_err(|e| Error::Internal(e.to_string()))?;
     let der = match parent {
-        None => x509::build_certificate(
-            &spec,
-            &IssuerInfo {
-                name: subject,
-                key_id: key.public_key().key_id(),
-            },
-            |tbs| key.sign_der(tbs),
-        ),
-        Some(parent) => {
-            x509::build_certificate(&spec, &parent.issuer(), |tbs| parent.key.sign_der(tbs))
-        }
+        None => cert::issue(&spec, &spki, &cert::name(Some(cn)), &own_id, |tbs| {
+            key.sign_der(tbs)
+        }),
+        Some(parent) => cert::issue(&spec, &spki, &parent.subject, &parent.key_id, |tbs| {
+            parent.key.sign_der(tbs)
+        }),
     }
     .map_err(|e| Error::Internal(e.to_string()))?;
     let pkcs8 = key.to_pkcs8().map_err(|e| Error::Internal(e.to_string()))?;
-    let cert = Certificate::parse(&der).map_err(|e| Error::Internal(e.to_string()))?;
-    Ok((
-        Ca {
-            name: name.into(),
-            key,
-            der,
-            cert,
-        },
-        pkcs8,
-    ))
+    Ok((Ca::new(name, key, der)?, pkcs8))
 }
 
 /// Device tunnel addresses for allocation index `index`: the index-th
@@ -570,29 +609,67 @@ mod tests {
             .unwrap()
             .0;
         let key = SigningKey::generate().unwrap();
-        let spec = |not_after: i64| CertificateSpec {
-            serial: serial().unwrap(),
-            not_before: clock::now_secs() - 60,
-            not_after,
-            subject: EMPTY_NAME.to_vec(),
-            public_key: key.public_key(),
-            usage: Usage::Leaf {
-                server_auth: true,
-                client_auth: true,
-            },
-            uris: vec!["spiffe://example.test/relay/n-1".into()],
-            dns_names: vec![],
-            identity: None,
+        let spki = cert::p256_spki(key.public_key().point());
+        let spec = |not_after: i64| {
+            leaf_spec(
+                clock::now_secs() - 60,
+                not_after,
+                &[oid::SERVER_AUTH],
+                vec!["warren://example.test/relay/n-1".into()],
+                Vec::new(),
+            )
+            .unwrap()
         };
         let within = clock::now_secs() + 1_800;
-        let issued = issue(&spec(within), &infra).unwrap();
+        let issued = issue(&spec(within), &spki, &infra).unwrap();
         assert_eq!(issued.not_after, within);
-        let past = infra.cert.not_after + 1;
-        let refused = issue(&spec(past), &infra).unwrap_err();
+        let past = infra.not_after + 1;
+        let refused = issue(&spec(past), &spki, &infra).unwrap_err();
         assert!(
             matches!(&refused, Error::Unavailable(m) if m.contains("infrastructure-ca")),
             "{refused:?}"
         );
+    }
+
+    #[test]
+    fn issued_certificates_chain_to_the_root() {
+        let root = create_ca("root-ca", "test root", None, 86_400).unwrap().0;
+        let client = create_ca("client-ca", "test client", Some(&root), 3_600)
+            .unwrap()
+            .0;
+        let infra = create_ca("infrastructure-ca", "test infra", Some(&root), 3_600)
+            .unwrap()
+            .0;
+        let bundle = TrustBundle::new(
+            "example.test",
+            CertificateDer::from(root.der.clone()),
+            vec![CertificateDer::from(client.der.clone())],
+            vec![CertificateDer::from(infra.der.clone())],
+        )
+        .unwrap();
+        let key = SigningKey::generate().unwrap();
+        let spki = cert::p256_spki(key.public_key().point());
+        let now = clock::now_secs();
+        let spec = leaf_spec(
+            now - 60,
+            now + 600,
+            &[oid::SERVER_AUTH, oid::CLIENT_AUTH],
+            vec!["warren://example.test/relay/n-1".into()],
+            vec!["relay.example.test".into()],
+        )
+        .unwrap();
+        let leaf = CertificateDer::from(issue(&spec, &spki, &infra).unwrap().der);
+        let at = pki::unix_time(std::time::SystemTime::now());
+        bundle
+            .verify_chain(&leaf, pki::Issuer::Infrastructure, true, at)
+            .unwrap();
+        assert!(
+            bundle
+                .verify_chain(&leaf, pki::Issuer::Client, false, at)
+                .is_err()
+        );
+        let id = pki::check_infra_profile(&leaf, "example.test").unwrap();
+        assert_eq!((id.role, id.id.as_str()), (NodeRole::Relay, "n-1"));
     }
 
     #[test]

@@ -17,7 +17,7 @@ use hyper_util::rt::TokioIo;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use serde_json::{Value, json};
-use support::{IdpUser, RunningIdp, StubNode, TempDir, free_port, write};
+use support::{IdpUser, RunningIdp, StubNode, TempDir, TestCa, free_port, pem_certs, write};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -27,9 +27,9 @@ use warren_control::web::{
     self, Body, Handler, ListenOptions, MAX_CONNECTIONS_PER_SOURCE, Peer, ServerCert,
 };
 use warren_control::{ControlPlane, Error, admin_request};
-use warren_core::clock;
+use warren_core::base64::pem;
 use warren_core::keys::SigningKey;
-use warren_core::x509::{self, CertificateSpec, EMPTY_NAME, IssuerInfo, Usage};
+use warren_core::pki::oid;
 use warren_policy::names::Cidr;
 
 const PUBLIC_HOST: &str = "warren.example.test";
@@ -45,54 +45,13 @@ struct OperatorPki {
 
 impl OperatorPki {
     fn new(host: &str) -> OperatorPki {
-        let ca_key = SigningKey::generate().unwrap();
-        let name = x509::common_name("operator CA");
-        let now = clock::now_secs();
-        let issuer = IssuerInfo {
-            name: name.clone(),
-            key_id: ca_key.public_key().key_id(),
-        };
-        let ca = x509::build_certificate(
-            &CertificateSpec {
-                serial: [1; 16],
-                not_before: now - 60,
-                not_after: now + 86_400,
-                subject: name,
-                public_key: ca_key.public_key(),
-                usage: Usage::Ca { path_len: 0 },
-                uris: vec![],
-                dns_names: vec![],
-                identity: None,
-            },
-            &issuer,
-            |tbs| ca_key.sign_der(tbs),
-        )
-        .unwrap();
+        let ca = TestCa::new("operator CA");
         let key = SigningKey::generate().unwrap();
-        let leaf = x509::build_certificate(
-            &CertificateSpec {
-                serial: [2; 16],
-                not_before: now - 60,
-                not_after: now + 86_400,
-                subject: EMPTY_NAME.to_vec(),
-                public_key: key.public_key(),
-                usage: Usage::Leaf {
-                    server_auth: true,
-                    client_auth: false,
-                },
-                uris: vec![],
-                dns_names: vec![host.into()],
-                identity: None,
-            },
-            &issuer,
-            |tbs| ca_key.sign_der(tbs),
-        )
-        .unwrap();
+        let leaf = ca.leaf(&key, &[host], &[], &[oid::SERVER_AUTH]);
         OperatorPki {
-            chain_pem: x509::pem_encode("CERTIFICATE", &leaf)
-                + &x509::pem_encode("CERTIFICATE", &ca),
-            key_pem: x509::pem_encode("PRIVATE KEY", &key.to_pkcs8().unwrap()),
-            ca,
+            chain_pem: pem("CERTIFICATE", &leaf) + &pem("CERTIFICATE", &ca.der),
+            key_pem: pem("PRIVATE KEY", &key.to_pkcs8().unwrap()),
+            ca: ca.der,
             leaf,
         }
     }
@@ -227,7 +186,7 @@ async fn the_public_host_presents_the_operator_certificate() {
     // The trust bundle does not vouch for the public host any more, but
     // still does for the internal name, where relays and connectors join,
     // fetch bundles and hold their event streams.
-    let roots: Vec<Vec<u8>> = x509::pem_decode("CERTIFICATE", &bundle).unwrap();
+    let roots: Vec<Vec<u8>> = pem_certs(&bundle);
     let roots: Vec<&[u8]> = roots.iter().map(Vec::as_slice).collect();
     assert!(handshake(port, PUBLIC_HOST, &roots).await.is_err());
     assert!(handshake(port, INTERNAL_HOST, &[&first.ca]).await.is_err());
@@ -237,7 +196,7 @@ async fn the_public_host_presents_the_operator_certificate() {
             &socket,
             "POST",
             "/v1/admin/join-tokens",
-            Some(r#"{"role":"relay"}"#.into()),
+            Some(r#"{"role":"relay","name":"relay1"}"#.into()),
         )
         .unwrap()
     })
@@ -246,15 +205,10 @@ async fn the_public_host_presents_the_operator_certificate() {
     assert_eq!(status, 201, "{body}");
     let token: Value = serde_json::from_str(&body).unwrap();
     let base = format!("https://{INTERNAL_HOST}:{port}");
-    let node = StubNode::join(
-        &base,
-        token["token"].as_str().unwrap(),
-        "relay1",
-        &[],
-        &bundle,
-    )
-    .await
-    .unwrap();
+    assert_eq!(token["control_plane"], base);
+    let node = StubNode::join(&base, token["token"].as_str().unwrap())
+        .await
+        .unwrap();
     assert_eq!(node.get("/v1/node/bundle").await.status, StatusCode::OK);
     let mut events = node.events(None).await;
     assert!(
@@ -328,9 +282,7 @@ async fn a_certificate_that_does_not_load_stops_startup() {
 async fn one_source_cannot_hold_every_connection() {
     let idp = idp().await;
     let port: u16 = idp.idp.issuer.rsplit(':').next().unwrap().parse().unwrap();
-    let ca = x509::pem_decode("CERTIFICATE", &idp.pki.ca_pem)
-        .unwrap()
-        .remove(0);
+    let ca = pem_certs(&idp.pki.ca_pem).remove(0);
 
     let mut held = Vec::new();
     for _ in 0..MAX_CONNECTIONS_PER_SOURCE {
@@ -376,68 +328,26 @@ struct EchoPki {
 
 impl EchoPki {
     fn new() -> EchoPki {
-        let ca_key = SigningKey::generate().unwrap();
-        let name = x509::common_name("echo CA");
-        let now = clock::now_secs();
-        let issuer = IssuerInfo {
-            name: name.clone(),
-            key_id: ca_key.public_key().key_id(),
-        };
-        let spec = |key: &SigningKey, usage, serial, dns: Vec<String>, uris: Vec<String>| {
-            x509::build_certificate(
-                &CertificateSpec {
-                    serial: [serial; 16],
-                    not_before: now - 60,
-                    not_after: now + 3_600,
-                    subject: if serial == 1 {
-                        name.clone()
-                    } else {
-                        EMPTY_NAME.to_vec()
-                    },
-                    public_key: key.public_key(),
-                    usage,
-                    uris,
-                    dns_names: dns,
-                    identity: None,
-                },
-                &issuer,
-                |tbs| ca_key.sign_der(tbs),
-            )
-            .unwrap()
-        };
-        let ca = spec(&ca_key, Usage::Ca { path_len: 0 }, 1, vec![], vec![]);
+        let ca = TestCa::new("echo CA");
         let server_key = SigningKey::generate().unwrap();
-        let server = spec(
-            &server_key,
-            Usage::Leaf {
-                server_auth: true,
-                client_auth: false,
-            },
-            2,
-            vec!["localhost".into()],
-            vec![],
-        );
+        let server = ca.leaf(&server_key, &["localhost"], &[], &[oid::SERVER_AUTH]);
         let client_key = SigningKey::generate().unwrap();
-        let client = spec(
+        let client = ca.leaf(
             &client_key,
-            Usage::Leaf {
-                server_auth: false,
-                client_auth: true,
-            },
-            3,
-            vec![],
-            vec!["warren://example.test/relay/n-1".into()],
+            &[],
+            &["warren://example.test/relay/n-1"],
+            &[oid::CLIENT_AUTH],
         );
         EchoPki {
             server: (
-                vec![server, ca.clone()],
+                vec![server, ca.der.clone()],
                 server_key.to_pkcs8().unwrap().to_vec(),
             ),
             client: (
-                vec![client, ca.clone()],
+                vec![client, ca.der.clone()],
                 client_key.to_pkcs8().unwrap().to_vec(),
             ),
-            ca,
+            ca: ca.der,
         }
     }
 

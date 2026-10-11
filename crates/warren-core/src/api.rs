@@ -5,8 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::jose::Jwk;
-
 /// `GET /.well-known/warren`: what a client needs to start, given only the
 /// organization URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +71,7 @@ pub struct Session {
     /// The signed-in user.
     pub user: UserInfo,
     /// When the user authenticated at the IdP, Unix seconds, or 0 when the
-    /// IdP did not say (`x509::AUTH_TIME_UNKNOWN`).
+    /// IdP did not say (`identity::AUTH_TIME_UNKNOWN`).
     pub auth_time: i64,
     /// Whether that authentication used multi-factor authentication.
     pub mfa: bool,
@@ -204,42 +202,6 @@ pub struct Relay {
     pub name: String,
     /// The DNS names it listens on.
     pub dns_names: Vec<String>,
-}
-
-/// `POST /v1/join`: a relay or connector exchanges a single-use join token
-/// for its first infrastructure certificate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JoinRequest {
-    /// The join token.
-    pub token: String,
-    /// A PKCS#10 request signed by the node's key, DER, base64.
-    pub csr: String,
-    /// The node's name, unique within its role.
-    pub name: String,
-    /// DNS names the node listens on (relays).
-    #[serde(default)]
-    pub dns_names: Vec<String>,
-}
-
-/// The answer to a join.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JoinResponse {
-    /// The node's ID.
-    pub node_id: String,
-    /// `relay` or `connector`.
-    pub role: String,
-    /// The connector group, for connectors.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
-    /// The deployment's trust domain.
-    pub trust_domain: String,
-    /// The node's certificate.
-    pub certificate: CertificateResponse,
-    /// The deployment trust bundle, PEM (root, client CA, infrastructure
-    /// CA).
-    pub trust_bundle: String,
-    /// The key that signs policy bundles.
-    pub policy_key: Jwk,
 }
 
 /// An error, as RFC 9457 problem details. `reason` is a stable code the

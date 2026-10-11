@@ -32,5 +32,4 @@ tokio               warren,warren-client,warren-connector,warren-control,warren-
 tokio-rustls        warren-control,warren-masque                                                                               rustls over tokio sockets (control-plane listener, HTTP/2 fallback)
 tracing             warren,warren-client,warren-connector,warren-core,warren-masque,warren-relay                               structured logging; quinn and h2 log through it as well
 tracing-subscriber  warren-core                                                                                                JSON-lines log output on stderr
-yasna               warren-core                                                                                                DER for the certificate profile: certificates, PKCS#10 requests, the identity extension
 zeroize             warren-control,warren-core                                                                                 wiping private keys and secrets from memory after use

@@ -172,6 +172,12 @@ paths:
       tags: [node]
       operationId: join
       summary: Exchange a single-use join token for a first infrastructure certificate
+      description: >-
+        The join exchange of protocol.md section 10.3. The node reaches the
+        endpoint the token names and verifies it against the root the token
+        pins; the control plane checks the token and the request's
+        signature, spends the token, and issues a certificate naming the
+        role, group, name and DNS names the token was minted for.
       requestBody:
         required: true
         content:
@@ -183,8 +189,26 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/JoinResponse" }
+        "400": { $ref: "#/components/responses/Problem" }
         "401": { $ref: "#/components/responses/Problem" }
         "409": { $ref: "#/components/responses/Problem" }
+  /v1/node/policy-key:
+    get:
+      tags: [node]
+      operationId: nodePolicyKey
+      summary: The policy-signing key, for verifying bundles
+      description: >-
+        Served on link E, where the node has verified the control plane
+        against the trust bundle its join pinned; the node keeps the key to
+        verify every bundle with.
+      security: [{ infrastructure: [] }]
+      responses:
+        "200":
+          description: The policy-signing key as a P-256 JWK.
+          content:
+            application/json:
+              schema: { type: object }
+        "403": { $ref: "#/components/responses/Problem" }
   /v1/node/bundle:
     get:
       tags: [node]
@@ -374,12 +398,27 @@ paths:
           application/json:
             schema:
               type: object
-              required: [role]
+              required: [role, name]
+              additionalProperties: false
               properties:
                 role: { type: string, enum: [relay, connector] }
                 group: { type: string, description: The connector group, for connectors. }
+                name: { type: string, description: "The node's name, unique within its role: 1 to 63 lowercase letters, digits and '-'." }
+                dns_names:
+                  type: array
+                  maxItems: 16
+                  items: { type: string }
+                  description: Host names the relay listens on (relays only); none may be warren's own or claimed by an app.
       responses:
-        "201": { description: "The token, wj1.<secret>.<root CA fingerprint>, valid once for JOIN_TOKEN_LIFETIME, and control_plane, the URL the node joins at: publicUrl, or with an operator certificate on its host, the same URL under an internal name from dnsNames." }
+        "201":
+          description: >-
+            The token (warren-join-v1., protocol.md section 10.3), valid once
+            for JOIN_TOKEN_LIFETIME, with the role, group, name, DNS names
+            and expiry it was minted for, and control_plane, the URL the node
+            joins at: publicUrl, or with an operator certificate on its host,
+            the same URL under an internal name from dnsNames.
+        "400": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
   /v1/admin/nodes:
     get:
       tags: [admin]
@@ -551,24 +590,28 @@ components:
               dns_names: { type: array, items: { type: string } }
     JoinRequest:
       type: object
-      required: [token, csr, name]
+      required: [token, csr]
+      additionalProperties: false
       properties:
-        token: { type: string }
-        csr: { type: string }
-        name: { type: string }
-        dns_names: { type: array, items: { type: string } }
+        token: { type: string, description: "The join token, warren-join-v1. followed by base64url JSON." }
+        csr: { type: string, description: A PKCS#10 request with an empty subject, signed by the node's P-256 key, DER, base64. }
     JoinResponse:
       type: object
+      required: [chain, trustBundle]
+      additionalProperties: false
       properties:
-        node_id: { type: string }
-        role: { type: string, enum: [relay, connector] }
-        group: { type: string }
-        trust_domain: { type: string }
-        certificate: { $ref: "#/components/schemas/Certificate" }
-        trust_bundle: { type: string }
-        policy_key:
+        chain:
+          type: array
+          items: { type: string }
+          description: The node's certificate, then the infrastructure CA, DER, base64.
+        trustBundle:
           type: object
-          description: The policy-signing key as a P-256 JWK.
+          required: [root, clientCas, infraCas]
+          additionalProperties: false
+          properties:
+            root: { type: string, description: The root CA certificate, DER, base64. }
+            clientCas: { type: array, items: { type: string } }
+            infraCas: { type: array, items: { type: string } }
     AckRequest:
       type: object
       required: [acks]
