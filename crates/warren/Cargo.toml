@@ -19,6 +19,9 @@ connector = ["dep:warren-connector"]
 
 [dependencies]
 clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+warren-core.workspace = true
 warren-connector = { workspace = true, optional = true }
 warren-control = { workspace = true, optional = true }
 warren-relay = { workspace = true, optional = true }

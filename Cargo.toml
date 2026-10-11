@@ -14,7 +14,21 @@ publish = false
 # must also appear in deps/allowlist.txt. Members opt in with `workspace = true`.
 # See docs/dependencies.md before adding anything.
 [workspace.dependencies]
+aws-lc-rs = { version = "=1.18.1", default-features = false, features = ["aws-lc-sys", "alloc"] }
+bytes = { version = "=1.12.1", default-features = false, features = ["std"] }
 clap = { version = "=4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+h2 = { version = "=0.4.20", default-features = false }
+http = { version = "=1.5.0", default-features = false, features = ["std"] }
+libc = { version = "=0.2.190", default-features = false, features = ["std"] }
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls-webpki = { version = "=0.103.15", default-features = false, features = ["std"] }
+serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+tokio = { version = "=1.53.2", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
+tokio-rustls = { version = "=0.26.6", default-features = false }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std", "json"] }
 
 # Workspace crates.
 warren-client = { path = "crates/warren-client" }
@@ -22,6 +36,7 @@ warren-connector = { path = "crates/warren-connector" }
 warren-console = { path = "crates/warren-console" }
 warren-control = { path = "crates/warren-control" }
 warren-core = { path = "crates/warren-core" }
+warren-harness = { path = "crates/warren-harness" }
 warren-masque = { path = "crates/warren-masque" }
 warren-operator = { path = "crates/warren-operator" }
 warren-policy = { path = "crates/warren-policy" }
