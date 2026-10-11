@@ -26,10 +26,15 @@ certificate serves browser sign-in and enrollment only (discovery,
 `/v1/auth/*` and `/v1/devices`); every other call made at `publicUrl`'s host
 is refused with `421 misdirected_request`. So `tls` needs at least one name
 in `dnsNames` besides `publicUrl`'s host that reaches the control plane from
-everywhere clients and nodes run; the first such name is the internal name.
-Any name in `dnsNames` gets the control plane's own certificate, so peers in
-the control plane's own cluster can use a ClusterIP Service name instead
-(see [Behind a load balancer](#behind-a-load-balancer)).
+everywhere clients and nodes run. The first such name in the list is the
+internal name: it is the `api_base` enrolled clients are given, the
+`control_plane` URL join tokens come with, and where `421` refusals send
+callers. Every name in `dnsNames` gets the control plane's own certificate,
+so peers in the control plane's own cluster can use a ClusterIP Service name
+listed after the internal name (see
+[Behind a load balancer](#behind-a-load-balancer)); listed first, it would
+become the name every client is given, which clients outside the cluster
+cannot resolve.
 
 - Clients sign in and enroll at the organization URL. The enrollment answer
   gives them `api_base`, a URL under the internal name, and from then on they
@@ -78,7 +83,7 @@ The HTTPS listener bounds what any peer can hold before it authenticates.
 | Connections in total | 4096 |
 | Unauthenticated connections from one source (an IPv4 address or an IPv6 /64) | `connections.maxPerSource`, 64 by default |
 | Concurrent requests on one HTTP/2 connection | 32 |
-| TLS handshake (and a trusted proxy's PROXY header) | 10 seconds |
+| A trusted proxy's PROXY header and the TLS handshake, together | 10 seconds |
 | Request headers (HTTP/1.1) | 10 seconds |
 | Request body | 30 seconds; 16 KiB before the caller is known |
 | A connection with no request in progress | closed after 60 seconds |
@@ -125,17 +130,24 @@ balancer send them:
   `externalTrafficPolicy: Local`, so pods see client addresses, or enable
   PROXY protocol version 2 on the cloud load balancer (usually with an
   annotation on the Service) and list only the load balancer's own
-  addresses in `trustedProxies`. With the default
-  `externalTrafficPolicy: Cluster` and no PROXY protocol, every peer appears
-  as a node address: set `maxPerSource` to 0 rather than let the limit
-  refuse legitimate peers.
+  addresses in `trustedProxies`. PROXY protocol needs connections to reach
+  the pod from the balancer's own addresses, so use it with
+  `externalTrafficPolicy: Local` or a load balancer that targets pod IPs
+  directly: under the default `externalTrafficPolicy: Cluster`, kube-proxy
+  rewrites each connection's source to a node address, which is not
+  trusted, so the header is never read and every TLS handshake fails. With
+  `externalTrafficPolicy: Cluster` and no PROXY protocol, every peer
+  appears as a node address: set `maxPerSource` to 0 rather than let the
+  limit refuse legitimate peers.
 - **Relays and connectors in the same cluster.** kube-proxy sends in-cluster
   traffic for a `LoadBalancer` IP straight to the pod, bypassing the load
   balancer, so it carries no PROXY header; if it arrives from a trusted
   address it is disconnected. Give in-cluster relays and connectors a
-  ClusterIP Service name that is also in `dnsNames` (for example
-  `warren.warren-system.svc.cluster.local`), so they reach the control plane
-  directly under its own certificate, or set the `LoadBalancer` Service's
-  `status.loadBalancer.ingress[].ipMode` to `Proxy` where the cloud
-  provider supports it, so in-cluster traffic goes through the load
-  balancer too.
+  ClusterIP Service name that is also in `dnsNames`, after the internal
+  name (for example
+  `dnsNames: [nodes.warren.example.com, warren.warren-system.svc.cluster.local]`),
+  so they reach the control plane directly under its own certificate. Or,
+  where the cloud provider supports it, request `ipMode: Proxy` through the
+  provider's annotation on the `LoadBalancer` Service; the cloud controller
+  then reports it in the Service's status and kube-proxy sends in-cluster
+  traffic through the load balancer too.

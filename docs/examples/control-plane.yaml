@@ -23,9 +23,11 @@ tls:
   keyFile: /etc/warren/tls/tls.key
 
 # More names for the control plane's own certificate. With tls set, the
-# first one is the internal name: enrolled clients, relays and connectors
-# make every call there, verified against the trust bundle. Point it at the
-# same address as publicUrl.
+# first one other than publicUrl's host is the internal name: enrolled
+# clients, relays and connectors make every call there, verified against
+# the trust bundle, so it must reach the control plane from everywhere they
+# run. A cluster-local Service name for in-cluster relays and connectors
+# goes after it (see docs/operating.md).
 dnsNames: [nodes.warren.example.com]
 
 # Unauthenticated connections one source may hold (0: no limit), and load
