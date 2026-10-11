@@ -14,14 +14,15 @@ publish.workspace = true
 [features]
 default = ["control-plane", "relay", "connector"]
 control-plane = ["dep:warren-control"]
-relay = ["dep:warren-relay"]
-connector = ["dep:warren-connector"]
+relay = ["dep:warren-relay", "dep:warren-core", "dep:warren-masque"]
+connector = ["dep:warren-connector", "dep:warren-core", "dep:warren-masque"]
 
 [dependencies]
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-warren-core.workspace = true
+warren-core = { workspace = true, optional = true }
+warren-masque = { workspace = true, optional = true }
 warren-connector = { workspace = true, optional = true }
 warren-control = { workspace = true, optional = true }
 warren-relay = { workspace = true, optional = true }

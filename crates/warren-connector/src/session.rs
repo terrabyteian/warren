@@ -801,14 +801,27 @@ impl Session {
                 v,
             );
         };
+        // Flows start at the client unless the app opts in; a server's
+        // source port is ephemeral, so only its address and protocol must
+        // belong to the app.
+        if server_initiated && !app.server_initiated_flows {
+            return Decision::deny(
+                Reason::ServerInitiatedBlocked,
+                format!("{} may not open connections to your device.", app.name),
+                v,
+            );
+        }
         let port = real_dst.port();
         let admits = app.destinations.iter().any(|d| {
-            d.admits(protocol, port)
-                && match (&d.kind, hostname) {
-                    (DestKind::Name { host, .. }, Some(h)) => host.matches(h),
-                    (DestKind::Cidr(net), None) => net.contains(real_dst.ip()),
-                    _ => false,
-                }
+            (if server_initiated {
+                d.protocol.matches(protocol)
+            } else {
+                d.admits(protocol, port)
+            }) && match (&d.kind, hostname) {
+                (DestKind::Name { host, .. }, Some(h)) => host.matches(h),
+                (DestKind::Cidr(net), None) => net.contains(real_dst.ip()),
+                _ => false,
+            }
         });
         if !admits {
             return Decision::deny(
@@ -825,13 +838,6 @@ impl Session {
             return Decision::deny(
                 Reason::OutOfScope,
                 format!("{} is outside this connector's scope.", app.name),
-                v,
-            );
-        }
-        if server_initiated && !app.server_initiated_flows {
-            return Decision::deny(
-                Reason::ServerInitiatedBlocked,
-                format!("{} may not open connections to your device.", app.name),
                 v,
             );
         }

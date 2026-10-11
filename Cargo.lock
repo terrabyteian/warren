@@ -777,6 +777,7 @@ dependencies = [
  "warren-connector",
  "warren-control",
  "warren-core",
+ "warren-masque",
  "warren-relay",
 ]
 

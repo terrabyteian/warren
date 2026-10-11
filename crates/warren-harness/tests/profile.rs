@@ -174,7 +174,10 @@ fn profile_violations_are_rejected() {
         mutate(&mut spec);
         let creds = pki.issue_client(&spec);
         let result = verify_client_leaf(&pki, &creds.chain[0], &users_only());
-        assert!(result.is_err(), "accepted a certificate with {what}: {result:?}");
+        assert!(
+            result.is_err(),
+            "accepted a certificate with {what}: {result:?}"
+        );
     }
 }
 

@@ -290,9 +290,32 @@ impl Tunnel {
 
     /// Closes the tunnel.
     pub fn close(&self) {
-        let _ = self.shutdown.send(true);
+        self.closer().close();
+    }
+
+    /// A handle that closes the tunnel from anywhere.
+    pub fn closer(&self) -> TunnelCloser {
+        TunnelCloser {
+            inner: self.inner.clone(),
+            shutdown: self.shutdown.clone(),
+        }
+    }
+}
+
+/// Closes a tunnel, for example from another task than the one moving its
+/// packets.
+#[derive(Debug, Clone)]
+pub struct TunnelCloser {
+    inner: quinn::Connection,
+    shutdown: Arc<watch::Sender<bool>>,
+}
+
+impl TunnelCloser {
+    /// Closes the inner session and the outer path.
+    pub fn close(&self) {
         self.inner
             .close(quinn::VarInt::from_u32(0x100), b"client closed");
+        let _ = self.shutdown.send(true);
     }
 }
 
