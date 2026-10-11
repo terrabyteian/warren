@@ -122,8 +122,11 @@ a client outside the deployment. Find it before configuring anything:
 with PROXY protocol off and `trustedProxies` empty, the `source` recorded in
 the audit log for a refused relay or connector is the address the control
 plane sees; or turn PROXY protocol on at the balancer with `trustedProxies`
-still empty, and the warning the control plane logs for each connection
-names the address the balancer connects from.
+still empty, connect once from a test client, and the warning the control
+plane logs names the source address it sees for that connection. Then
+follow the bullets below: if that is the test client's own address, turn
+PROXY protocol off again; only an address that is not one of the test
+client's can be the balancer's own.
 
 - **It sees the client's real address.** The balancer keeps client
   addresses (on Kubernetes, for example, `externalTrafficPolicy: Local` with

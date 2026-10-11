@@ -790,7 +790,7 @@ pub async fn serve_tls<H: Handler>(
                     if tcp.peek(&mut first).await.ok()? == first.len() && first == PROXY_SIGNATURE {
                         crate::log::warn_with(
                             "listener",
-                            "a connection from an address not in connections.trustedProxies started with a PROXY protocol header; add the load balancer's own address to connections.trustedProxies, or turn PROXY protocol off at the load balancer",
+                            "a connection started with a PROXY protocol header from a source address not in connections.trustedProxies; list that address there only if it is the load balancer's own address, otherwise turn PROXY protocol off at the load balancer",
                             &[("source", &addr.to_string())],
                         );
                         return None;
