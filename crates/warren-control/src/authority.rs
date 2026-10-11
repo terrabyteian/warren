@@ -228,16 +228,7 @@ const ISSUING_LIFETIME: i64 = 5 * 365 * 86_400;
 /// How long before a CA expires the control plane starts warning about it.
 const CA_EXPIRY_WARNING: i64 = 90 * 86_400;
 
-fn serial() -> Result<Vec<u8>, Error> {
-    let mut serial: [u8; 16] = random_bytes().map_err(|e| Error::Internal(e.to_string()))?;
-    // Positive and non-zero, with at least 120 random bits left.
-    serial[0] = (serial[0] & 0x7f) | 0x40;
-    Ok(serial.to_vec())
-}
-
-/// A leaf in the profile both certificate kinds share: empty subject,
-/// critical digitalSignature and subject alternative name, CA:FALSE, key
-/// identifiers.
+/// A leaf in the shared profile with these extended key usages and names.
 fn leaf_spec(
     not_before: i64,
     not_after: i64,
@@ -245,21 +236,12 @@ fn leaf_spec(
     uris: Vec<String>,
     dns_names: Vec<String>,
 ) -> Result<CertSpec, Error> {
-    Ok(CertSpec {
-        serial: serial()?,
-        subject_cn: None,
-        not_before,
-        not_after,
-        ca: Some(false),
-        path_len: None,
-        key_usage: Some((0x80, true)),
-        eku: eku.iter().map(|o| o.to_vec()).collect(),
-        san_uris: uris,
-        san_dns: dns_names,
-        san_critical: true,
-        key_ids: true,
-        extra: Vec::new(),
-    })
+    let mut spec = CertSpec::leaf_valid(not_before, not_after)
+        .map_err(|_| Error::Internal("the CSPRNG failed".into()))?;
+    spec.eku = eku.iter().map(|o| o.to_vec()).collect();
+    spec.san_uris = uris;
+    spec.san_dns = dns_names;
+    Ok(spec)
 }
 
 impl Authority {
@@ -514,7 +496,7 @@ fn create_ca(
     let now = clock::now_secs();
     let spki = cert::p256_spki(key.public_key().point());
     let spec = CertSpec {
-        serial: serial()?,
+        serial: cert::random_serial().map_err(|_| Error::Internal("the CSPRNG failed".into()))?,
         subject_cn: Some(cn.into()),
         not_before: now - 3600,
         not_after: now + lifetime,

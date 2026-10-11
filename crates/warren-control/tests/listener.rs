@@ -28,11 +28,14 @@ use warren_control::web::{
 };
 use warren_control::{ControlPlane, Error, admin_request};
 use warren_core::base64::pem;
+use warren_core::join::JoinToken;
 use warren_core::keys::SigningKey;
 use warren_core::pki::oid;
 use warren_policy::names::Cidr;
 
 const PUBLIC_HOST: &str = "warren.example.test";
+/// How the configuration spells it: hosts are case-insensitive.
+const PUBLIC_HOST_AS_WRITTEN: &str = "Warren.Example.Test";
 const INTERNAL_HOST: &str = "localhost";
 
 /// A throwaway CA and a server certificate it issued for `host`.
@@ -103,7 +106,7 @@ async fn start(dir: &TempDir, idp: &RunningIdp, port: u16) -> Result<ControlPlan
     write(&dir.path().join("idp-ca.pem"), &idp.pki.ca_pem);
     let mut config = Config::parse(&format!(
         "trustDomain: example.test\n\
-         publicUrl: https://{PUBLIC_HOST}:{port}\n\
+         publicUrl: https://{PUBLIC_HOST_AS_WRITTEN}:{port}\n\
          dnsNames: [{INTERNAL_HOST}]\n\
          tls:\n  certFile: tls/cert.pem\n  keyFile: tls/key.pem\n\
          listen: 127.0.0.1:{port}\n\
@@ -206,6 +209,12 @@ async fn the_public_host_presents_the_operator_certificate() {
     let token: Value = serde_json::from_str(&body).unwrap();
     let base = format!("https://{INTERNAL_HOST}:{port}");
     assert_eq!(token["control_plane"], base);
+    let parsed = JoinToken::parse(
+        token["token"].as_str().unwrap(),
+        warren_core::clock::now_secs().unsigned_abs(),
+    )
+    .unwrap();
+    assert_eq!(parsed.cp, format!("{INTERNAL_HOST}:{port}"));
     let node = StubNode::join(&base, token["token"].as_str().unwrap())
         .await
         .unwrap();

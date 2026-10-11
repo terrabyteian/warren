@@ -96,6 +96,11 @@ struct Deployment {
 
 impl Deployment {
     async fn start(approval: &str) -> Deployment {
+        Deployment::start_at(approval, "localhost").await
+    }
+
+    /// A deployment whose publicUrl names `host`, spelled as given.
+    async fn start_at(approval: &str, host: &str) -> Deployment {
         let dir = TempDir::new("e2e");
         let idp = RunningIdp::start(IdpUser {
             sub: "00u-ada".into(),
@@ -112,7 +117,7 @@ impl Deployment {
         let port = free_port();
         let config_text = format!(
             "trustDomain: example.test\n\
-             publicUrl: https://localhost:{port}\n\
+             publicUrl: https://{host}:{port}\n\
              listen: 127.0.0.1:{port}\n\
              dataDir: {data}\n\
              policyDir: {dir}/policy\n\
@@ -130,7 +135,7 @@ impl Deployment {
             .unwrap();
         let bundle = cp.app().authority.trust_bundle();
         Deployment {
-            base: format!("https://localhost:{port}"),
+            base: format!("https://{host}:{port}"),
             dir,
             idp,
             cp,
@@ -392,6 +397,15 @@ async fn sign_in_enroll_certify_and_revoke() {
     let relay = d
         .join("relay", None, "relay-1", &["relay1.example.test"])
         .await;
+    // A name is minted once per role: a second relay-1 token is refused
+    // when minted, not when the node it was meant for tries to join.
+    let (status, taken) = d
+        .mint("relay", None, "relay-1", &["relay2.example.test"])
+        .await;
+    assert_eq!(
+        (status, taken["reason"].clone()),
+        (409, json!("name_taken"))
+    );
     let connector = d.join("connector", Some("homelab"), "lab-1", &[]).await;
     assert_eq!(
         connector.role,
@@ -937,6 +951,27 @@ async fn sign_in_asks_for_and_records_freshness() {
         .unwrap()
         .identity;
     assert_eq!(identity.auth_time, AUTH_TIME_UNKNOWN);
+    d.cp.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_case_public_url_gives_out_lowercase_addresses() {
+    let d = Deployment::start_at("automatic", "LocalHost").await;
+    let port = d.base.rsplit(':').next().unwrap().to_owned();
+    let mut client = d.client();
+    client.sign_in().await;
+    let (status, device) = client.enroll().await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(device["api_base"], format!("https://localhost:{port}/v1"));
+    let (status, minted) = d.mint("relay", None, "relay-1", &[]).await;
+    assert_eq!(status, 201, "{minted}");
+    let token = JoinToken::parse(
+        minted["token"].as_str().unwrap(),
+        clock::now_secs().unsigned_abs(),
+    )
+    .unwrap();
+    assert_eq!(token.cp, format!("localhost:{port}"));
+    assert_eq!(minted["control_plane"], format!("https://localhost:{port}"));
     d.cp.shutdown().await;
 }
 

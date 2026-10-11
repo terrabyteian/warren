@@ -371,15 +371,25 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
             let id = crate::store::new_id("jt")?;
             let secret = new_secret()?;
             let exp = clock::now_secs() + JOIN_TOKEN_LIFETIME.as_secs() as i64;
-            let internal = app.config.internal_url();
-            let authority = internal.strip_prefix("https://").unwrap_or(&internal);
+            let taken = app
+                .store
+                .nodes()
+                .await?
+                .into_iter()
+                .any(|n| n.revoked_at.is_none() && n.role == body.role && n.name == body.name);
+            if taken {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "name_taken",
+                    format!(
+                        "a {} named {} has already joined; revoke it first or choose another name",
+                        body.role, body.name
+                    ),
+                ));
+            }
             let token = JoinToken {
                 td: app.config.trust_domain.clone(),
-                cp: if authority.contains(':') {
-                    authority.to_owned()
-                } else {
-                    format!("{authority}:443")
-                },
+                cp: app.config.internal_endpoint(),
                 role: body.role.clone(),
                 group: body.group.clone(),
                 root: sha256_hex(&app.authority.root.der),
@@ -411,7 +421,7 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
                     "name": body.name,
                     "dns_names": body.dns_names,
                     "expires_at": exp,
-                    "control_plane": internal,
+                    "control_plane": app.config.internal_url(),
                 }),
             ))
         }

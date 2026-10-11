@@ -5,6 +5,8 @@
 //! mint certificates that break the profile on purpose, which is why it
 //! checks nothing itself: issuers decide what they sign.
 
+use rustls::crypto::GetRandomFailed;
+
 use crate::clock;
 use crate::der::{self, Reader, tag};
 use crate::pki::oid;
@@ -43,16 +45,15 @@ pub struct CertSpec {
     pub extra: Vec<(Vec<u8>, bool, Vec<u8>)>,
 }
 
-/// A random serial number: 16 bytes from the CSPRNG, positive, with at
-/// least 120 random bits.
-pub fn random_serial() -> Vec<u8> {
+/// A random serial number: 16 bytes from the CSPRNG, positive and
+/// non-zero, with at least 120 random bits.
+pub fn random_serial() -> Result<Vec<u8>, GetRandomFailed> {
     let mut s = [0u8; 16];
     rustls::crypto::aws_lc_rs::default_provider()
         .secure_random
-        .fill(&mut s)
-        .expect("CSPRNG");
+        .fill(&mut s)?;
     s[0] = (s[0] & 0x7f) | 0x40;
-    s.to_vec()
+    Ok(s.to_vec())
 }
 
 impl CertSpec {
@@ -60,7 +61,7 @@ impl CertSpec {
     pub fn ca(cn: &str) -> CertSpec {
         let now = clock::now_secs();
         CertSpec {
-            serial: random_serial(),
+            serial: random_serial().expect("CSPRNG"),
             subject_cn: Some(cn.into()),
             not_before: now - 3600,
             not_after: now + 10 * 365 * 86_400,
@@ -76,15 +77,22 @@ impl CertSpec {
         }
     }
 
-    /// A leaf with the given lifetime starting now (backdated a minute):
-    /// empty subject, critical digitalSignature, CA:FALSE.
+    /// A leaf with the given lifetime starting now (backdated a minute).
     pub fn leaf(lifetime_secs: i64) -> CertSpec {
         let now = clock::now_secs();
-        CertSpec {
-            serial: random_serial(),
+        CertSpec::leaf_valid(now - 60, now - 60 + lifetime_secs).expect("CSPRNG")
+    }
+
+    /// A leaf in the profile every warren leaf shares (docs/protocol.md
+    /// sections 10.2 and 10.3), valid from `not_before` to `not_after`:
+    /// empty subject, critical digitalSignature and subject alternative
+    /// name, CA:FALSE, key identifiers, and a fresh serial.
+    pub fn leaf_valid(not_before: i64, not_after: i64) -> Result<CertSpec, GetRandomFailed> {
+        Ok(CertSpec {
+            serial: random_serial()?,
             subject_cn: None,
-            not_before: now - 60,
-            not_after: now - 60 + lifetime_secs,
+            not_before,
+            not_after,
             ca: Some(false),
             path_len: None,
             key_usage: Some((0x80, true)),
@@ -94,7 +102,7 @@ impl CertSpec {
             san_critical: true,
             key_ids: true,
             extra: Vec::new(),
-        }
+        })
     }
 }
 

@@ -539,14 +539,30 @@ impl Config {
     }
 
     /// Where enrolled clients, relays and connectors reach the control
-    /// plane, always under its own certificate: `public_url`, or with an
-    /// operator certificate on its host, the same URL under the first
-    /// internal name.
+    /// plane, always under its own certificate, as `host:port`: the host of
+    /// `public_url`, or with an operator certificate on it the first
+    /// internal name, and `public_url`'s port either way. Join tokens carry
+    /// it as `cp`.
+    pub fn internal_endpoint(&self) -> String {
+        let host = match (&self.tls, self.internal_names().first()) {
+            (Some(_), Some(name)) => name.clone(),
+            _ => self.public_host.clone(),
+        };
+        let authority = self.public_url.trim_start_matches("https://");
+        let port = authority
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .unwrap_or(443);
+        format!("{host}:{port}")
+    }
+
+    /// [`Config::internal_endpoint`] as an `https://` URL.
     pub fn internal_url(&self) -> String {
-        match (&self.tls, self.internal_names().first()) {
-            (Some(_), Some(name)) => self.public_url.replacen(&self.public_host, name, 1),
-            _ => self.public_url.clone(),
-        }
+        let endpoint = self.internal_endpoint();
+        format!(
+            "https://{}",
+            endpoint.strip_suffix(":443").unwrap_or(&endpoint)
+        )
     }
 
     /// The names in `dns_names` other than `public_host`, which always get
@@ -745,7 +761,35 @@ mod tests {
         let plain = Config::parse(MINIMAL).unwrap();
         assert_eq!(plain.tls, None);
         assert_eq!(plain.internal_url(), "https://warren.example.com");
+        assert_eq!(plain.internal_endpoint(), "warren.example.com:443");
         assert!(plain.presents_own_certificate(Some("warren.example.com")));
+
+        // The host is compared and given out lowercase, whatever case the
+        // operator wrote it in; the port carries over.
+        let mixed = Config::parse(&MINIMAL.replace(
+            "https://warren.example.com",
+            "https://Warren.Example.com:8443",
+        ))
+        .unwrap();
+        assert_eq!(mixed.internal_endpoint(), "warren.example.com:8443");
+        assert_eq!(mixed.internal_url(), "https://warren.example.com:8443");
+        let mut mixed_tls = Config::parse(&format!(
+            "{}dnsNames: [nodes.warren.example.com]\n{tls}",
+            MINIMAL.replace(
+                "https://warren.example.com",
+                "https://Warren.Example.com:8443"
+            )
+        ))
+        .unwrap();
+        mixed_tls.resolve_paths(Path::new("/srv/warren"));
+        assert_eq!(
+            mixed_tls.internal_endpoint(),
+            "nodes.warren.example.com:8443"
+        );
+        assert_eq!(
+            mixed_tls.internal_url(),
+            "https://nodes.warren.example.com:8443"
+        );
 
         let e = Config::parse(&format!(
             "{MINIMAL}dnsNames: [nodes.warren.example.com]\ntls:\n  certFile: cert.pem\n"
