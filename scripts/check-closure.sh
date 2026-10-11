@@ -43,7 +43,7 @@ forbidden=$(grep -v '^[[:space:]]*#' deps/data-path-forbidden.txt | awk 'NF { pr
 # Every crate in the closure, one "name version" or "name version (path)" per line.
 closure() {
   # shellcheck disable=SC2086 # word splitting is intended for both argument lists
-  cargo tree --locked --offline -e normal,build --prefix none -f '{p}' $1 $target_args |
+  cargo tree --color never --locked --offline -e normal,build --prefix none -f '{p}' $1 $target_args |
     sed -e 's/ (\*)$//' -e 's/ (proc-macro)$//' | LC_ALL=C sort -u
 }
 
