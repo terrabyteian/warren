@@ -42,8 +42,12 @@ same document applied to a cluster.
 ## 2. Connector groups and their scope
 
 A connector group's `destinations` bound everything its apps may point at. An
-app outside its group's scope is rejected at compile time, and at run time a
-connector refuses any resolved address outside the scope (G8).
+app whose targets fall outside its group's scope is rejected at compile time,
+and at run time a connector refuses any resolved address outside the scope
+(G8). A domain is an exact name or a single leading wildcard, `*.` followed by
+a domain, which matches names with one or more labels in its place:
+`*.svc.cluster.local` matches `grafana.observability.svc.cluster.local` but
+not `svc.cluster.local` itself.
 
 ```yaml
 apiVersion: warren.dev/v1alpha1
@@ -58,15 +62,20 @@ spec:
 ```
 
 A cluster's connector group is created when the operator is installed, with a
-default scope of the cluster's own Service network and `*.svc.cluster.local`.
+default scope of the cluster's own Service network and `*.svc.cluster.local`
+(or the cluster's configured domain), which covers every Service's cluster DNS
+name, `<service>.<namespace>.svc.cluster.local`.
 Widening a scope is a deployment-admin change, never something a cluster can do
 for itself.
 
 ## 3. Apps
 
 An app is a set of destinations served by one connector group. Destinations are
-host names (exact or a single leading wildcard), IP addresses or CIDR ranges,
-each with ports and a protocol.
+host names (exact or a single leading wildcard, matching as in
+[section 2](#2-connector-groups-and-their-scope)), IP addresses or CIDR ranges,
+each with ports and a protocol. A `host` is the name clients use; an exact host
+may set a separate `target`, the name or address the connector actually
+reaches. Without one the target is the host itself.
 
 ```yaml
 apiVersion: warren.dev/v1alpha1
@@ -116,8 +125,12 @@ Field notes:
 - `protocol` is `tcp`, `udp`, `icmp` or `any`; `ports` is omitted for `icmp`
   and `any`. Omitting `ports` for `tcp` or `udp` means every port, which the
   compiler flags as a warning.
-- Host names resolve on the connector, inside the private network, and use
-  synthetic addresses on the client ([design.md](design.md#8-internal-names-and-addressing)).
+- Host names use synthetic addresses on the client; the connector resolves
+  each destination's target inside the private network
+  ([design.md](design.md#8-internal-names-and-addressing)). Targets, not
+  client-facing hosts, must lie inside the connector group's scope.
+- `clientless.upstream` is the URL the connector forwards clientless requests
+  to; its host must be one of the app's destination targets.
 - `discoverable: true` makes the app visible to users who may request it, so a
   connection attempt fails with a "request access" reason instead of a lookup
   failure.
@@ -134,18 +147,26 @@ metadata:
 spec:
   connectorGroup: prod-cluster
   kubernetes:
-    apiServer: https://kubernetes.default.svc
+    apiServer: https://kubernetes.default.svc.cluster.local
     groupPrefix: "warren:"    # IdP group "sre" is impersonated as "warren:sre"
 ```
 
-The connector impersonates the user (`Impersonate-User`) and their IdP groups
-with the prefix (`Impersonate-Group`), and refuses any user or group name in the
-`system:` namespace. Cluster RBAC then binds roles to the prefixed groups.
+The connector admits the user's API connection by policy and forwards it to
+warren's Kubernetes broker, a separate in-cluster component that alone holds
+impersonation rights. The broker impersonates the user (`Impersonate-User`)
+and their IdP groups with the prefix (`Impersonate-Group`), and refuses any
+user or group name in the `system:` namespace. Cluster RBAC then binds roles
+to the prefixed groups. Kubernetes RBAC cannot restrict impersonation to a
+prefix, so that refusal is enforced by the broker, not by the cluster, and a
+compromised broker can impersonate anyone its service account may
+([threat-model.md](threat-model.md#t13-abuse-of-kubernetes-impersonation)).
 
 ### Publishing a Service
 
 In a cluster, annotating a Service publishes it through the cluster's
-connector group. The operator turns the annotation into an `App` it owns.
+connector group. The operator turns the annotation into an `App` it owns, with
+the annotated hostname as each destination's `host` and the Service's cluster
+DNS name, here `grafana.observability.svc.cluster.local`, as its `target`.
 
 ```yaml
 apiVersion: v1
@@ -189,8 +210,12 @@ spec:
       name: corp-agent                # an integration configured on the control plane
 ```
 
-The default `minTrust` is `device-reported`. A signal that has not been
-reported within its allowed age counts as failing (G11). The optional
+The default `minTrust` is `device-reported`. A signal is **stale** once the
+posture statement carrying it has expired: a statement lasts at most
+5 minutes from the oldest observation it carries
+([protocol.md](protocol.md#14-named-parameters), `POSTURE_STATEMENT_LIFETIME`),
+and a connector accepts it for at most `CLOCK_SKEW_ALLOWANCE` beyond that on
+its own clock. A stale signal counts as failing (G11). The optional
 `remediation` text is shown to the user when the check blocks them.
 
 ## 5. Access policies
@@ -325,6 +350,7 @@ The compiler generates a Cedar schema for each policy set. Its core is:
 namespace Warren {
   entity Group;
   entity User in [Group] { email: String };
+  entity AutoApprover;                      // warren's built-in automatic approver
   entity AppLabel;                          // one entity per "key=value" label
   entity App in [AppLabel] { connectorGroup: String };
 
@@ -353,7 +379,7 @@ namespace Warren {
   action connect appliesTo { principal: [User], resource: [App], context: Context };
   action request appliesTo { principal: [User], resource: [App], context: Context };
   action approve appliesTo {
-    principal: [User],
+    principal: [User, AutoApprover],
     resource: [App],
     context: { requester: User, request: Context },
   };
@@ -365,8 +391,9 @@ mode with the Cedar 4.13 CLI.
 
 The enforcement point builds the request: the principal and groups from the
 signed entity snapshot, the device and its signals from the latest verified
-posture statement (dropping any signal past its allowed age, so a stale signal
-is simply absent and every check on it fails), authentication facts from the
+posture statement (dropping every signal once that statement is stale, as
+defined in [section 4](#4-posture-profiles), so a stale signal is simply
+absent and every check on it fails), authentication facts from the
 certificate, and grants from the snapshot filtered by expiry on the local
 clock.
 
@@ -441,7 +468,7 @@ context.time.europe_berlin >= 1920 && context.time.europe_berlin < 2580
 ### 8.3 Just-in-time access
 
 `prod-db-break-glass` from [section 6](#6-just-in-time-access) compiles to three
-policies:
+policies, plus one for automatic approval:
 
 ```cedar
 @id("prod-db-break-glass/request")
@@ -477,7 +504,23 @@ when {
 ```
 
 Automatic approval compiles to an `approve` policy whose principal is warren's
-built-in automatic approver, conditioned on the `automatic.when` clause.
+built-in automatic approver, conditioned on the `automatic.when` clause as
+evaluated for the request:
+
+```cedar
+@id("prod-db-break-glass/approve-automatic")
+permit (
+  principal == Warren::AutoApprover::"automatic",
+  action == Warren::Action::"approve",
+  resource == Warren::App::"prod-db"
+)
+when {
+  // minutes since Sunday 00:00 UTC: Monday 06:00 to 18:00, then one such
+  // range per listed day
+  context.request.time.utcMinuteOfWeek >= 1800 &&
+  context.request.time.utcMinuteOfWeek < 2520
+};
+```
 
 ### 8.4 Validation
 

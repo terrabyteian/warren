@@ -110,17 +110,17 @@ tunable is a named parameter in [protocol.md](protocol.md#14-named-parameters).
 | **G2** User and device | Every tunneled connection is bound to exactly one authenticated user and one approved device. Clientless sessions are bound to a user only and exist only for apps that opt in. |
 | **G3** Hardware-bound device keys | A device's private key is generated in and never leaves its hardware key store (the Secure Enclave on macOS). A certificate is useless without the device that holds the key. |
 | **G4** Short-lived credentials | Client certificates live at most 4 hours and renew at half-life. Renewal re-checks the user, the device, the session, and baseline posture. |
-| **G5** End-to-end encryption | Application traffic is encrypted from client to connector inside a mutually authenticated session. Relays forward only ciphertext and cannot impersonate either end. |
+| **G5** End-to-end encryption | Tunneled application traffic is encrypted from client to connector inside a mutually authenticated session. Relays forward only its ciphertext and cannot impersonate either end. Clientless traffic is the stated exception: the relay sees it in clear, but cannot mint or extend a user's identity (section 6). |
 | **G6** Outbound only | Clients and connectors only dial out. A connector needs no inbound port on the network it serves. |
 | **G7** Enforcement at the connector | The connector admits every new flow against policy. The client is never trusted to enforce anything; its local checks exist only to explain blocks faster. |
 | **G8** Scoped reach, no open proxy | A connector reaches only destinations declared for it, a relay forwards only to connectors attached to it, and neither will carry traffic anywhere else. |
 | **G9** Revocation in 10 seconds | Disabling a user or device, revoking a session, expiring or revoking a JIT grant, and changing policy cut every live connection that is no longer allowed within 10 seconds while connectors and relays are connected to the control plane. This is a tested promise. |
 | **G10** Fail closed | During a control-plane outage nobody gains access, connectors keep enforcing the last policy they verified, and all access decays to zero within one certificate lifetime. |
-| **G11** Continuous posture | Device posture is re-checked at least every 5 minutes. A stale signal counts as failing. A failing check cuts only the apps whose rules require it. Every signal carries a trust class. |
+| **G11** Continuous posture | Device posture is re-checked at least every 5 minutes, and connectors enforce that bound themselves: a posture statement lasts at most 5 minutes, plus the clock-skew allowance. A stale signal counts as failing. A failing check cuts only the apps whose rules require it. Every signal carries a trust class. |
 | **G12** Explained blocks | Every denial produces a specific, human-readable reason for the user and the matching rule and condition for the admin. Nothing fails as a silent timeout. |
 | **G13** Complete audit | Every access decision, allow or deny, and every flow produces a structured audit record. |
 | **G14** Split tunnel, no interception | Only traffic for internal apps enters the tunnel. warren does not decrypt or inspect application content. |
-| **G15** Kubernetes identity | Kubernetes API access impersonates the user and their IdP groups, never a built-in system identity, and leaves no long-lived secret in kubeconfig. |
+| **G15** Kubernetes identity | Kubernetes API access impersonates the user and their IdP groups, never a built-in system identity, and leaves no long-lived secret in kubeconfig. Only a dedicated broker holds impersonation rights; connectors hold none. |
 | **G16** Standard, audited crypto | TLS 1.3 only, through rustls on aws-lc-rs. No hand-rolled cryptography. |
 | **G17** Small, audited supply chain | Direct dependencies come from an explicit allowlist; every crate is pinned, vendored, and vetted; data-path builds never link console, operator or Kubernetes crates. |
 | **G18** Self-hosted | warren depends on no vendor-operated service and can run air-gapped. |
@@ -136,7 +136,7 @@ tunable is a named parameter in [protocol.md](protocol.md#14-named-parameters).
 | **Relay** | Stateless rendezvous that clients and connectors both dial out to. Splices client sessions to connector sessions and forwards ciphertext. Also hosts clientless HTTP(S) access. | `warren relay`, anywhere reachable on 443. |
 | **Connector** | Terminates end-to-end sessions from clients, admits each flow against policy, resolves internal names, and forwards traffic to private destinations. | `warren connector`, standalone or in-cluster via the operator. |
 | **Client** | Native shell (Swift on macOS) around the shared Rust core: sign-in, device key, posture, DNS, and the packet tunnel. | macOS menu-bar app with a NetworkExtension system extension. |
-| **Operator** | Kubernetes operator: runs connector replicas, publishes annotated Services and app CRDs, syncs policy CRDs to the control plane. | Its own binary, in each cluster. |
+| **Operator** | Kubernetes operator: runs connector replicas and the Kubernetes broker, publishes annotated Services and app CRDs, syncs policy CRDs to the control plane. | Its own binary, in each cluster. |
 
 The control plane, relay and connector are one binary, `warren`, with one
 role per subcommand. Each role is a build feature, so a data-path build (relay
@@ -194,15 +194,16 @@ a separate binary so the Kubernetes client libraries never enter the data path
   the inherent scope of device-level access.
 - **Relays** are trusted for availability and for coarse admission (only valid
   certificates get through), never for confidentiality or integrity of
-  application traffic.
+  tunneled application traffic. For clientless apps the relay terminates TLS,
+  so it is trusted with that content, but never with identity (section 6).
 - **Connectors** are trusted for the apps they serve. A connector is the
   policy enforcement point and the place where traffic leaves the tunnel, so it
   sees plaintext for its own apps and nothing else.
 - **The control plane** is the root of trust: it issues every identity and
   signs every policy. It never sees application traffic.
 - **The IdP** is trusted to authenticate users and assert group membership.
-- **The Kubernetes API server** trusts the in-cluster connector to impersonate
-  users, within the limits in [section 9](#9-kubernetes).
+- **The Kubernetes API server** trusts warren's Kubernetes broker to
+  impersonate users, within the limits in [section 9](#9-kubernetes).
 
 [threat-model.md](threat-model.md) walks each boundary.
 
@@ -237,12 +238,17 @@ The client is where warren is felt, so its behavior is part of the design.
   provider in a NetworkExtension system extension.
 
 **Clientless access** is a secondary, lower-assurance tier for HTTP(S) apps
-that opt in: the relay acts as an identity-aware proxy, signs the user in
-through the IdP, and forwards requests to the connector with a signed identity
-header. There is no device identity and the relay sees the traffic in clear,
-which is why it is opt-in per app and why device-posture conditions can never
-be satisfied by a clientless session. Non-web clientless access (SSH, RDP, VNC
-in the browser) comes later.
+that opt in: the relay is the HTTPS front end and proxies requests to the
+connector. The user signs in through the control plane, which issues a
+short-lived signed session assertion naming the user, the app and an expiry,
+bound to the sign-in session. Before forwarding any request, the connector
+verifies that assertion against the control plane's key, strips any identity
+header the request carries, and passes the verified assertion to the app as
+its identity header. A relay can neither mint nor extend an identity, and
+revoking the session cuts it (G9). There is no device identity and the relay
+sees the traffic in clear, which is why clientless is opt-in per app and why
+device-posture conditions can never be satisfied by a clientless session.
+Non-web clientless access (SSH, RDP, VNC in the browser) comes later.
 
 ## 7. Identity, devices and policy
 
@@ -295,9 +301,10 @@ in the browser) comes later.
   security agent API), or *hardware-attested* (backed by a hardware attestation
   chain). Rules can require a minimum class per check.
 - Posture is re-checked at least every 5 minutes and whenever the client sees
-  a relevant change. The control plane turns each report into a short-lived
-  signed posture statement that connectors verify; a signal older than its
-  allowed age counts as failing (G11).
+  a relevant change. The control plane turns each report into a signed posture
+  statement that lasts at most 5 minutes; connectors verify it and treat every
+  signal in an expired statement as failing (G11), so the bound holds at the
+  connector even if the client stops reporting.
 - A failing check cuts only the apps whose rules require it, and the user sees
   which check failed and how to fix it.
 
@@ -341,8 +348,9 @@ in the browser) comes later.
 - **Synthetic addresses for names.** FQDN and wildcard apps resolve to
   synthetic IPs from a private pool. The client answers DNS for the names the
   user is entitled to and tells the connector which name each synthetic address
-  stands for; the connector resolves the real name inside the private network
-  and translates addresses (NAT). No internal DNS data is exposed to the client
+  stands for; the connector resolves that name's target (the name itself unless
+  the app sets a separate one) inside the private network and translates
+  addresses (NAT). No internal DNS data is exposed to the client
   beyond the user's own entitlements.
 - **CIDR and IP apps keep real addresses** and are routed as-is.
 - **Split DNS.** On macOS the client claims only the internal DNS suffixes in
@@ -369,14 +377,22 @@ in the browser) comes later.
   cluster. The operator syncs them to the control plane and marks them as owned
   by the cluster (G19).
 - **Identity-brokered `kubectl`.** A cluster can be published as a Kubernetes
-  API app. The in-cluster connector terminates the user's API connection,
-  admits it by policy, and forwards it to the API server impersonating the
-  user and their IdP groups, so cluster RBAC maps directly to IdP groups and the
-  API server's audit log shows the real user. Impersonated groups carry a
-  configurable prefix and warren never impersonates built-in system users or
-  groups (G15). The generated kubeconfig contains no secret, only an exec
-  credential plugin that obtains short-lived, session-bound credentials from
-  the local client.
+  API app. The connector admits the user's API connection by policy like any
+  other flow and forwards it to the **Kubernetes broker**, a separate component
+  the operator runs as its own Deployment with its own service account. The
+  broker terminates the connection, verifies the user's short-lived,
+  session-bound credential, and forwards each request to the API server
+  impersonating the user and their IdP groups, so cluster RBAC maps directly to
+  IdP groups and the API server's audit log shows the real user. Only the
+  broker's service account holds impersonation rights; connector pods hold
+  none (G15). Impersonated groups carry a configurable prefix and the broker
+  refuses any built-in system user or group. Kubernetes RBAC cannot restrict
+  impersonation to a name prefix, so that refusal is a check in the broker, not
+  in the cluster: the broker's service account can impersonate anyone,
+  potentially a cluster administrator. Where the cluster supports constrained
+  impersonation, the broker's grant uses it to narrow what impersonated
+  requests may do. The generated kubeconfig contains no secret, only an exec
+  credential plugin that obtains those credentials from the local client.
 - **The control plane** runs on Kubernetes as a Deployment with PostgreSQL, or
   anywhere as one binary.
 - **v1.x: workload access.** Pods reach warren apps elsewhere by presenting
@@ -388,9 +404,9 @@ in the browser) comes later.
 - **Anything reachable.** A connector, in-cluster or standalone, can expose
   FQDNs, wildcard domains, IPs and CIDR ranges, each scoped by port and
   protocol.
-- **Declared scope.** Each connector group has a destination scope; an app can
-  only point at destinations inside its connector group's scope, and resolved
-  addresses for names must also fall inside it (G8).
+- **Declared scope.** Each connector group has a destination scope; an app's
+  targets must lie inside its connector group's scope, and resolved addresses
+  for names must also fall inside it (G8).
 - **Forwarding modes.** Kernel mode (TUN plus NAT, needing `NET_ADMIN`) comes
   first. A userspace TCP/IP mode for unprivileged pods follows, and becomes the
   Kubernetes default only after it passes a conformance and performance suite.
@@ -431,12 +447,10 @@ expiry.
   every revocation they have received.
 - Nobody gains access: no certificate, device approval, grant or policy change
   can be issued without the control plane.
-- Access decays: posture-gated access ends when posture statements expire, JIT
-  grants end on time, and all access ends within one certificate lifetime
-  (at most 4 hours).
+- Access decays: posture-gated access ends when posture statements expire
+  (within 5 minutes plus the clock-skew allowance), JIT grants end on time, and
+  all access ends within one certificate lifetime (at most 4 hours).
 - Clients show that the control plane is unreachable and when access will end.
-- Operators who prefer it can set connectors to fail closed sooner after a
-  bounded partition.
 
 **Other failures.** Losing a relay moves clients to another relay without
 breaking inner sessions. Losing a connector replica resets the flows that ran

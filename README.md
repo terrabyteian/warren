@@ -30,9 +30,9 @@ through outbound-only connectors and self-hosted relays.
 Clients and connectors both dial out to relays. The client opens an end-to-end,
 mutually authenticated QUIC session to the connector through the relay
 (CONNECT-UDP), and tunnels IP packets inside it (CONNECT-IP). The relay only
-ever sees ciphertext; the connector checks policy on every new flow; the
-control plane issues short-lived certificates bound to each device's Secure
-Enclave key and pushes revocations. See [docs/design.md](docs/design.md).
+ever sees the tunnel's ciphertext; the connector checks policy on every new
+flow; the control plane issues short-lived certificates bound to each device's
+Secure Enclave key and pushes revocations. See [docs/design.md](docs/design.md).
 
 ## Documentation
 

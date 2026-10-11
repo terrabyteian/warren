@@ -133,8 +133,11 @@ Applies to links A to E.
   working group's bound-UDP extension (draft-ietf-masque-connect-udp-listen).
   warren pins one draft revision (`BIND_DRAFT_REVISION`) until an RFC exists.
   Bind mode lets one request stream carry datagrams from many peers; the relay
-  assigns each peer a context ID and announces the peer's address with the
-  extension's capsules.
+  assigns each peer its own compressed context ID and announces the peer's
+  address with the extension's capsules. Context IDs on a bind stream stay
+  within the MTU budget's bound ([section 9](#9-mtu-budget)), and the
+  extension's uncompressed context, which carries the peer address in every
+  datagram, MUST NOT be used.
 - Peers are virtual: each spliced client stream appears to the connector as a
   distinct peer address that the relay allocates from a private range
   (`RELAY_PEER_PREFIX`). The connector's inner QUIC endpoint uses these
@@ -231,8 +234,10 @@ Invariants:
   usually completes before the application's first packet; until it does, the
   client holds that destination's packets (`FIRST_PACKET_HOLD`, bounded by
   `FIRST_PACKET_QUEUE`).
-- The connector resolves the name with its own resolver when a flow starts,
-  MUST check that every address used is inside its group's destination scope,
+- The connector resolves the name's target (the name itself unless the app
+  sets a separate target, [policy.md](policy.md#3-apps)) with its own resolver
+  when a flow starts, MUST check that every address used is inside its group's
+  destination scope,
   and translates the synthetic destination to the resolved one. A flow keeps
   its resolved address for its lifetime; new flows resolve afresh within the
   record's TTL.
@@ -303,27 +308,40 @@ Terms:
 - *Outer PMTU*: the path MTU between an endpoint and the relay, discovered by
   DPLPMTUD on the outer QUIC connection.
 - *Per-layer overhead*: QUIC short header (1 byte + destination connection ID +
-  packet number), AEAD tag (16), DATAGRAM frame type and optional length,
-  Quarter Stream ID (varint), Context ID (varint). With an 8-byte connection ID,
-  2-byte packet numbers and 2-byte stream IDs this is about 31 bytes.
+  packet number), AEAD tag (16), DATAGRAM frame type (1; a full-size datagram
+  is the packet's last frame and carries no length), Quarter Stream ID
+  (varint), Context ID (varint).
+  - Outer layer (links A and B): connection IDs of at most 4 bytes, 2-byte
+    packet numbers and 2-byte quarter stream IDs. The context ID is 1 byte on
+    link A (always 0) and at most 2 bytes on link B (one per virtual peer), so
+    the outer overhead is at most 27 bytes on link A and 28 bytes on link B.
+  - Inner layer (link C): with 8-byte connection IDs, 2-byte packet numbers,
+    2-byte quarter stream IDs and context ID 0, about 31 bytes.
 - *Tunnel MTU*: the largest IP packet the client's tunnel interface accepts.
 
-Approximate budget for one direction, both hops on the same PMTU:
+Budget for one direction, both hops on the same PMTU, using the larger link B
+overhead:
 
 | Outer path | Outer PMTU | IP + UDP | Outer QUIC | Inner QUIC | Largest inner IP packet |
 | --- | --- | --- | --- | --- | --- |
-| IPv4 Ethernet | 1500 | 28 | ~31 | ~31 | ~1410 |
-| IPv6 Ethernet | 1500 | 48 | ~31 | ~31 | ~1390 |
-| IPv6 minimum | 1280 | 48 | ~31 | ~31 | ~1170: below the floor |
+| IPv4 Ethernet | 1500 | 28 | 28 | ~31 | ~1413 |
+| IPv6 Ethernet | 1500 | 48 | 28 | ~31 | ~1393 |
+| IPv6 minimum | 1280 | 48 | 28 | ~31 | ~1173: below the floor |
 
 Requirements:
 
 - **The floor (fixed).** The tunnel MTU is never below 1280 bytes, the IPv6
   minimum that RFC 9484 requires CONNECT-IP to carry.
 - **Inner QUIC must run on any IPv6-capable path.** On a 1280-byte outer path
-  the outer layer can carry about 1201 bytes of UDP payload, enough for the
-  inner session's 1200-byte minimum. Implementations MUST keep outer overhead
-  within that budget (short connection IDs on relays, compact varints).
+  the outer layer carries 1232 bytes of UDP payload, less at most 28 bytes of
+  outer overhead: at least 1204 bytes, 4 bytes above the inner session's
+  1200-byte minimum on link B and 5 bytes above it on link A. Implementations
+  MUST keep outer overhead within that budget: on links A and B, connection
+  IDs of at most 4 bytes in both directions and quarter stream IDs below
+  16,384 (an endpoint opens a new outer connection rather than exceed them);
+  on link B, compressed context IDs below 16,384 (2-byte varints). A relay
+  that has no free context ID on a replica's bind stream refuses new splices
+  to that replica as it does at `RELAY_LIMITS`.
 - **No silent drops of conforming packets.** When an IP packet that fits the
   tunnel MTU does not fit an inner DATAGRAM frame on the current path, the
   sender MUST carry it in a DATAGRAM capsule on the CONNECT-IP stream instead
@@ -418,10 +436,14 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
    `POSTURE_RECHECK_INTERVAL` (fixed bound: 5 minutes) and on change. The
    control plane returns a posture statement: a compact object signed by the
    posture-signing key naming the device, each signal with its trust class and
-   observation time, and an expiry at most
-   `POSTURE_STATEMENT_LIFETIME` ahead. The client forwards each new statement to
-   its connectors in a `WARREN_POSTURE` capsule. Connectors drop expired
-   statements, so stale posture fails closed (G11).
+   observation time, and an expiry at most `POSTURE_STATEMENT_LIFETIME`
+   (fixed bound: 5 minutes) after the oldest observation it carries, on the
+   control plane's clock. The client forwards each new statement to its
+   connectors in a `WARREN_POSTURE` capsule and reports early enough that a
+   fresh statement arrives before the current one expires. Connectors accept a
+   statement until its expiry plus at most `CLOCK_SKEW_ALLOWANCE` on their own
+   clock and then drop it, so stale posture fails closed at the connector even
+   if the client stops reporting (G11).
 6. **Entitlements.** Apps the user may reach or request, with names, ranges,
    ports, connector groups and the relay list. Nothing in it is secret.
 7. **Notices.** A server-to-client stream of user-facing events (re-auth
@@ -434,10 +456,10 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
 - **Policy bundles.** The control plane publishes a signed, versioned bundle:
   the compiled Cedar policy set and schema, the entity snapshot (users, groups,
   devices, apps, connector scopes, active JIT grants with expiries), the current
-  revocation state, and the posture-signing public key. Bundle versions only
-  increase; a node MUST reject a bundle older than its current one, MUST verify
-  the signature before use, and MUST persist the last verified bundle so it can
-  restart during an outage (G10).
+  revocation state, and the posture-signing and session-assertion-signing
+  public keys. Bundle versions only increase; a node MUST reject a bundle older
+  than its current one, MUST verify the signature before use, and MUST persist
+  the last verified bundle so it can restart during an outage (G10).
 - **Event stream:** [section 12](#12-revocation-push-channel).
 - **Health and audit.** Nodes report health and metrics and export audit
   records to the control plane and any configured sinks.
@@ -475,9 +497,7 @@ Requirements, which together implement G9 and G10:
 8. **Unknown events** are logged and trigger a bundle refresh; they are never
    silently ignored.
 9. **Partition.** While a node's stream is broken it keeps enforcing its last
-   verified bundle and revocation state (G10). If
-   `PARTITION_FAIL_CLOSED_AFTER` is set, a node that stays partitioned that long
-   stops admitting new flows.
+   verified bundle and revocation state (G10).
 10. **Who acts.** Relays act on events about identities (user, device, session,
     certificate) and infrastructure nodes, closing outer connections. Connectors
     act on all events, closing inner sessions and tearing down flows, and send
@@ -510,13 +530,13 @@ defaults are initial and may change with measurement.
 | `CLIENT_CERT_RENEW_AT` | 0.5 (fixed) | Fraction of lifetime at which renewal starts |
 | `REVOCATION_DEADLINE` | 10 s (fixed) | Commit to last connection cut |
 | `POSTURE_RECHECK_INTERVAL` | at most 5 min (fixed bound) | Maximum time between posture reports |
+| `POSTURE_STATEMENT_LIFETIME` | at most 5 min (fixed bound) | Validity of a signed posture statement, from its oldest observation |
 | `TUNNEL_MTU` floor | 1280 (fixed) | RFC 9484 minimum |
 | `REVOCATION_APPLY_BUDGET` | 1 s | Node-side time to apply a revocation |
 | `EVENT_HEARTBEAT_INTERVAL` | 2 s | Event-stream heartbeat |
 | `EVENT_STALE_AFTER` | 3 heartbeats | Silence before a node reconnects |
-| `PARTITION_FAIL_CLOSED_AFTER` | unset | Optional partition limit before refusing new flows |
-| `POSTURE_STATEMENT_LIFETIME` | 10 min | Validity of a signed posture statement |
-| `CLOCK_SKEW_ALLOWANCE` | 2 min | `notBefore` backdating and validity slack |
+| `CLOCK_SKEW_ALLOWANCE` | 2 min | `notBefore` backdating and validity slack, including posture statements |
+| `CLIENTLESS_ASSERTION_LIFETIME` | 5 min | Validity of a control-plane-signed clientless session assertion |
 | `INFRA_CERT_LIFETIME` | 24 h | Relay, connector and control-plane certificates |
 | `INFRA_KEY_ALG` | ECDSA P-256 | Infrastructure key algorithm |
 | `JOIN_TOKEN_LIFETIME` | 1 h, single use | Node bootstrap token |

@@ -25,12 +25,12 @@ features it relies on.
 | --- | --- |
 | Private applications and their data | What warren exists to protect. |
 | Deployment root and issuing CA keys | Mint any identity; full compromise if stolen. |
-| Policy-signing and posture-signing keys | Forge policy bundles or posture statements. |
+| Policy-signing, posture-signing and session-assertion-signing keys | Forge policy bundles, posture statements or clientless identities. |
 | Device private keys | Act as a device; bound to hardware (G3). |
 | Client certificates and sessions | Act as a user on a device, for at most 4 hours (G4). |
 | Policy, entity data, grants | Decide who reaches what. |
 | Audit records | Detection, investigation, compliance. |
-| Connector service-account credentials in Kubernetes | Can impersonate users toward the API server (G15). |
+| Kubernetes broker service-account credentials | Can impersonate any user or group toward the API server, potentially a cluster administrator; RBAC cannot limit impersonation to a name prefix (G15, T13). |
 | Join tokens | Enroll a relay or connector. |
 | Control-plane database | Users, devices, sessions, grants, configuration, audit. |
 | Availability of relays and connectors | Access to everything depends on it. |
@@ -65,7 +65,7 @@ features it relies on.
 | TB7 | Nodes and clients to the control plane | HTTPS, mutual TLS after enrollment; signed bundles. |
 | TB8 | Control plane to the IdP | OIDC, SCIM, shared signals. |
 | TB9 | Admins to the control plane | Console, API, CLI, Git, CRDs. |
-| TB10 | Connector to the Kubernetes API server | Impersonation with the connector's service account. |
+| TB10 | Kubernetes broker to the API server | Impersonation with the broker's service account. |
 | TB11 | Source and dependencies to binaries | Build and CI pipeline. |
 
 ## 5. Threats and mitigations
@@ -75,17 +75,25 @@ features it relies on.
 A relay operator, or an attacker who owns a relay host, tries to read or alter
 traffic, impersonate a party, or reach private networks.
 
-- **Cannot read or alter application traffic.** The inner session is
+- **Cannot read or alter tunneled application traffic.** The inner session is
   end-to-end QUIC between client and connector; the relay forwards ciphertext
   (G5, G16).
-- **Cannot impersonate a connector or a client.** The client verifies that the
-  inner session's certificate names a connector in the expected group, issued
-  by the infrastructure CA; the connector verifies the client's certificate
-  itself. Neither relies on the relay's checks. The relay holds no client or
+- **Can read and alter clientless HTTP(S) traffic** it proxies, because it
+  terminates TLS for those apps; that is the cost of the lower-assurance
+  clientless tier (T14). It cannot mint or extend a clientless identity: the
+  connector admits a clientless request only with a control-plane-signed
+  session assertion naming the user, the app and an expiry. Within a live
+  clientless session it carries, it can send requests as that user to that app
+  until the assertion expires or the session is revoked.
+- **Cannot impersonate a connector or a tunnel client.** The client verifies
+  that the inner session's certificate names a connector in the expected group,
+  issued by the infrastructure CA; the connector verifies the client's
+  certificate itself. Neither relies on the relay's checks. The relay holds no client or
   connector keys (G2, G3, G5).
 - **Cannot reach private networks.** A relay can only forward to attached
-  connectors, and connectors admit only authenticated inner sessions; there is
-  no relay egress (G6, G8).
+  connectors, and connectors admit only authenticated inner sessions or
+  clientless requests with a valid session assertion; there is no relay egress
+  (G6, G8).
 - **Can see metadata:** which user and device talk to which connector group,
   when, and how much; the client's public address. **Can deny service** by
   dropping or delaying traffic. Mitigations: clients move to another relay;
@@ -95,8 +103,9 @@ traffic, impersonate a party, or reach private networks.
   with `network` conditions. Policy labels that signal relay-observed and the
   docs advise never using it alone ([policy.md](policy.md#5-access-policies)).
 
-Residual risk: metadata exposure to relay operators and loss of availability.
-Run relays you control.
+Residual risk: metadata exposure to relay operators, loss of availability, and
+exposure of clientless content and live clientless sessions. Run relays you
+control.
 
 ### T2. Stolen device
 
@@ -141,7 +150,8 @@ revocation is re-checked on resumption ([protocol.md](protocol.md#3-common-tls-a
 inherent: it is where traffic leaves the tunnel. It cannot mint identities,
 cannot reach other connector groups' apps through warren, and cannot forge
 policy (bundles are signed by the control plane). It could under-enforce its
-own apps or lie in its own audit. Mitigations: small connector groups with
+own apps or lie in its own audit. It holds no Kubernetes impersonation rights;
+only the Kubernetes broker does (T13). Mitigations: small connector groups with
 tight scopes (blast radius), short-lived infrastructure certificates and node
 revocation (G9), audit cross-checks between relay-side and connector-side
 records, and connectors as hardened, minimal data-path builds (G17).
@@ -259,35 +269,51 @@ Residual risk: a fully compromised device acts as its user until detected.
 Join tokens are single-use, short-lived and scoped to one role and one
 connector group. A node's identity is an infrastructure certificate the admin
 can see and revoke (G9). A rogue relay gains only what T1 describes. A rogue
-connector in a group could receive that group's sessions; deployments can
-require admin approval of new connectors, and every attachment is audited
-(G13).
+connector in a group could receive that group's sessions until it is noticed
+and revoked; every attachment is audited (G13). Admin approval of new
+connectors is a possible later option if join tokens alone prove
+insufficient.
 
 ### T13. Abuse of Kubernetes impersonation
 
-The in-cluster connector's service account can impersonate users and groups,
-which makes it a high-value credential.
+Kubernetes RBAC can limit `impersonate` only to exact names, never to a
+prefix, so a component that impersonates arbitrary IdP users and prefixed
+groups needs unrestricted impersonation, which includes `system:masters`.
+warren therefore confines that power to one component, the Kubernetes broker.
 
-- warren impersonates only the authenticated user and their prefixed IdP
-  groups and refuses any `system:` user or group, so it can never act as
-  `system:masters` or a node (G15).
-- The service account lives in the operator's namespace, is not mounted
-  anywhere else, and its RBAC allows impersonation and nothing more.
+- Only the broker's service account holds impersonation rights. Connector
+  pods, including in-cluster connectors, hold none, so compromising a
+  connector (T4) does not yield impersonation.
+- The broker verifies the user's short-lived, session-bound credential itself,
+  impersonates only that user and their prefixed IdP groups, and refuses any
+  `system:` user or group (G15). That refusal is a software check in the
+  broker, not a limit the API server enforces.
+- **A compromised broker is equivalent to its impersonation power**, which is
+  potentially cluster-admin. Mitigations: the broker is small, runs as its own
+  Deployment in the operator's namespace with its service account mounted
+  nowhere else, its RBAC allows impersonation and nothing more, and where the
+  cluster supports constrained impersonation its grant uses it to narrow what
+  impersonated requests may do.
 - A cluster insider who edits warren CRDs can only publish apps and write
   policies within that cluster's delegation scope ([policy.md](policy.md#7-ownership-and-delegation)),
   and cannot widen the connector group's destination scope.
-- The API server's own audit log records the impersonated user and warren's
-  service account, alongside warren's decision record (G13).
+- The API server's own audit log records the impersonated user and the
+  broker's service account, alongside warren's decision record (G13).
 
 ### T14. Clientless tier
 
-The relay terminates TLS for clientless apps, so it sees that traffic in clear;
-there is no device identity; browser sessions can be stolen through the
-browser. Mitigations: clientless is opt-in per app; rules must name `browser`
-explicitly and can never satisfy posture conditions (G2); session cookies are
-host-only, `Secure`, `HttpOnly`, short-lived and bound to the IdP session;
-warren strips any incoming identity header and sets its own signed header,
-which apps verify against the control plane's published keys.
+The relay terminates TLS for clientless apps, so it can read and alter that
+traffic; there is no device identity; browser sessions can be stolen through
+the browser. Identity does not depend on the relay: after browser sign-in the
+control plane issues a short-lived session assertion (user, app, expiry, bound
+to the sign-in session), and the connector verifies it against the control
+plane's key before forwarding each request, so a relay cannot mint or extend
+an identity, and revoking the session cuts it (G9). Mitigations: clientless is
+opt-in per app; rules must name `browser` explicitly and can never satisfy
+posture conditions (G2); session cookies are host-only, `Secure`, `HttpOnly`,
+short-lived and bound to the IdP session; the connector strips any incoming
+identity header and passes the verified assertion to the app as its identity
+header, which apps verify against the control plane's published keys.
 
 ### T15. Denial of service
 
@@ -316,11 +342,16 @@ the connector, so one wrong clock cannot extend access past the other's view
 ## 6. Accepted risks
 
 - Relays see connection metadata (T1).
+- Clientless sessions are lower assurance by design: they carry no device
+  identity, and a compromised relay can read and alter the clientless HTTP(S)
+  traffic it proxies and act within the live clientless sessions it carries
+  until their assertions expire (T1, T14).
 - A compromised connector exposes the apps behind it (T4).
+- A compromised Kubernetes broker can act as anyone its service account may
+  impersonate, potentially a cluster administrator (T13).
 - A compromised control plane is a full compromise until detected (T5).
 - Device-level access means any process on an enrolled, unlocked device can
   use the user's access (T2, T10).
-- Clientless sessions are lower assurance by design (T14).
 - An IdP without shared signals or SCIM leaves a lag bounded by the
   certificate lifetime until polling arrives in v1.x (T6).
 
@@ -330,9 +361,9 @@ the connector, so one wrong clock cannot extend access past the other's view
 | --- | --- |
 | Choose the hardware attestation path for Mac device keys and its trust class | M1 |
 | Specify posture-statement and policy-bundle encodings and their signature formats | M1 |
+| Specify the clientless session-assertion format and its signature | M3 |
 | Revocation-deadline integration test and published latency metric | M2 |
 | Per-IdP revocation latency documentation | M2 |
-| Admin approval for new connectors as a deployment option | M2 |
 | Off-box audit streaming verified end to end | M3 |
 | Release signing, provenance and reproducible-build checks | M4 |
 | External security audit of the design and implementation | M4 |
