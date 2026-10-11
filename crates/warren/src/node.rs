@@ -160,42 +160,64 @@ pub enum Signal {
     Stop,
 }
 
-/// The signals a node listens for, registered once at start.
+/// The signals a node listens for, each registered once.
 pub struct Signals {
     #[cfg(unix)]
     hup: tokio::signal::unix::Signal,
     #[cfg(unix)]
-    term: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    int: tokio::signal::unix::Signal,
+    stop: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
 }
 
 impl Signals {
-    /// Registers the signal handlers on `runtime`.
+    /// Registers SIGHUP on `runtime`, so a reload signal during setup cannot
+    /// kill the process; SIGTERM and SIGINT keep their default action until
+    /// [`Signals::listen_for_stop`].
     pub fn new(runtime: &tokio::runtime::Runtime) -> Result<Self, String> {
         let _guard = runtime.enter();
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
-            let listen = |kind| signal(kind).map_err(|e| format!("signals: {e}"));
             Ok(Self {
-                hup: listen(SignalKind::hangup())?,
-                term: listen(SignalKind::terminate())?,
-                int: listen(SignalKind::interrupt())?,
+                hup: signal(SignalKind::hangup()).map_err(|e| format!("signals: {e}"))?,
+                stop: None,
             })
         }
         #[cfg(not(unix))]
         Ok(Self {})
     }
 
+    /// Registers SIGTERM and SIGINT on `runtime`, once setup is done and the
+    /// node can stop cleanly.
+    pub fn listen_for_stop(&mut self, runtime: &tokio::runtime::Runtime) -> Result<(), String> {
+        let _guard = runtime.enter();
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let listen = |kind| signal(kind).map_err(|e| format!("signals: {e}"));
+            self.stop = Some((
+                listen(SignalKind::terminate())?,
+                listen(SignalKind::interrupt())?,
+            ));
+        }
+        Ok(())
+    }
+
     /// Waits for the next signal.
     pub async fn next(&mut self) -> Signal {
         #[cfg(unix)]
         {
+            let Self { hup, stop } = self;
             tokio::select! {
-                _ = self.hup.recv() => Signal::Reload,
-                _ = self.term.recv() => Signal::Stop,
-                _ = self.int.recv() => Signal::Stop,
+                _ = hup.recv() => Signal::Reload,
+                () = async {
+                    match stop {
+                        Some((term, int)) => tokio::select! {
+                            _ = term.recv() => {}
+                            _ = int.recv() => {}
+                        },
+                        None => std::future::pending().await,
+                    }
+                } => Signal::Stop,
             }
         }
         #[cfg(not(unix))]

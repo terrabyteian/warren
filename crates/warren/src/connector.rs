@@ -50,6 +50,7 @@ pub fn run(m: &ArgMatches) -> Result<(), String> {
     let runtime = node::runtime()?;
     let mut signals = node::Signals::new(&runtime)?;
     let setup = node::setup(m)?;
+    signals.listen_for_stop(&runtime)?;
     let group = m.get_one::<String>("group").expect("required").clone();
     let leaf = setup
         .credentials

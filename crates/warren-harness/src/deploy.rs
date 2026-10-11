@@ -245,6 +245,8 @@ pub struct Options {
     /// How many connector replicas of the group (each attaches to every
     /// relay); replicas after the first get their own test backend.
     pub replicas: usize,
+    /// The relays' bind stream rollover point (`BIND_ROLLOVER`).
+    pub bind_rollover: u64,
 }
 
 impl Default for Options {
@@ -258,6 +260,7 @@ impl Default for Options {
             policy: None,
             record_packets: true,
             replicas: 1,
+            bind_rollover: params::BIND_ROLLOVER,
         }
     }
 }
@@ -303,6 +306,7 @@ impl Deployment {
                 name: format!("warren-relay-r{i}"),
                 peer_prefix: None,
                 max_splices_per_client: 64,
+                bind_rollover: opts.bind_rollover,
                 tuning: TransportTuning::default(),
             })
             .await

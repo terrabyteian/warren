@@ -13,6 +13,7 @@ pub fn run(m: &ArgMatches) -> Result<(), String> {
     let runtime = node::runtime()?;
     let mut signals = node::Signals::new(&runtime)?;
     let setup = node::setup(m)?;
+    signals.listen_for_stop(&runtime)?;
     let listen: SocketAddr = parse(m, "listen")?;
     let listen_tcp = if m.get_flag("no-tcp") {
         None
@@ -50,6 +51,7 @@ pub fn run(m: &ArgMatches) -> Result<(), String> {
         max_splices_per_client: *m
             .get_one::<usize>("max-splices-per-client")
             .expect("defaulted"),
+        bind_rollover: warren_core::params::BIND_ROLLOVER,
         tuning: TransportTuning::default(),
     };
     let bundle_path = setup.bundle_path;

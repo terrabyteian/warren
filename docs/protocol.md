@@ -154,9 +154,7 @@ Applies to links A to E.
   stream, one odd context ID per spliced client, with COMPRESSION_ASSIGN
   naming the client's virtual peer address; the connector answers
   COMPRESSION_ACK, and either side ends a context with COMPRESSION_CLOSE.
-  Context IDs are never reused on a stream: once a relay has assigned every
-  ID within the bound, it assigns no more on that stream and closes it when
-  the last context ends, and the connector re-attaches with a fresh one. The draft lets a proxy open
+  Context IDs are never reused on a stream. The draft lets a proxy open
   compressed contexts only while the client keeps an uncompressed one; warren
   replaces that rule with the splice itself (the relay opens a context only
   for a client it splices to this replica), and `Warren-Protocol` on the
@@ -169,7 +167,17 @@ Applies to links A to E.
   addresses only to tell sessions apart.
 - Each connector replica keeps one attachment per relay in its relay set
   (default: every relay in the deployment) and re-attaches immediately when an
-  attachment drops.
+  attachment drops. An attachment is one outer connection carrying one or
+  more bind streams.
+- Rollover: so a bind stream never runs out of context IDs, a relay that
+  assigns context ID `BIND_ROLLOVER` on a stream sends a `WARREN_NOTICE`
+  capsule with reason `bind_rollover` on it. The connector then opens a fresh
+  bind stream on the same outer connection, alongside the old one. The relay
+  assigns new clients to a replica's streams that have not reached
+  `BIND_ROLLOVER` before those that have, so the fresh stream takes them while
+  the old one keeps the IDs above `BIND_ROLLOVER` (up to the bound) in reserve
+  until the fresh one is open. Once a stream past `BIND_ROLLOVER` has no
+  contexts left, the relay closes it; the connector's other streams carry on.
 - Draining: a connector that is shutting down sends a `WARREN_NOTICE` capsule
   with reason `draining` on each bind stream, over either carrier, and HTTP/3
   GOAWAY on an HTTP/3 outer connection; it keeps serving its existing peers.
@@ -186,9 +194,12 @@ When a client's CONNECT-UDP names group G, the relay:
 
 1. selects a healthy replica of G attached to it (`REPLICA_SELECTION`, default
    least-loaded) and pins the client stream to that replica for its lifetime.
-   A request carrying `Warren-Connector: {node ID}` goes to that connector's
-   attachment while it has one with a free context ID, draining or not, and
-   to the `REPLICA_SELECTION` choice only when it has none;
+   A request carrying `Warren-Connector: {node ID}` goes to one of that
+   connector's bind streams, draining or not, whenever it has one attached
+   to this relay; the relay never picks another replica for it then, and
+   refuses it with 503 if none of those streams has a free context ID. Only
+   when the connector has no bind stream here does the request get the
+   `REPLICA_SELECTION` choice;
 2. allocates a virtual peer address and announces it on the replica's bind
    stream;
 3. forwards datagram payloads between the two streams byte for byte.
@@ -684,6 +695,7 @@ defaults are initial and may change with measurement.
 | `FLOW_IDLE_TIMEOUT` | UDP 60 s, ICMP 10 s | Idle time that ends a UDP or ICMP flow |
 | `DRAIN_TIMEOUT` | 5 min | Longest a draining connector keeps existing streams |
 | `REPLICA_SELECTION` | least loaded | Relay's choice of connector replica |
+| `BIND_ROLLOVER` | context ID 12287 | Context ID at which a relay asks the connector for a fresh bind stream (three quarters of the 2-byte bound) |
 | `RELAY_LIMITS` | deployment setting | Per-client and per-connector relay limits |
 | `RELAY_PEER_PREFIX` | an IPv6 ULA /64 per relay | Virtual peer addresses on bind streams |
 | `DEVICE_POOL_V4`, `DEVICE_POOL_V6` | deployment setting (defaults `100.96.0.0/16`, `fd00:7761:7272:6e00::/64`) | Device tunnel addresses |

@@ -32,7 +32,7 @@ use warren_core::tls::{
     WarrenServerVerifier,
 };
 use warren_core::vsock::{self, Inbound, PacketSink, VirtualSocket};
-use warren_masque::capsule::{Capsule, Notice, split_context};
+use warren_masque::capsule::{Capsule, NOTICE_BIND_ROLLOVER, Notice, split_context};
 use warren_masque::connect::{self, Refusal};
 use warren_masque::h3::H3Connection;
 use warren_masque::http::ResponseHead;
@@ -426,22 +426,90 @@ async fn attach_once(
     inbound: &Inbound,
     shutdown: &mut watch::Receiver<bool>,
 ) -> String {
+    let first = match open_bind(relay, conn).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    info!(relay = %relay.name, carrier = ?conn.carrier(), "attached");
+    // A bind stream that reaches its rollover point asks for a fresh one on
+    // the same connection; the attachment lasts while any stream does.
+    let (roll_tx, mut roll_rx) = mpsc::channel(1);
+    let mut streams = tokio::task::JoinSet::new();
+    let spawn = |streams: &mut tokio::task::JoinSet<String>,
+                 (tx, rx): (TunnelSender, TunnelReceiver)| {
+        streams.spawn(serve_bind(
+            shared.clone(),
+            relay.name.clone(),
+            tx,
+            rx,
+            inbound.clone(),
+            shutdown.clone(),
+            roll_tx.clone(),
+        ));
+    };
+    spawn(&mut streams, first);
+    let mut draining = shared.draining.subscribe();
+    let mut goaway_sent = false;
+    loop {
+        tokio::select! {
+            done = streams.join_next() => {
+                let reason = match done {
+                    Some(Ok(r)) => r,
+                    Some(Err(e)) => e.to_string(),
+                    None => break "no bind stream".into(),
+                };
+                if streams.is_empty() {
+                    break reason;
+                }
+                debug!(relay = %relay.name, reason = %reason, "bind stream ended; another carries on");
+            }
+            Some(()) = roll_rx.recv() => match open_bind(relay, conn).await {
+                Ok(t) => {
+                    info!(relay = %relay.name, "fresh bind stream opened");
+                    spawn(&mut streams, t);
+                }
+                Err(e) => warn!(relay = %relay.name, error = %e, "cannot open a fresh bind stream"),
+            },
+            () = async { let _ = draining.wait_for(|d| *d).await; }, if !goaway_sent => {
+                goaway_sent = true;
+                if let OuterConn::H3(h3) = conn {
+                    let _ = h3.send_goaway().await;
+                }
+            }
+        }
+    }
+}
+
+async fn open_bind(
+    relay: &RelayAddress,
+    conn: &OuterConn,
+) -> Result<(TunnelSender, TunnelReceiver), String> {
     let head = connect::udp_bind(&relay.name);
     let limit = warren_masque::varint::len(params::MAX_BIND_CONTEXT_ID)
         + usize::from(params::QUIC_MIN_UDP_PAYLOAD);
-    let (resp, tx, mut rx) = match conn.open_tunnel(&head, limit).await {
-        Ok(t) => t,
-        Err(e) => return format!("bind refused: {e}"),
-    };
+    let (resp, tx, rx) = conn
+        .open_tunnel(&head, limit)
+        .await
+        .map_err(|e| format!("bind refused: {e}"))?;
     if resp.header(connect::CONNECT_UDP_BIND) != Some("?1") {
-        return "relay does not support bound CONNECT-UDP".into();
+        return Err("relay does not support bound CONNECT-UDP".into());
     }
-    let attachment = Arc::new(Attachment {
-        tx,
-        relay: relay.name.clone(),
-    });
+    Ok((tx, rx))
+}
+
+/// Serves one bind stream's virtual peers until it ends or the connector
+/// shuts down.
+async fn serve_bind(
+    shared: Arc<Shared>,
+    relay: String,
+    tx: TunnelSender,
+    mut rx: TunnelReceiver,
+    inbound: Inbound,
+    mut shutdown: watch::Receiver<bool>,
+    roll: mpsc::Sender<()>,
+) -> String {
+    let attachment = Arc::new(Attachment { tx, relay });
     shared.metrics.attachments.inc();
-    info!(relay = %relay.name, carrier = ?conn.carrier(), "attached");
     let mut mine: HashMap<u64, SocketAddr> = HashMap::new();
     // Datagrams for contexts announced but not yet processed are held
     // briefly instead of dropped.
@@ -503,7 +571,10 @@ async fn attach_once(
                             shared.peers.observed.write().expect("observed lock").insert(*peer, info.observed);
                         }
                     }
-                    Capsule::Notice(n) => debug!(relay = %relay.name, reason = %n.reason, "relay notice"),
+                    Capsule::Notice(n) if n.reason == NOTICE_BIND_ROLLOVER => {
+                        let _ = roll.try_send(());
+                    }
+                    Capsule::Notice(n) => debug!(relay = %attachment.relay, reason = %n.reason, "relay notice"),
                     _ => {}
                 }
             }
@@ -514,9 +585,6 @@ async fn attach_once(
                     reason: "draining".into(),
                     message: "connector is draining".into(),
                 })).await;
-                if let OuterConn::H3(h3) = conn {
-                    let _ = h3.send_goaway().await;
-                }
             }
             _ = shutdown.changed() => break if drain_sent { "drained" } else { "shutdown" }.into(),
         }
@@ -530,7 +598,7 @@ async fn attach_once(
         }
     }
     shared.metrics.attachments.dec();
-    debug!(relay = %attachment.relay, "attachment state cleared");
+    debug!(relay = %attachment.relay, "bind stream state cleared");
     reason
 }
 

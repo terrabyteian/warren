@@ -95,6 +95,7 @@ async fn joined_nodes_carry_traffic() {
         name: "warren-relay-joined".into(),
         peer_prefix: None,
         max_splices_per_client: 8,
+        bind_rollover: warren_core::params::BIND_ROLLOVER,
         tuning: TransportTuning::default(),
     })
     .await

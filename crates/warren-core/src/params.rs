@@ -45,6 +45,11 @@ pub const INNER_CID_LEN: usize = 8;
 /// Largest compressed context ID on a bind stream: 2-byte varints only.
 pub const MAX_BIND_CONTEXT_ID: u64 = 16_383;
 
+/// Context ID at which a relay asks the connector for a fresh bind stream
+/// (`BIND_ROLLOVER`): three quarters of the ID space, so the old stream
+/// keeps a reserve while the fresh one opens.
+pub const BIND_ROLLOVER: u64 = 12_287;
+
 /// How long a QUIC handshake gets before HTTP/2 is raced alongside it.
 pub const FALLBACK_DELAY: Duration = Duration::from_millis(300);
 

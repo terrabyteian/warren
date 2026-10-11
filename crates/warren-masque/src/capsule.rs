@@ -234,6 +234,10 @@ pub struct Notice {
     pub message: String,
 }
 
+/// The `WARREN_NOTICE` reason a relay sends on a bind stream that reached
+/// its rollover point: the connector opens a fresh bind stream alongside it.
+pub const NOTICE_BIND_ROLLOVER: &str = "bind_rollover";
+
 /// `WARREN_PEER_INFO`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerInfo {

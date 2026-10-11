@@ -954,3 +954,118 @@ async fn reloads_reach_every_session_of_a_device() {
         assert_eq!(next_notice(events).await.reason, "revoked");
     }
 }
+
+async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !ok() {
+        assert!(std::time::Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bind_streams_roll_over_under_load_and_retire_when_drained() {
+    // Ten devices, so each session owns its addresses.
+    let mut bundle = warren_harness::deploy::test_bundle(1);
+    let devices = bundle["devices"].as_array_mut().unwrap();
+    for i in 0..10 {
+        devices.push(serde_json::json!({ "id": format!("load-{i}"), "approved": true }));
+    }
+    // Context IDs 1, 3, 5 and 7 per stream before it rolls over.
+    let d = Deployment::start(Options {
+        bind_rollover: 7,
+        bundle,
+        ..Options::default()
+    })
+    .await;
+    let mut tunnels = Vec::new();
+    for i in 0..10u16 {
+        let cert = warren_harness::pki::ClientCert::new(
+            "alice",
+            &format!("load-{i}"),
+            &format!("100.96.1.{}", i + 1),
+            &format!("fd00:7761:7272:6e00::1:{}", i + 1),
+        );
+        let mut t = warren_client::connect(d.client(&cert, TransportMode::QuicOnly))
+            .await
+            .unwrap();
+        echo_ok(&mut t, 50_000 + i, b"load").await;
+        tunnels.push(t);
+    }
+    let m = d.relay().metrics();
+    assert!(m.rollovers.get() >= 2, "rollovers: {}", m.rollovers.get());
+    assert!(m.attachments.get() >= 2, "fresh streams opened alongside");
+    for (i, t) in tunnels.iter_mut().enumerate() {
+        echo_ok(t, 50_100 + i as u16, b"still here").await;
+    }
+    // The rolled-over streams drain as their clients leave, then close; the
+    // newest stream carries on.
+    for t in &tunnels {
+        t.close();
+    }
+    drop(tunnels);
+    eventually("rolled-over streams retired", || {
+        m.retired.get() == m.rollovers.get() && m.attachments.get() == 1
+    })
+    .await;
+    assert_eq!(d.connector.metrics().attachments.get(), 1);
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    echo_ok(&mut t, 50_200, b"after retirement").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renewals_stay_on_their_replica_across_rollover() {
+    use warren_harness::pki::KeyPair;
+    // Context IDs 1, 3 and 5 per stream before it rolls over.
+    let d = Deployment::start(Options {
+        replicas: 2,
+        bind_rollover: 5,
+        ..Options::default()
+    })
+    .await;
+    let key = KeyPair::generate();
+    let creds = d
+        .pki
+        .issue_client_with_key(&d.pki.client_spec(&alice()), &key);
+    let mut t = warren_client::connect(d.client_with(creds, TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut events = t.events();
+    echo_ok(&mut t, 51_000, b"before").await;
+    let sessions = |c: &warren_connector::Connector| c.metrics().sessions_total.get();
+    let holder = sessions(&d.connector);
+    let renewed = d
+        .pki
+        .issue_client_with_key(&d.pki.client_spec(&alice()), &key);
+    // Every renewal costs the holder's stream a context ID.
+    for round in 0..6u16 {
+        t.refresh_certificate(renewed.clone(), |exporter| Ok(key.sign(exporter)))
+            .await
+            .unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), events.recv()).await {
+                Ok(Some(warren_client::ClientEvent::PathChanged { .. })) => break,
+                Ok(Some(warren_client::ClientEvent::Closed(r))) => {
+                    panic!("round {round}: session closed: {r}")
+                }
+                Ok(Some(_)) => {}
+                other => panic!("round {round}: no path change: {other:?}"),
+            }
+        }
+        echo_ok(&mut t, 51_001 + round, b"renewed").await;
+    }
+    assert_eq!(sessions(&d.connector), holder, "the session stayed put");
+    assert_eq!(sessions(&d.replicas[0]), 1 - holder);
+    let m = d.relay().metrics();
+    assert!(m.rollovers.get() >= 2, "rollovers: {}", m.rollovers.get());
+    // Every rolled-over stream but one still holding the client's splice
+    // drains and closes.
+    eventually("drained streams retired", || {
+        let (rolled, retired) = (m.rollovers.get(), m.retired.get());
+        retired + 1 >= rolled && m.attachments.get() == 2 + rolled - retired
+    })
+    .await;
+    assert!(m.retired.get() >= 1);
+}
