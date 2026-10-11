@@ -45,6 +45,8 @@ connections:
 # production (a mounted secret, for example) and back it up: without it the
 # CA and signing keys in the database cannot be opened.
 dataDir: /var/lib/warren
+# database: /var/lib/warren/warren.db       # default: warren.db in dataDir
+# adminSocket: /var/lib/warren/admin.sock   # default: admin.sock in dataDir (warren admin --socket)
 keyEncryptionKeyFile: /etc/warren/kek
 
 # The policy directory (see policy/ next to this file and docs/policy.md).
@@ -61,6 +63,7 @@ idp:
   scopes: [openid, email, profile, groups]
   groupsClaim: groups
   mfaAmrValues: [mfa]
+  # mfaAcrValues: []                                # acr values that also mean MFA
   # caFile: /etc/warren/idp-ca.pem                  # for a privately signed IdP
 
 signIn:
