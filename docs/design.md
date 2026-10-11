@@ -116,7 +116,7 @@ tunable is a named parameter in [protocol.md](protocol.md#14-named-parameters).
 | **G8** Scoped reach, no open proxy | A connector reaches only destinations declared for it, a relay forwards only to connectors attached to it, and neither will carry traffic anywhere else. |
 | **G9** Revocation in 10 seconds | Disabling a user or device, revoking a session, expiring or revoking a JIT grant, and changing policy cut every live connection that is no longer allowed within 10 seconds while connectors and relays are connected to the control plane. This is a tested promise. |
 | **G10** Fail closed | During a control-plane outage nobody gains access, connectors keep enforcing the last policy they verified, and all access decays to zero within one certificate lifetime. |
-| **G11** Continuous posture | Device posture is re-checked at least every 5 minutes, and connectors enforce that bound themselves: a posture statement lasts at most 5 minutes, plus the clock-skew allowance. A stale signal counts as failing. A failing check cuts only the apps whose rules require it. Every signal carries a trust class. |
+| **G11** Continuous posture | Device posture is re-checked at least every 5 minutes, and connectors enforce that bound themselves: a posture statement lasts at most 5 minutes, plus a clock-skew allowance of at most 2 minutes. A stale signal counts as failing. A failing check cuts only the apps whose rules require it. Every signal carries a trust class. |
 | **G12** Explained blocks | Every denial produces a specific, human-readable reason for the user and the matching rule and condition for the admin. Nothing fails as a silent timeout. |
 | **G13** Complete audit | Every access decision, allow or deny, and every flow produces a structured audit record. |
 | **G14** Split tunnel, no interception | Only traffic for internal apps enters the tunnel. warren does not decrypt or inspect application content. |
@@ -240,9 +240,11 @@ The client is where warren is felt, so its behavior is part of the design.
 **Clientless access** is a secondary, lower-assurance tier for HTTP(S) apps
 that opt in: the relay is the HTTPS front end and proxies requests to the
 connector. The user signs in through the control plane, which issues a
-short-lived signed session assertion naming the user, the app and an expiry,
-bound to the sign-in session. Before forwarding any request, the connector
-verifies that assertion against the control plane's key, strips any identity
+short-lived signed session assertion naming the user, the app, the sign-in
+session, the IdP authentication time, whether MFA was used, and an expiry.
+Before forwarding any request, the connector verifies that assertion against
+the control plane's key, takes the authentication facts that policy checks
+only from it, strips any identity
 header the request carries, and passes the verified assertion to the app as
 its identity header. A relay can neither mint nor extend an identity, and
 revoking the session cuts it (G9). There is no device identity and the relay
@@ -352,6 +354,12 @@ Non-web clientless access (SSH, RDP, VNC in the browser) comes later.
   the app sets a separate one) inside the private network and translates
   addresses (NAT). No internal DNS data is exposed to the client
   beyond the user's own entitlements.
+- **Names are claimed once.** Each connector group and each delegated source
+  has a deployment-admin-owned scope of client-facing names. A name maps to
+  exactly one app across the deployment, and warren's own names (control
+  plane, relays, IdP sign-in hosts) are reserved, so no app or cluster can take
+  over a name another app or warren itself uses
+  ([policy.md](policy.md#3-apps)).
 - **CIDR and IP apps keep real addresses** and are routed as-is.
 - **Split DNS.** On macOS the client claims only the internal DNS suffixes in
   use. Names outside them, and names under them that warren does not publish,
@@ -404,9 +412,10 @@ Non-web clientless access (SSH, RDP, VNC in the browser) comes later.
 - **Anything reachable.** A connector, in-cluster or standalone, can expose
   FQDNs, wildcard domains, IPs and CIDR ranges, each scoped by port and
   protocol.
-- **Declared scope.** Each connector group has a destination scope; an app's
-  targets must lie inside its connector group's scope, and resolved addresses
-  for names must also fall inside it (G8).
+- **Declared scope.** Each connector group has a destination scope and a
+  client-name scope; an app's targets must lie inside the first and its
+  client-facing names inside the second, and resolved addresses for names must
+  also fall inside the destination scope (G8).
 - **Forwarding modes.** Kernel mode (TUN plus NAT, needing `NET_ADMIN`) comes
   first. A userspace TCP/IP mode for unprivileged pods follows, and becomes the
   Kubernetes default only after it passes a conformance and performance suite.
@@ -448,8 +457,9 @@ expiry.
 - Nobody gains access: no certificate, device approval, grant or policy change
   can be issued without the control plane.
 - Access decays: posture-gated access ends when posture statements expire
-  (within 5 minutes plus the clock-skew allowance), JIT grants end on time, and
-  all access ends within one certificate lifetime (at most 4 hours).
+  (within 5 minutes plus a clock-skew allowance of at most 2 minutes), JIT
+  grants end on time, and all access ends within one certificate lifetime
+  (at most 4 hours).
 - Clients show that the control plane is unreachable and when access will end.
 
 **Other failures.** Losing a relay moves clients to another relay without

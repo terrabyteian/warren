@@ -244,9 +244,11 @@ Invariants:
 - CIDR and IP apps use real addresses end to end; the connector translates only
   the source.
 - macOS split DNS claims exactly the internal suffixes in the user's
-  entitlement data. The client answers the browser DNS-over-HTTPS canary
-  domain so that browsers which honor it fall back to system DNS, and it
-  reports bypass it detects for internal names to the user (G12).
+  entitlement data, never warren's reserved names
+  ([policy.md](policy.md#3-apps)). The client answers the browser
+  DNS-over-HTTPS canary domain so that browsers which honor it fall back to
+  system DNS, and it reports bypass it detects for internal names to the user
+  (G12).
 
 ## 7. Flow admission and deny signalling
 
@@ -441,7 +443,8 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
    control plane's clock. The client forwards each new statement to its
    connectors in a `WARREN_POSTURE` capsule and reports early enough that a
    fresh statement arrives before the current one expires. Connectors accept a
-   statement until its expiry plus at most `CLOCK_SKEW_ALLOWANCE` on their own
+   statement until its expiry plus at most `CLOCK_SKEW_ALLOWANCE` (fixed
+   bound: 2 minutes) on their own
    clock and then drop it, so stale posture fails closed at the connector even
    if the client stops reporting (G11).
 6. **Entitlements.** Apps the user may reach or request, with names, ranges,
@@ -531,12 +534,12 @@ defaults are initial and may change with measurement.
 | `REVOCATION_DEADLINE` | 10 s (fixed) | Commit to last connection cut |
 | `POSTURE_RECHECK_INTERVAL` | at most 5 min (fixed bound) | Maximum time between posture reports |
 | `POSTURE_STATEMENT_LIFETIME` | at most 5 min (fixed bound) | Validity of a signed posture statement, from its oldest observation |
+| `CLOCK_SKEW_ALLOWANCE` | at most 2 min (fixed bound; deployments may only lower it) | `notBefore` backdating and validity slack, including posture statements |
 | `TUNNEL_MTU` floor | 1280 (fixed) | RFC 9484 minimum |
 | `REVOCATION_APPLY_BUDGET` | 1 s | Node-side time to apply a revocation |
 | `EVENT_HEARTBEAT_INTERVAL` | 2 s | Event-stream heartbeat |
 | `EVENT_STALE_AFTER` | 3 heartbeats | Silence before a node reconnects |
-| `CLOCK_SKEW_ALLOWANCE` | 2 min | `notBefore` backdating and validity slack, including posture statements |
-| `CLIENTLESS_ASSERTION_LIFETIME` | 5 min | Validity of a control-plane-signed clientless session assertion |
+| `CLIENTLESS_ASSERTION_LIFETIME` | 5 min | Validity of a control-plane-signed clientless session assertion (user, app, sign-in session, IdP authentication time, MFA) |
 | `INFRA_CERT_LIFETIME` | 24 h | Relay, connector and control-plane certificates |
 | `INFRA_KEY_ALG` | ECDSA P-256 | Infrastructure key algorithm |
 | `JOIN_TOKEN_LIFETIME` | 1 h, single use | Node bootstrap token |

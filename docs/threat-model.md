@@ -82,7 +82,10 @@ traffic, impersonate a party, or reach private networks.
   terminates TLS for those apps; that is the cost of the lower-assurance
   clientless tier (T14). It cannot mint or extend a clientless identity: the
   connector admits a clientless request only with a control-plane-signed
-  session assertion naming the user, the app and an expiry. Within a live
+  session assertion naming the user, the app, the sign-in session, the IdP
+  authentication time, whether MFA was used, and an expiry, and it takes the
+  authentication facts policy checks only from that assertion, so the relay
+  cannot pass off a stale or non-MFA sign-in as fresh. Within a live
   clientless session it carries, it can send requests as that user to that app
   until the assertion expires or the session is revoked.
 - **Cannot impersonate a connector or a tunnel client.** The client verifies
@@ -236,8 +239,11 @@ step independent of the IdP.
   approvals and grants are audited; grants expire on the connector's own clock
   (G9, G13).
 - **Escalating in Kubernetes** through impersonation: see T13.
-- **Granting themselves access through config:** delegation scopes limit what
-  each source can grant, and every change is audited (G19).
+- **Granting themselves access through config:** delegation scopes limit
+  which connector groups each source may publish through, which client-facing
+  names it may claim, and which apps its policies may grant; a name already
+  used by another app or reserved for warren itself cannot be claimed; and
+  every change is audited (G19).
 
 ### T10. Malware on an enrolled device
 
@@ -294,9 +300,14 @@ warren therefore confines that power to one component, the Kubernetes broker.
   nowhere else, its RBAC allows impersonation and nothing more, and where the
   cluster supports constrained impersonation its grant uses it to narrow what
   impersonated requests may do.
-- A cluster insider who edits warren CRDs can only publish apps and write
-  policies within that cluster's delegation scope ([policy.md](policy.md#7-ownership-and-delegation)),
-  and cannot widen the connector group's destination scope.
+- A cluster insider who edits warren CRDs or Service annotations can only
+  publish apps and write policies within that cluster's delegation scope
+  ([policy.md](policy.md#7-ownership-and-delegation)). They cannot widen the
+  connector group's destination or client-name scope, and cannot claim a
+  client-facing name outside the cluster's grant, one another app already
+  owns, or one reserved for warren's control plane, relays or IdP sign-in, so
+  they cannot redirect other users' traffic for those names to their own
+  Services.
 - The API server's own audit log records the impersonated user and the
   broker's service account, alongside warren's decision record (G13).
 
@@ -305,15 +316,17 @@ warren therefore confines that power to one component, the Kubernetes broker.
 The relay terminates TLS for clientless apps, so it can read and alter that
 traffic; there is no device identity; browser sessions can be stolen through
 the browser. Identity does not depend on the relay: after browser sign-in the
-control plane issues a short-lived session assertion (user, app, expiry, bound
-to the sign-in session), and the connector verifies it against the control
-plane's key before forwarding each request, so a relay cannot mint or extend
-an identity, and revoking the session cuts it (G9). Mitigations: clientless is
-opt-in per app; rules must name `browser` explicitly and can never satisfy
-posture conditions (G2); session cookies are host-only, `Secure`, `HttpOnly`,
-short-lived and bound to the IdP session; the connector strips any incoming
-identity header and passes the verified assertion to the app as its identity
-header, which apps verify against the control plane's published keys.
+control plane issues a short-lived session assertion (user, app, sign-in
+session, IdP authentication time, MFA, expiry), and the connector verifies it
+against the control plane's key before forwarding each request and takes the
+authentication facts for `auth` conditions only from it, so a relay cannot
+mint or extend an identity, and revoking the session cuts it (G9).
+Mitigations: clientless is opt-in per app; rules must name `browser`
+explicitly and can never satisfy posture conditions (G2); session cookies are
+host-only, `Secure`, `HttpOnly`, short-lived and bound to the IdP session; the
+connector strips any incoming identity header and passes the verified
+assertion to the app as its identity header, which apps verify against the
+control plane's published keys.
 
 ### T15. Denial of service
 
@@ -335,9 +348,9 @@ into log lines.
 
 Certificate validity, grant expiry and posture freshness depend on clocks.
 Nodes and clients must run time synchronization; validation allows only a small
-skew (`CLOCK_SKEW_ALLOWANCE`); expiry is enforced by both the control plane and
-the connector, so one wrong clock cannot extend access past the other's view
-(G4, G9).
+skew (`CLOCK_SKEW_ALLOWANCE`, fixed bound: at most 2 minutes); expiry is
+enforced by both the control plane and the connector, so one wrong clock cannot
+extend access past the other's view (G4, G9).
 
 ## 6. Accepted risks
 

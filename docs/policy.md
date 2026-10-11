@@ -41,11 +41,14 @@ same document applied to a cluster.
 
 ## 2. Connector groups and their scope
 
-A connector group's `destinations` bound everything its apps may point at. An
-app whose targets fall outside its group's scope is rejected at compile time,
-and at run time a connector refuses any resolved address outside the scope
-(G8). A domain is an exact name or a single leading wildcard, `*.` followed by
-a domain, which matches names with one or more labels in its place:
+A connector group has two scopes, both owned by deployment admins. Its
+`destinations` bound everything its apps may point at: an app whose targets
+fall outside them is rejected at compile time, and at run time a connector
+refuses any resolved address outside them (G8). Its `clientNames` bound the
+names clients may use for its apps: an app whose hosts fall outside them is
+rejected at compile time. A domain in either scope is an exact name or a
+single leading wildcard, `*.` followed by a domain, which matches names with
+one or more labels in its place:
 `*.svc.cluster.local` matches `grafana.observability.svc.cluster.local` but
 not `svc.cluster.local` itself.
 
@@ -58,15 +61,18 @@ spec:
   destinations:
     domains: ["*.lab.example.com", "nas.example.internal"]
     cidrs: ["10.20.0.0/16", "fd00:20::/48"]
+  clientNames: ["*.lab.example.com", "*.access.example.com"]
   relays: all          # or a list of relay names
 ```
 
 A cluster's connector group is created when the operator is installed, with a
 default scope of the cluster's own Service network and `*.svc.cluster.local`
 (or the cluster's configured domain), which covers every Service's cluster DNS
-name, `<service>.<namespace>.svc.cluster.local`.
-Widening a scope is a deployment-admin change, never something a cluster can do
-for itself.
+name, `<service>.<namespace>.svc.cluster.local`. Its client-name scope starts
+empty, so a cluster publishes nothing under a client-facing name until a
+deployment admin grants one, for example `*.prod.internal`. Widening either
+scope is a deployment-admin change, never something a cluster can do for
+itself.
 
 ## 3. Apps
 
@@ -76,6 +82,21 @@ host names (exact or a single leading wildcard, matching as in
 each with ports and a protocol. A `host` is the name clients use; an exact host
 may set a separate `target`, the name or address the connector actually
 reaches. Without one the target is the host itself.
+
+Client-facing names are claimed, not just declared:
+
+- A host must lie inside its connector group's `clientNames` and inside its
+  source's delegation scope ([section 7](#7-ownership-and-delegation)).
+- A host maps to exactly one app across the whole deployment. Two apps that
+  claim the same host conflict, and so do two hosts from different sources
+  where one covers the other (an exact name under a wildcard, or nested
+  wildcards); the compiler rejects the newcomer, the first owner keeps
+  the name, and the conflict is reported in `warren plan` and the console.
+  Within one source, an exact host takes precedence over a wildcard that
+  covers it.
+- warren's own names (the control plane, the relays, and the configured IdP
+  sign-in hosts) are reserved: no app can claim them, and no wildcard host
+  covers them.
 
 ```yaml
 apiVersion: warren.dev/v1alpha1
@@ -127,9 +148,12 @@ Field notes:
   compiler flags as a warning.
 - Host names use synthetic addresses on the client; the connector resolves
   each destination's target inside the private network
-  ([design.md](design.md#8-internal-names-and-addressing)). Targets, not
-  client-facing hosts, must lie inside the connector group's scope.
-- `clientless.upstream` is the URL the connector forwards clientless requests
+  ([design.md](design.md#8-internal-names-and-addressing)). Targets must lie
+  inside the connector group's `destinations` and hosts inside its
+  `clientNames`.
+- `clientless.url` is the address users open in the browser; its host is a
+  client-facing name under the same rules as any `host`.
+  `clientless.upstream` is the URL the connector forwards clientless requests
   to; its host must be one of the app's destination targets.
 - `discoverable: true` makes the app visible to users who may request it, so a
   connection attempt fails with a "request access" reason instead of a lookup
@@ -166,7 +190,10 @@ compromised broker can impersonate anyone its service account may
 In a cluster, annotating a Service publishes it through the cluster's
 connector group. The operator turns the annotation into an `App` it owns, with
 the annotated hostname as each destination's `host` and the Service's cluster
-DNS name, here `grafana.observability.svc.cluster.local`, as its `target`.
+DNS name, here `grafana.observability.svc.cluster.local`, as its `target`. The
+hostname is subject to the same rules as any host: it must lie inside the
+cluster's client-name scope, must not be claimed by another app, and must not
+be reserved, or the operator reports the rejection on the Service.
 
 ```yaml
 apiVersion: v1
@@ -214,9 +241,10 @@ The default `minTrust` is `device-reported`. A signal is **stale** once the
 posture statement carrying it has expired: a statement lasts at most
 5 minutes from the oldest observation it carries
 ([protocol.md](protocol.md#14-named-parameters), `POSTURE_STATEMENT_LIFETIME`),
-and a connector accepts it for at most `CLOCK_SKEW_ALLOWANCE` beyond that on
-its own clock. A stale signal counts as failing (G11). The optional
-`remediation` text is shown to the user when the check blocks them.
+and a connector accepts it for at most `CLOCK_SKEW_ALLOWANCE` (at most
+2 minutes) beyond that on its own clock. A stale signal counts as failing
+(G11). The optional `remediation` text is shown to the user when the check
+blocks them.
 
 ## 5. Access policies
 
@@ -330,12 +358,15 @@ Every object carries ownership labels:
 - Objects managed by anything other than `console` are read-only in the
   console (G19). The CLI refuses to modify an object owned by another manager
   unless told to take ownership explicitly, and that change is audited.
-- **Delegation.** The control plane gives each source a scope. By default a
+- **Delegation.** Deployment admins give each source (a cluster or a Git
+  source) a delegation scope: the connector groups it may publish through, the
+  client names it may claim, and the apps its policies may grant. By default a
   cluster's operator may define apps only inside its own connector group's
-  scope, and its policies may grant access only to apps that cluster
-  publishes. Kubernetes RBAC on the CRDs then decides who in the cluster can
-  change them. A namespace owner can therefore never grant access to anything
-  outside what their cluster serves.
+  scopes, claim no client names until granted some, and grant access only to
+  apps that cluster publishes. Kubernetes RBAC on the CRDs then decides who in
+  the cluster can change them. A namespace owner can therefore never grant
+  access to anything outside what their cluster serves, nor take over a name
+  that another app or warren itself uses.
 - `warren plan <dir>` shows the object diff and the access impact (which users
   would gain or lose access to which apps) before `warren apply <dir>` changes
   anything.
@@ -393,9 +424,10 @@ The enforcement point builds the request: the principal and groups from the
 signed entity snapshot, the device and its signals from the latest verified
 posture statement (dropping every signal once that statement is stale, as
 defined in [section 4](#4-posture-profiles), so a stale signal is simply
-absent and every check on it fails), authentication facts from the
-certificate, and grants from the snapshot filtered by expiry on the local
-clock.
+absent and every check on it fails), authentication facts (IdP sign-in time
+and MFA) from the verified client certificate for tunnel sessions and from the
+verified clientless session assertion for browser sessions, never from the
+relay, and grants from the snapshot filtered by expiry on the local clock.
 
 ### 8.2 Rules
 
@@ -528,8 +560,9 @@ when {
   mode before it is signed and shipped. Any error is reported against the
   YAML file and line or CRD that produced it.
 - The compiler also rejects references to unknown apps, groups or profiles,
-  apps outside their connector group's scope, and objects outside their
-  source's delegation scope; and it warns about rules that can never match.
+  apps outside their connector group's scopes, hosts that conflict with another
+  app or claim a reserved name, and objects outside their source's delegation
+  scope; and it warns about rules that can never match.
 
 ## 9. Explaining decisions
 
