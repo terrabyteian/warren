@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -71,8 +71,11 @@ pub struct RelayMetrics {
     pub registry: Registry,
     /// Outer connections accepted.
     pub connections: Counter,
-    /// Connector attachments currently live.
+    /// Connector attachments currently live: outer connections carrying at
+    /// least one bind stream.
     pub attachments: Gauge,
+    /// Bind streams currently live.
+    pub bind_streams: Gauge,
     /// Client splices currently live.
     pub splices: Gauge,
     /// Client splices established.
@@ -90,7 +93,7 @@ pub struct RelayMetrics {
     pub dropped: Counter,
     /// Outer connections closed by revocation or certificate expiry.
     pub cut: Counter,
-    /// Bind streams asked to roll over to a fresh one.
+    /// Bind streams rolled over to a fresh one.
     pub rollovers: Counter,
     /// Rolled-over bind streams closed after their last context ended.
     pub retired: Counter,
@@ -105,6 +108,7 @@ impl RelayMetrics {
                 "Outer connections accepted",
             ),
             attachments: r.gauge("warren_relay_attachments", "Connector attachments live"),
+            bind_streams: r.gauge("warren_relay_bind_streams", "Bind streams live"),
             splices: r.gauge("warren_relay_splices", "Client splices live"),
             splices_total: r.counter("warren_relay_splices_total", "Client splices established"),
             refusals: r.counter("warren_relay_refusals_total", "CONNECT requests refused"),
@@ -124,7 +128,7 @@ impl RelayMetrics {
             ),
             rollovers: r.counter(
                 "warren_relay_bind_rollovers_total",
-                "Bind streams asked to roll over to a fresh one",
+                "Bind streams rolled over to a fresh one",
             ),
             retired: r.counter(
                 "warren_relay_bind_streams_retired_total",
@@ -146,7 +150,7 @@ struct Attachment {
     tx: TunnelSender,
     contexts: Mutex<Contexts>,
     draining: AtomicBool,
-    /// The context ID at which this stream rolls over.
+    /// The context ID at which this stream asks for a fresh one.
     rollover: u64,
     /// Notified when a rolled-over stream's last context ends, so the bind
     /// stream closes; the connector's fresh stream carries on.
@@ -159,23 +163,47 @@ struct Attachment {
 struct Contexts {
     /// The next context ID to assign; IDs are never reused on a stream.
     next: u64,
-    /// Contexts assigned and not yet released: the replica's load.
+    /// Contexts assigned and not yet released: the stream's load.
     open: usize,
+    /// Rolled over: a fresh stream of the connector replaced this one, which
+    /// takes no new contexts.
+    rolled: bool,
     live: HashMap<u64, TunnelSender>,
 }
 
 impl Attachment {
-    /// Assigns the next odd context ID (RFC 9298), if any is left, and
-    /// whether this assignment reached the rollover point.
-    fn assign(&self) -> Option<(u64, bool)> {
+    /// Assigns the next odd context ID (RFC 9298), unless the stream has
+    /// rolled over or spent its IDs.
+    fn assign(&self) -> Option<u64> {
         let mut c = self.contexts.lock().expect("contexts lock");
-        if c.next > params::MAX_BIND_CONTEXT_ID {
+        if c.rolled || c.next > params::MAX_BIND_CONTEXT_ID {
             return None;
         }
         let ctx = c.next;
         c.next += 2;
         c.open += 1;
-        Some((ctx, ctx <= self.rollover && c.next > self.rollover))
+        Some(ctx)
+    }
+
+    /// Whether the stream is past its rollover point, so the connector
+    /// should open a fresh one.
+    fn past_rollover(&self) -> bool {
+        self.contexts.lock().expect("contexts lock").next > self.rollover
+    }
+
+    /// Rolls the stream over once a fresh stream of its connector is
+    /// attached, if it is past its rollover point; it then retires when its
+    /// last context ends. Returns whether it rolled over now.
+    fn roll_over(&self) -> bool {
+        let mut c = self.contexts.lock().expect("contexts lock");
+        if c.rolled || c.next <= self.rollover {
+            return false;
+        }
+        c.rolled = true;
+        if c.open == 0 {
+            self.retire.notify_one();
+        }
+        true
     }
 
     /// Ends a context assigned by [`Attachment::assign`].
@@ -183,16 +211,23 @@ impl Attachment {
         let mut c = self.contexts.lock().expect("contexts lock");
         c.live.remove(&ctx);
         c.open -= 1;
-        if c.open == 0 && c.next > self.rollover {
+        if c.rolled && c.open == 0 {
             self.retire.notify_one();
         }
     }
 
-    /// How the stream ranks for a new client, lowest first: streams that
-    /// have not rolled over, then by load; `None` once its IDs are spent.
+    /// Contexts open on the stream.
+    fn load(&self) -> usize {
+        self.contexts.lock().expect("contexts lock").open
+    }
+
+    /// How the stream ranks for a new client of its replica, lowest first:
+    /// streams before their rollover point, then by load; `None` if it
+    /// cannot take one.
     fn rank(&self) -> Option<(bool, usize)> {
         let c = self.contexts.lock().expect("contexts lock");
-        (c.next <= params::MAX_BIND_CONTEXT_ID).then_some((c.next > self.rollover, c.open))
+        (!c.rolled && c.next <= params::MAX_BIND_CONTEXT_ID)
+            .then_some((c.next > self.rollover, c.open))
     }
 }
 
@@ -484,13 +519,15 @@ async fn serve_quic(
                 })
             };
             debug!(%remote, peer = %describe(&peer), "outer connection");
+            let binds = Arc::new(AtomicUsize::new(0));
             loop {
                 match h3.accept_request().await {
                     Ok(Some((head, stream))) => {
                         let shared = shared.clone();
                         let peer = peer.clone();
+                        let binds = binds.clone();
                         tokio::spawn(async move {
-                            handle(shared, peer, remote, head, Incoming::H3(stream)).await;
+                            handle(shared, peer, remote, head, Incoming::H3(stream), binds).await;
                         });
                     }
                     Ok(None) => break,
@@ -581,15 +618,17 @@ async fn serve_h2(
     let until = not_after(peer);
     let expiry = tokio::time::sleep(until.duration_since(SystemTime::now()).unwrap_or_default());
     tokio::pin!(expiry);
+    let binds = Arc::new(AtomicUsize::new(0));
     loop {
         tokio::select! {
             next = h2.accept() => match next {
                 Some(Ok(req)) => {
                     let shared = shared.clone();
                     let peer = peer.clone();
+                    let binds = binds.clone();
                     let head = req.head.clone();
                     tokio::spawn(async move {
-                        handle(shared, peer, remote, head, Incoming::H2(req)).await;
+                        handle(shared, peer, remote, head, Incoming::H2(req), binds).await;
                     });
                 }
                 Some(Err(e)) => return Err(e.to_string()),
@@ -610,6 +649,7 @@ async fn handle(
     remote: SocketAddr,
     head: RequestHead,
     incoming: Incoming,
+    binds: Arc<AtomicUsize>,
 ) {
     let name = shared.config.name.clone();
     let request = match connect::parse_relay_request(&head) {
@@ -628,7 +668,7 @@ async fn handle(
         (Request::UdpBind, PeerIdentity::Node(node)) => {
             if let NodeRole::Connector { group } = &node.role {
                 let group = group.clone();
-                attach(shared, node.clone(), group, incoming).await;
+                attach(shared, node.clone(), group, incoming, &binds).await;
             } else {
                 shared.metrics.refusals.inc();
                 incoming
@@ -658,7 +698,15 @@ fn deliver_limit(context: u64) -> usize {
     warren_masque::varint::len(context) + usize::from(params::QUIC_MIN_UDP_PAYLOAD)
 }
 
-async fn attach(shared: Arc<Shared>, node: NodeIdentity, group: String, incoming: Incoming) {
+/// Serves a bind stream; `binds` counts the bind streams on its outer
+/// connection, which is one attachment however many it carries.
+async fn attach(
+    shared: Arc<Shared>,
+    node: NodeIdentity,
+    group: String,
+    incoming: Incoming,
+    binds: &AtomicUsize,
+) {
     let resp = ResponseHead::new(200)
         .with(CONNECT_UDP_BIND, "?1")
         .with(PROXY_PUBLIC_ADDRESS, format!("\"[{}]:443\"", shared.prefix));
@@ -680,6 +728,7 @@ async fn attach(shared: Arc<Shared>, node: NodeIdentity, group: String, incoming
         contexts: Mutex::new(Contexts {
             next: 1,
             open: 0,
+            rolled: false,
             live: HashMap::new(),
         }),
         draining: AtomicBool::new(false),
@@ -687,15 +736,21 @@ async fn attach(shared: Arc<Shared>, node: NodeIdentity, group: String, incoming
         retire: Notify::new(),
         gone: watch::channel(false).0,
     });
-    shared
-        .registry
-        .lock()
-        .expect("registry lock")
-        .groups
-        .entry(group.clone())
-        .or_default()
-        .push(attachment.clone());
-    shared.metrics.attachments.inc();
+    {
+        let mut registry = shared.registry.lock().expect("registry lock");
+        let streams = registry.groups.entry(group.clone()).or_default();
+        for a in streams.iter().filter(|a| a.node_id == attachment.node_id) {
+            if a.roll_over() {
+                info!(connector = %a.node, attachment = a.id, "bind stream rolled over");
+                shared.metrics.rollovers.inc();
+            }
+        }
+        streams.push(attachment.clone());
+    }
+    if binds.fetch_add(1, Ordering::SeqCst) == 0 {
+        shared.metrics.attachments.inc();
+    }
+    shared.metrics.bind_streams.inc();
     info!(connector = %attachment.node, group = %group, attachment = attachment.id, "connector attached");
 
     serve_bind(&shared, &attachment, &mut rx).await;
@@ -708,7 +763,10 @@ async fn attach(shared: Arc<Shared>, node: NodeIdentity, group: String, incoming
         .entry(group)
         .or_default()
         .retain(|a| a.id != attachment.id);
-    shared.metrics.attachments.dec();
+    shared.metrics.bind_streams.dec();
+    if binds.fetch_sub(1, Ordering::SeqCst) == 1 {
+        shared.metrics.attachments.dec();
+    }
     // The replica is gone: end its clients' streams so they re-establish
     // on another replica (docs/design.md section 11).
     attachment.gone.send_replace(true);
@@ -767,18 +825,20 @@ async fn serve_bind(shared: &Shared, a: &Attachment, rx: &mut TunnelReceiver) {
     }
 }
 
-/// Picks the bind stream for a client and assigns it a context ID; the
-/// flag says the stream just reached its rollover point.
+/// Picks the bind stream for a client and assigns it a context ID.
 fn pick_replica(
     shared: &Shared,
     group: &str,
     connector: Option<&str>,
-) -> Option<(Arc<Attachment>, u64, bool)> {
+) -> Option<(Arc<Attachment>, u64)> {
     let registry = shared.registry.lock().expect("registry lock");
     let candidates = registry.groups.get(group)?;
-    let best = |eligible: &dyn Fn(&Attachment) -> bool| {
-        candidates
-            .iter()
+    let streams = |id: &str| -> Vec<&Arc<Attachment>> {
+        candidates.iter().filter(|a| a.node_id == id).collect()
+    };
+    let best_stream = |id: &str, eligible: &dyn Fn(&Attachment) -> bool| {
+        streams(id)
+            .into_iter()
             .filter(|a| eligible(a))
             .filter_map(|a| a.rank().map(|rank| (rank, a)))
             .min_by_key(|(rank, _)| *rank)
@@ -786,15 +846,32 @@ fn pick_replica(
     };
     // The replica holding the client's inner session, on any of its
     // streams here, and never another replica while it has one; otherwise
-    // REPLICA_SELECTION: least loaded among those not draining. Streams that
-    // have not rolled over come first.
+    // REPLICA_SELECTION: the replica with the fewest open contexts over all
+    // its streams, among those with a stream not draining that can take the
+    // client. Within the replica, a stream before its rollover point first.
     let a = match connector.filter(|id| candidates.iter().any(|a| a.node_id == *id)) {
-        Some(id) => best(&|a| a.node_id == id),
-        None => best(&|a| !a.draining.load(Ordering::Relaxed)),
+        Some(id) => best_stream(id, &|_| true),
+        None => {
+            let mut replicas: Vec<&str> = Vec::new();
+            for a in candidates {
+                if !replicas.contains(&a.node_id.as_str()) {
+                    replicas.push(&a.node_id);
+                }
+            }
+            replicas
+                .into_iter()
+                .filter_map(|id| {
+                    let stream = best_stream(id, &|a| !a.draining.load(Ordering::Relaxed))?;
+                    let load: usize = streams(id).iter().map(|a| a.load()).sum();
+                    Some((load, stream))
+                })
+                .min_by_key(|(load, _)| *load)
+                .map(|(_, a)| a)
+        }
     }?
     .clone();
-    let (ctx, rolled) = a.assign()?;
-    Some((a, ctx, rolled))
+    let ctx = a.assign()?;
+    Some((a, ctx))
 }
 
 async fn splice(
@@ -846,8 +923,7 @@ async fn splice(
             }
         }
     };
-    let Some((attachment, ctx, rolled)) = pick_replica(&shared, &group, connector.as_deref())
-    else {
+    let Some((attachment, ctx)) = pick_replica(&shared, &group, connector.as_deref()) else {
         release();
         shared.metrics.refusals.inc();
         let r = Refusal::new(
@@ -888,9 +964,10 @@ async fn splice(
         incoming.refuse(&r, &name).await;
         return;
     }
-    if rolled {
-        info!(connector = %attachment.node, attachment = attachment.id, "bind stream reached its rollover point");
-        shared.metrics.rollovers.inc();
+    // Asked on every assignment past the rollover point, until a fresh
+    // stream of the connector takes over.
+    if attachment.past_rollover() {
+        debug!(connector = %attachment.node, attachment = attachment.id, "bind stream past its rollover point");
         let _ = attachment
             .tx
             .send_capsule(&Capsule::Notice(Notice {

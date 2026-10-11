@@ -993,8 +993,11 @@ async fn bind_streams_roll_over_under_load_and_retire_when_drained() {
         tunnels.push(t);
     }
     let m = d.relay().metrics();
-    assert!(m.rollovers.get() >= 2, "rollovers: {}", m.rollovers.get());
-    assert!(m.attachments.get() >= 2, "fresh streams opened alongside");
+    eventually("streams rolled over to fresh ones", || {
+        m.rollovers.get() >= 2
+    })
+    .await;
+    assert_eq!(m.attachments.get(), 1, "all on one outer connection");
     for (i, t) in tunnels.iter_mut().enumerate() {
         echo_ok(t, 50_100 + i as u16, b"still here").await;
     }
@@ -1005,10 +1008,12 @@ async fn bind_streams_roll_over_under_load_and_retire_when_drained() {
     }
     drop(tunnels);
     eventually("rolled-over streams retired", || {
-        m.retired.get() == m.rollovers.get() && m.attachments.get() == 1
+        m.retired.get() == m.rollovers.get() && m.bind_streams.get() == 1
     })
     .await;
+    assert_eq!(m.attachments.get(), 1);
     assert_eq!(d.connector.metrics().attachments.get(), 1);
+    assert_eq!(d.connector.metrics().bind_streams.get(), 1);
     let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
         .await
         .unwrap();
@@ -1059,13 +1064,69 @@ async fn renewals_stay_on_their_replica_across_rollover() {
     assert_eq!(sessions(&d.connector), holder, "the session stayed put");
     assert_eq!(sessions(&d.replicas[0]), 1 - holder);
     let m = d.relay().metrics();
-    assert!(m.rollovers.get() >= 2, "rollovers: {}", m.rollovers.get());
+    eventually("streams rolled over to fresh ones", || {
+        m.rollovers.get() >= 2
+    })
+    .await;
     // Every rolled-over stream but one still holding the client's splice
     // drains and closes.
     eventually("drained streams retired", || {
         let (rolled, retired) = (m.rollovers.get(), m.retired.get());
-        retired + 1 >= rolled && m.attachments.get() == 2 + rolled - retired
+        retired + 1 >= rolled && m.bind_streams.get() == 2 + rolled - retired
     })
     .await;
     assert!(m.retired.get() >= 1);
+    assert_eq!(m.attachments.get(), 2, "one outer connection per replica");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replicas_balance_over_all_their_bind_streams() {
+    let mut bundle = warren_harness::deploy::test_bundle(1);
+    let devices = bundle["devices"].as_array_mut().unwrap();
+    for i in 0..4 {
+        devices.push(serde_json::json!({ "id": format!("bal-{i}"), "approved": true }));
+    }
+    // Context IDs 1 and 3 per stream before it rolls over.
+    let d = Deployment::start(Options {
+        replicas: 2,
+        bind_rollover: 3,
+        bundle,
+        ..Options::default()
+    })
+    .await;
+    let mut tunnels = Vec::new();
+    let mut connect = async |i: u16| {
+        let cert = warren_harness::pki::ClientCert::new(
+            "alice",
+            &format!("bal-{i}"),
+            &format!("100.96.2.{}", i + 1),
+            &format!("fd00:7761:7272:6e00::2:{}", i + 1),
+        );
+        let mut t = warren_client::connect(d.client(&cert, TransportMode::QuicOnly))
+            .await
+            .unwrap();
+        echo_ok(&mut t, 52_000 + i, b"balance").await;
+        tunnels.push(t);
+    };
+    // Least loaded alternates: the first replica takes clients 0 and 2,
+    // which rolls its stream over to a fresh, empty one.
+    for i in 0..3 {
+        connect(i).await;
+    }
+    let m = d.relay().metrics();
+    eventually("the busier replica rolled over", || m.rollovers.get() == 1).await;
+    let total = |c: &warren_connector::Connector| c.metrics().sessions_total.get();
+    let (busy, idle) = if total(&d.connector) == 2 {
+        (&d.connector, &d.replicas[0])
+    } else {
+        (&d.replicas[0], &d.connector)
+    };
+    assert_eq!((total(busy), total(idle)), (2, 1));
+    // Its fresh stream is empty, but the replica still carries two clients.
+    connect(3).await;
+    assert_eq!(
+        (total(busy), total(idle)),
+        (2, 2),
+        "the less loaded replica takes the client"
+    );
 }

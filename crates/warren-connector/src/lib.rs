@@ -84,8 +84,10 @@ pub struct ConnectorConfig {
 pub struct ConnectorMetrics {
     /// The registry they are exposed through.
     pub registry: Registry,
-    /// Live relay attachments.
+    /// Live relay attachments: outer connections carrying bind streams.
     pub attachments: Gauge,
+    /// Live bind streams.
+    pub bind_streams: Gauge,
     /// Live inner sessions.
     pub sessions: Gauge,
     /// Inner sessions accepted.
@@ -111,6 +113,7 @@ impl ConnectorMetrics {
         let r = Registry::default();
         ConnectorMetrics {
             attachments: r.gauge("warren_connector_attachments", "Relay attachments live"),
+            bind_streams: r.gauge("warren_connector_bind_streams", "Bind streams live"),
             sessions: r.gauge("warren_connector_sessions", "Inner sessions live"),
             sessions_total: r.counter("warren_connector_sessions_total", "Inner sessions accepted"),
             flows_allowed: r.counter("warren_connector_flows_allowed_total", "Flows admitted"),
@@ -448,9 +451,12 @@ async fn attach_once(
         ));
     };
     spawn(&mut streams, first);
+    shared.metrics.attachments.inc();
+    // Opens the fresh stream, retrying until it is open.
+    let mut opener: Option<tokio::task::JoinHandle<(TunnelSender, TunnelReceiver)>> = None;
     let mut draining = shared.draining.subscribe();
     let mut goaway_sent = false;
-    loop {
+    let reason = loop {
         tokio::select! {
             done = streams.join_next() => {
                 let reason = match done {
@@ -463,13 +469,29 @@ async fn attach_once(
                 }
                 debug!(relay = %relay.name, reason = %reason, "bind stream ended; another carries on");
             }
-            Some(()) = roll_rx.recv() => match open_bind(relay, conn).await {
-                Ok(t) => {
+            Some(()) = roll_rx.recv() => {
+                if opener.is_none() {
+                    let (relay, conn) = (relay.clone(), conn.clone());
+                    opener = Some(tokio::spawn(async move {
+                        let mut backoff = Duration::from_millis(100);
+                        loop {
+                            match open_bind(&relay, &conn).await {
+                                Ok(t) => return t,
+                                Err(e) => warn!(relay = %relay.name, error = %e, retry = ?backoff, "cannot open a fresh bind stream"),
+                            }
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(10));
+                        }
+                    }));
+                }
+            }
+            opened = async { opener.as_mut().expect("opener running").await }, if opener.is_some() => {
+                opener = None;
+                if let Ok(t) = opened {
                     info!(relay = %relay.name, "fresh bind stream opened");
                     spawn(&mut streams, t);
                 }
-                Err(e) => warn!(relay = %relay.name, error = %e, "cannot open a fresh bind stream"),
-            },
+            }
             () = async { let _ = draining.wait_for(|d| *d).await; }, if !goaway_sent => {
                 goaway_sent = true;
                 if let OuterConn::H3(h3) = conn {
@@ -477,7 +499,12 @@ async fn attach_once(
                 }
             }
         }
+    };
+    if let Some(o) = opener {
+        o.abort();
     }
+    shared.metrics.attachments.dec();
+    reason
 }
 
 async fn open_bind(
@@ -509,13 +536,14 @@ async fn serve_bind(
     roll: mpsc::Sender<()>,
 ) -> String {
     let attachment = Arc::new(Attachment { tx, relay });
-    shared.metrics.attachments.inc();
+    shared.metrics.bind_streams.inc();
     let mut mine: HashMap<u64, SocketAddr> = HashMap::new();
     // Datagrams for contexts announced but not yet processed are held
     // briefly instead of dropped.
     let mut pending: HashMap<u64, Vec<Bytes>> = HashMap::new();
     let mut draining = shared.draining.subscribe();
     let mut drain_sent = false;
+    let mut rolling = false;
     let reason = loop {
         tokio::select! {
             d = rx.datagrams.recv() => {
@@ -572,7 +600,11 @@ async fn serve_bind(
                         }
                     }
                     Capsule::Notice(n) if n.reason == NOTICE_BIND_ROLLOVER => {
-                        let _ = roll.try_send(());
+                        // One fresh stream per stream; its opener retries
+                        // until it is open.
+                        if !rolling {
+                            rolling = roll.send(()).await.is_ok();
+                        }
                     }
                     Capsule::Notice(n) => debug!(relay = %attachment.relay, reason = %n.reason, "relay notice"),
                     _ => {}
@@ -597,7 +629,7 @@ async fn serve_bind(
             observed.remove(peer);
         }
     }
-    shared.metrics.attachments.dec();
+    shared.metrics.bind_streams.dec();
     debug!(relay = %attachment.relay, "bind stream state cleared");
     reason
 }

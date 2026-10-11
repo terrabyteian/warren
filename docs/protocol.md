@@ -169,15 +169,17 @@ Applies to links A to E.
   (default: every relay in the deployment) and re-attaches immediately when an
   attachment drops. An attachment is one outer connection carrying one or
   more bind streams.
-- Rollover: so a bind stream never runs out of context IDs, a relay that
-  assigns context ID `BIND_ROLLOVER` on a stream sends a `WARREN_NOTICE`
-  capsule with reason `bind_rollover` on it. The connector then opens a fresh
-  bind stream on the same outer connection, alongside the old one. The relay
-  assigns new clients to a replica's streams that have not reached
-  `BIND_ROLLOVER` before those that have, so the fresh stream takes them while
-  the old one keeps the IDs above `BIND_ROLLOVER` (up to the bound) in reserve
-  until the fresh one is open. Once a stream past `BIND_ROLLOVER` has no
-  contexts left, the relay closes it; the connector's other streams carry on.
+- Rollover: so a bind stream never runs out of context IDs, a relay sends a
+  `WARREN_NOTICE` capsule with reason `bind_rollover` on a stream each time
+  it assigns that stream context ID `BIND_ROLLOVER` or above. The connector
+  then opens a fresh bind stream on the same outer connection, alongside the
+  old one, retrying with backoff until it is open. Until then the old stream
+  keeps taking clients from its reserve of IDs above `BIND_ROLLOVER`. When
+  the fresh stream attaches, the relay rolls every stream of that connector
+  past `BIND_ROLLOVER` over: a rolled-over stream takes no new contexts, and
+  the relay closes it once its last context ends; the connector's other
+  streams carry on. Within a replica, the relay assigns new clients to its
+  streams before `BIND_ROLLOVER` first, then by load.
 - Draining: a connector that is shutting down sends a `WARREN_NOTICE` capsule
   with reason `draining` on each bind stream, over either carrier, and HTTP/3
   GOAWAY on an HTTP/3 outer connection; it keeps serving its existing peers.
@@ -193,7 +195,8 @@ Applies to links A to E.
 When a client's CONNECT-UDP names group G, the relay:
 
 1. selects a healthy replica of G attached to it (`REPLICA_SELECTION`, default
-   least-loaded) and pins the client stream to that replica for its lifetime.
+   least-loaded, counting the open contexts over all of the replica's bind
+   streams) and pins the client stream to that replica for its lifetime.
    A request carrying `Warren-Connector: {node ID}` goes to one of that
    connector's bind streams, draining or not, whenever it has one attached
    to this relay; the relay never picks another replica for it then, and
