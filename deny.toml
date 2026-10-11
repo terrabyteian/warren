@@ -31,6 +31,12 @@ ignore = []
 allow = [
     "Apache-2.0",
     "MIT",
+    # aws-lc (aws-lc-rs, aws-lc-sys), rustls-webpki and untrusted.
+    "ISC",
+    # subtle (constant-time primitives under rustls) and parts of aws-lc.
+    "BSD-3-Clause",
+    # unicode-ident's Unicode data tables (proc-macro build dependency).
+    "Unicode-3.0",
 ]
 confidence-threshold = 0.93
 exceptions = []

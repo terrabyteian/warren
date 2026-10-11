@@ -122,11 +122,12 @@ start_deployment() {
   CONNECTOR_PID=$!
   PIDS+=("$CONNECTOR_PID")
 
-  local i
-  for i in $(seq 1 100); do
+  local tries=0
+  while [ "$tries" -lt 100 ]; do
     if relay_metric warren_relay_attachments | grep -qx 1; then
       return 0
     fi
+    tries=$((tries + 1))
     sleep 0.1
   done
   echo "error: the connector did not attach to the relay" >&2

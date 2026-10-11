@@ -63,6 +63,37 @@ jobs:
       - name: test the data-path build
         run: cargo test -p warren --no-default-features --features relay,connector --locked --offline
 
+  e2e-kernel:
+    name: kernel-mode end-to-end (network namespaces)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: nftables for the connector's NAT and the UDP-blocking test
+        run: sudo apt-get install -y --no-install-recommends nftables
+      - run: cargo build -p warren -p warren-harness --locked --offline
+      - name: relay, connector (TUN and NAT) and test client in namespaces
+        run: sudo scripts/e2e-kernel.sh target/debug
+
+  bench:
+    name: benchmarks (informative, never gating)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: nftables and WireGuard tools
+        run: sudo apt-get install -y --no-install-recommends nftables wireguard-tools
+      - run: cargo build --release -p warren -p warren-harness --locked --offline
+      - name: in-process benchmarks
+        run: scripts/bench-inprocess.sh target/release 5 --summary "$GITHUB_STEP_SUMMARY"
+      - name: kernel-mode benchmarks
+        run: sudo scripts/bench-kernel.sh target/release 10 --summary "$GITHUB_STEP_SUMMARY"
+
   deps:
     name: dependency policy
     runs-on: ubuntu-latest
@@ -71,7 +102,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install
-      - name: install pinned cargo-deny and cargo-vet (CI-only tools)
+      - name: install pinned cargo-deny and cargo-vet (CI-only tools, digest-verified)
         run: |
           scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"
           echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"

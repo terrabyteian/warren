@@ -12,20 +12,15 @@ publish.workspace = true
 aws-lc-rs.workspace = true
 bytes.workspace = true
 clap.workspace = true
-quinn.workspace = true
 rustls.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 warren-client.workspace = true
 warren-connector.workspace = true
 warren-core.workspace = true
 warren-masque.workspace = true
 warren-relay.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc.workspace = true
 
 [lints]
 workspace = true
