@@ -30,7 +30,8 @@ pub enum TrustClass {
 }
 
 impl TrustClass {
-    fn from_u64(v: u64) -> Option<TrustClass> {
+    /// The class with this `trustClass` value, if any.
+    pub fn from_u64(v: u64) -> Option<TrustClass> {
         match v {
             1 => Some(TrustClass::DeviceReported),
             2 => Some(TrustClass::ServerVerified),

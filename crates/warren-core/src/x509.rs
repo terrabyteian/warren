@@ -19,21 +19,18 @@ use yasna::models::ObjectIdentifier;
 use yasna::{ASN1Error, ASN1ErrorKind, BERReader, DERWriter, Tag};
 
 use crate::clock;
+use crate::identity::{self, TrustClass, WarrenIdentity};
 use crate::keys::{KeyError, PublicKey};
 
-/// `WARREN_OID_ARC` (docs/protocol.md section 14): the UUID-derived object
-/// identifier arc under which warren defines its own identifiers.
-pub const WARREN_OID_ARC: &str = "2.25.210934735780206524032646251764184590960";
-
-/// The object identifier of the warren identity extension,
-/// `WARREN_OID_ARC.1`.
-pub const IDENTITY_EXTENSION_OID: &str = "2.25.210934735780206524032646251764184590960.1";
-
-/// DER of [`IDENTITY_EXTENSION_OID`], tag and length included.
-const IDENTITY_EXTENSION_OID_DER: &[u8] = &[
-    0x06, 0x15, 0x69, 0x82, 0xbd, 0xb0, 0xc6, 0xda, 0xb8, 0xb1, 0xb2, 0x9b, 0x93, 0x9c, 0xdf, 0xf3,
-    0xff, 0xb0, 0x8d, 0xc4, 0xd4, 0x70, 0x01,
-];
+/// DER of the warren identity extension's object identifier
+/// (`WARREN_OID_ARC.1`, [`identity::identity_extension_oid`]), tag and length
+/// included.
+fn identity_extension_oid_der() -> Vec<u8> {
+    let value = identity::identity_extension_oid();
+    let mut der = vec![0x06, value.len() as u8];
+    der.extend(value);
+    der
+}
 
 const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
 const OID_PRIME256V1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
@@ -179,21 +176,8 @@ pub enum Usage {
 pub const AUTH_TIME_UNKNOWN: i64 = 0;
 
 /// The warren identity extension carried by user+device certificates
-/// (docs/protocol.md section 10.2).
-///
-/// ```text
-/// WarrenIdentity ::= SEQUENCE {
-///   version     INTEGER,             -- 1
-///   sessionId   UTF8String,
-///   authTime    INTEGER,             -- IdP authentication time, Unix seconds;
-///                                    -- 0 when the IdP did not report it
-///   mfa         BOOLEAN,             -- the sign-in used multi-factor authentication
-///   trustClass  INTEGER (1..3),      -- device enrollment trust class
-///   tunnelV4    OCTET STRING (SIZE (4)),
-///   tunnelV6    OCTET STRING (SIZE (16)),
-///   ...                              -- later versions append fields
-/// }
-/// ```
+/// (docs/protocol.md section 10.2), encoded and decoded by
+/// [`WarrenIdentity`], the same code connectors verify it with.
 ///
 /// Trust classes use the scale of posture signals: 1 device-reported,
 /// 2 server-verified, 3 hardware-attested.
@@ -214,65 +198,36 @@ pub struct Identity {
     pub tunnel_v6: Ipv6Addr,
 }
 
-const IDENTITY_VERSION: u64 = 1;
-
 impl Identity {
-    /// The DER encoding of the extension value.
+    /// The DER encoding of the extension value. The trust class must be 1 to
+    /// 3, which [`build_certificate`] checks before encoding.
     pub fn to_der(&self) -> Vec<u8> {
-        yasna::construct_der(|w| {
-            w.write_sequence(|w| {
-                w.next().write_u64(IDENTITY_VERSION);
-                w.next().write_utf8_string(&self.session_id);
-                w.next().write_i64(self.auth_time);
-                w.next().write_bool(self.mfa);
-                w.next().write_u8(self.trust_class);
-                w.next().write_bytes(&self.tunnel_v4.octets());
-                w.next().write_bytes(&self.tunnel_v6.octets());
-            })
-        })
+        WarrenIdentity {
+            session_id: self.session_id.clone(),
+            // A time before the epoch says no more than an unknown one.
+            auth_time: u64::try_from(self.auth_time).unwrap_or(0),
+            mfa: self.mfa,
+            trust_class: TrustClass::from_u64(u64::from(self.trust_class))
+                .expect("build_certificate checks the trust class"),
+            tunnel_v4: self.tunnel_v4,
+            tunnel_v6: self.tunnel_v6,
+        }
+        .to_der()
     }
 
     /// Decodes the extension value. Fields appended by later versions are
     /// skipped.
     pub fn from_der(der: &[u8]) -> Result<Identity, X509Error> {
-        yasna::parse_der(der, |r| {
-            r.read_sequence(|r| {
-                let version = r.next().read_u64()?;
-                if version < IDENTITY_VERSION {
-                    return Err(ASN1Error::new(ASN1ErrorKind::Invalid));
-                }
-                let session_id = r.next().read_utf8string()?;
-                let auth_time = r.next().read_i64()?;
-                let mfa = r.next().read_bool()?;
-                let trust_class = r.next().read_u8()?;
-                let v4: [u8; 4] = r
-                    .next()
-                    .read_bytes()?
-                    .try_into()
-                    .map_err(|_| ASN1Error::new(ASN1ErrorKind::Invalid))?;
-                let v6: [u8; 16] = r
-                    .next()
-                    .read_bytes()?
-                    .try_into()
-                    .map_err(|_| ASN1Error::new(ASN1ErrorKind::Invalid))?;
-                while r.read_optional(|r| r.read_der())?.is_some() {}
-                Ok(Identity {
-                    session_id,
-                    auth_time,
-                    mfa,
-                    trust_class,
-                    tunnel_v4: Ipv4Addr::from(v4),
-                    tunnel_v6: Ipv6Addr::from(v6),
-                })
-            })
-        })
-        .map_err(|_| err("malformed warren identity extension"))
-        .and_then(|id| {
-            if (1..=3).contains(&id.trust_class) {
-                Ok(id)
-            } else {
-                Err(err("identity extension trust class out of range"))
-            }
+        let id = WarrenIdentity::from_der(der)
+            .map_err(|_| err("malformed warren identity extension"))?;
+        Ok(Identity {
+            session_id: id.session_id,
+            auth_time: i64::try_from(id.auth_time)
+                .map_err(|_| err("identity extension auth time out of range"))?,
+            mfa: id.mfa,
+            trust_class: id.trust_class as u8,
+            tunnel_v4: id.tunnel_v4,
+            tunnel_v6: id.tunnel_v6,
         })
     }
 }
@@ -510,7 +465,7 @@ fn write_extensions(
     if let Some(identity) = &spec.identity {
         write_extension(
             w.next(),
-            IDENTITY_EXTENSION_OID_DER,
+            &identity_extension_oid_der(),
             false,
             identity.to_der(),
         );
@@ -721,7 +676,7 @@ fn read_extension(
                     Ok(id)
                 })
             })?;
-        } else if id == IDENTITY_EXTENSION_OID_DER {
+        } else if id == identity_extension_oid_der() {
             cert.identity = Some(Identity::from_der(&value).map_err(|_| invalid())?);
         } else if id == oid_der(OID_KEY_USAGE) {
             // Read for well-formedness; the profile's key usage is checked by
@@ -861,12 +816,12 @@ mod tests {
     }
 
     #[test]
-    fn identity_oid_constant_matches_its_dotted_form() {
+    fn identity_oid_matches_its_dotted_form() {
+        // `WARREN_OID_ARC.1`, docs/protocol.md section 14.
         assert_eq!(
-            oid_text_to_der(IDENTITY_EXTENSION_OID),
-            IDENTITY_EXTENSION_OID_DER
+            oid_text_to_der("2.25.97285697713720826090513308506181383429.1"),
+            identity_extension_oid_der()
         );
-        assert!(IDENTITY_EXTENSION_OID.starts_with(WARREN_OID_ARC));
         assert_eq!(oid_text_to_der("2.5.29.17"), oid_der(OID_SUBJECT_ALT_NAME));
     }
 
@@ -884,24 +839,21 @@ mod tests {
     #[test]
     fn identity_round_trips_and_tolerates_appended_fields() {
         let id = identity();
-        assert_eq!(Identity::from_der(&id.to_der()).unwrap(), id);
+        let der = id.to_der();
+        assert_eq!(Identity::from_der(&der).unwrap(), id);
         // A later version with one more field still decodes.
-        let extended = yasna::construct_der(|w| {
-            w.write_sequence(|w| {
-                w.next().write_u64(2);
-                w.next().write_utf8_string(&id.session_id);
-                w.next().write_i64(id.auth_time);
-                w.next().write_bool(id.mfa);
-                w.next().write_u8(id.trust_class);
-                w.next().write_bytes(&id.tunnel_v4.octets());
-                w.next().write_bytes(&id.tunnel_v6.octets());
-                w.next().write_utf8_string("future");
-            })
-        });
+        let mut fields = der[2..].to_vec();
+        fields.extend(yasna::construct_der(|w| w.write_utf8_string("future")));
+        let extended = yasna::construct_der(|w| w.write_sequence(|w| w.next().write_der(&fields)));
         assert_eq!(Identity::from_der(&extended).unwrap(), id);
-        let mut bad = id.clone();
-        bad.trust_class = 4;
-        assert!(Identity::from_der(&bad.to_der()).is_err());
+        // trustClass deviceReported(1) becomes 4, which no class has.
+        let mut bad = der.clone();
+        let at = bad
+            .windows(3)
+            .position(|b| b == [0x0a, 0x01, 0x01])
+            .unwrap();
+        bad[at + 2] = 4;
+        assert!(Identity::from_der(&bad).is_err());
     }
 
     struct Ca {
@@ -991,6 +943,25 @@ mod tests {
         assert_eq!(
             cert.authority_key_id.as_deref(),
             Some(&ca.key.public_key().key_id()[..])
+        );
+        // Connectors check client certificates with the data path's profile
+        // check, which must accept what the control plane issues.
+        let checked = crate::pki::check_client_profile(&der, "example.com").unwrap();
+        assert_eq!(
+            (checked.user.as_str(), checked.device.as_str()),
+            ("u-1", "d-1")
+        );
+        let id = identity();
+        assert_eq!(
+            checked.identity,
+            WarrenIdentity {
+                session_id: id.session_id,
+                auth_time: id.auth_time as u64,
+                mfa: id.mfa,
+                trust_class: TrustClass::DeviceReported,
+                tunnel_v4: id.tunnel_v4,
+                tunnel_v6: id.tunnel_v6,
+            }
         );
     }
 
