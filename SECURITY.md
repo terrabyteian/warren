@@ -5,7 +5,7 @@ about the design itself.
 
 ## Supported versions
 
-warren is at the design stage and has no releases yet. Until v1.0, fixes land
+warren is in early development and has no releases yet. Until v1.0, fixes land
 on `main`. Once releases exist, this section will list the versions that
 receive security fixes.
 

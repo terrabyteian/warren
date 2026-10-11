@@ -9,9 +9,29 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-warren-core.workspace = true
-warren-policy.workspace = true
+aws-lc-rs.workspace = true
+base64.workspace = true
+bytes.workspace = true
+form_urlencoded.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
 warren-console.workspace = true
+warren-core.workspace = true
+warren-policy = { workspace = true, features = ["compiler"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+warren-masque.workspace = true
 
 [lints]
 workspace = true

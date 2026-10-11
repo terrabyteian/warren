@@ -14,6 +14,7 @@ use aws_lc_rs::signature::{self, EcdsaKeyPair, KeyPair as _};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 
+use crate::cert;
 use crate::der::{self, Reader, tag};
 use crate::identity::{NodeRole, valid_id, valid_trust_domain};
 use crate::pki::oid;
@@ -158,35 +159,18 @@ impl NodeKey {
 
     /// The SubjectPublicKeyInfo, DER.
     pub fn spki(&self) -> Vec<u8> {
-        let alg = der::sequence(&[
-            &der::tlv(tag::OID, oid::EC_PUBLIC_KEY),
-            &der::tlv(tag::OID, oid::P256),
-        ]);
-        let mut bits = vec![0u8];
-        bits.extend_from_slice(self.pair.public_key().as_ref());
-        der::sequence(&[&alg, &der::tlv(tag::BIT_STRING, &bits)])
+        cert::p256_spki(self.pair.public_key().as_ref())
     }
 
     /// A certificate request signed by this key, with an empty subject: the
     /// control plane assigns the node's identity from the token.
     pub fn certificate_request(&self) -> Result<Vec<u8>, JoinError> {
-        let info = der::sequence(&[
-            &der::uint(tag::INTEGER, 0),
-            &der::sequence(&[]),
-            &self.spki(),
-            &der::tlv(tag::context(0), &[]),
-        ]);
-        let sig = self
-            .pair
-            .sign(&SystemRandom::new(), &info)
-            .map_err(|_| JoinError("signing failed".into()))?;
-        let mut bits = vec![0u8];
-        bits.extend_from_slice(sig.as_ref());
-        Ok(der::sequence(&[
-            &info,
-            &der::sequence(&[&der::oid(ECDSA_WITH_SHA256)]),
-            &der::tlv(tag::BIT_STRING, &bits),
-        ]))
+        certificate_request(&self.spki(), |info| {
+            self.pair
+                .sign(&SystemRandom::new(), info)
+                .map(|sig| sig.as_ref().to_vec())
+                .map_err(|_| JoinError("signing failed".into()))
+        })
     }
 
     /// The private key.
@@ -198,6 +182,29 @@ impl NodeKey {
     pub fn private_key_pem(&self) -> String {
         base64::pem("PRIVATE KEY", &self.pkcs8)
     }
+}
+
+/// A certificate request (PKCS#10, RFC 2986) for the key in `spki`, with an
+/// empty subject and no attributes. `sign` returns that key's ECDSA P-256
+/// SHA-256 signature over the request info, DER, so a key held in hardware
+/// signs without leaving its store.
+pub fn certificate_request<E>(
+    spki: &[u8],
+    sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
+) -> Result<Vec<u8>, E> {
+    let info = der::sequence(&[
+        &der::uint(tag::INTEGER, 0),
+        &der::sequence(&[]),
+        spki,
+        &der::tlv(tag::context(0), &[]),
+    ]);
+    let mut bits = vec![0u8];
+    bits.extend_from_slice(&sign(&info)?);
+    Ok(der::sequence(&[
+        &info,
+        &der::sequence(&[&der::oid(ECDSA_WITH_SHA256)]),
+        &der::tlv(tag::BIT_STRING, &bits),
+    ]))
 }
 
 /// Checks a certificate request's self-signature and returns its

@@ -3,6 +3,7 @@
 atomic-waker v1.1.2
 aws-lc-rs v1.18.1
 aws-lc-sys v0.45.0
+base64 v0.22.1
 bytes v1.12.1
 cc v1.8.0
 cfg-if v1.0.5

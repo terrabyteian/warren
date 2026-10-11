@@ -9,9 +9,12 @@ through outbound-only connectors and self-hosted relays.
 > traffic end to end through the relay, with per-flow policy decisions and
 > audit records, the HTTP/2 fallback and the 1280-byte MTU floor
 > ([scripts/e2e-kernel.sh](scripts/e2e-kernel.sh),
-> [docs/benchmarks.md](docs/benchmarks.md)). Until the control plane lands,
-> nodes read policy from a static bundle file. The control plane and the
-> macOS app are next.
+> [docs/benchmarks.md](docs/benchmarks.md)). The control plane runs too:
+> sign-in through any OpenID Connect IdP, device enrollment and approval,
+> short-lived user+device certificates, policy compiled to Cedar and
+> published as signed bundles, the revocation push channel, and audit. Until
+> relays and connectors consume the control plane's bundles, they read policy
+> from a static bundle file. The macOS app is next.
 
 ## What warren will be
 
@@ -44,7 +47,7 @@ Secure Enclave key and pushes revocations. See [docs/design.md](docs/design.md).
 Start with the [docs index](docs/README.md):
 [design](docs/design.md), [protocol](docs/protocol.md),
 [threat model](docs/threat-model.md), [policy](docs/policy.md),
-[dependencies](docs/dependencies.md).
+[dependencies](docs/dependencies.md), [API](docs/api/openapi.yaml).
 
 ## Building
 
@@ -58,6 +61,32 @@ cargo run --locked --offline -- --help
 ```
 
 [CONTRIBUTING.md](CONTRIBUTING.md) lists the full set of checks CI runs.
+
+## Running the control plane
+
+Write a configuration (see
+[docs/examples/control-plane.yaml](docs/examples/control-plane.yaml)) and a
+policy directory (see [docs/examples/policy](docs/examples/policy) and
+[docs/policy.md](docs/policy.md)), then:
+
+```sh
+warren policy check /etc/warren/policy        # compile and show every problem
+warren control-plane --config /etc/warren/control-plane.yaml
+```
+
+On first start the control plane creates its key-encryption key, its
+certificate authorities and its signing keys. Operate it from the same host
+through its local admin socket:
+
+```sh
+warren admin devices list
+warren admin devices approve <device>
+warren admin users disable alice@example.com      # cut within 10 seconds
+warren admin join-token create --role connector --group homelab --name lab-1
+warren admin policy reload
+```
+
+The APIs are described in [docs/api/openapi.yaml](docs/api/openapi.yaml).
 
 ## Contributing and security
 

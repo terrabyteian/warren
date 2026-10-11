@@ -1,0 +1,23 @@
+apiVersion: warren.dev/v1alpha1
+kind: AccessRequestPolicy
+metadata:
+  name: prod-db-break-glass
+spec:
+  who:
+    groups: [sre]
+  what:
+    apps: [prod-db]
+  approval:
+    approvers: { groups: [sre-leads] }
+    minApprovals: 1
+    automatic:                       # optional: approve without a human when these hold
+      when:
+        schedule:
+          timezone: UTC
+          windows: [{ days: [mon, tue, wed, thu, fri], from: "06:00", to: "18:00" }]
+  requireReason: true
+  maxDuration: 4h
+  defaultDuration: 1h
+  when:                              # must hold to request, and for the whole grant
+    posture: [managed-mac]
+    auth: { maxAge: 1h, mfa: true }

@@ -155,7 +155,8 @@ Field notes:
 
 - `protocol` is `tcp`, `udp`, `icmp` or `any`; `ports` is omitted for `icmp`
   and `any`. Omitting `ports` for `tcp` or `udp` means every port, which the
-  compiler flags as a warning.
+  compiler flags as a warning; an empty `ports` list is an error rather than
+  a quiet way to say the same.
 - Host names use synthetic addresses on the client; the connector resolves
   each destination's target inside the private network
   ([design.md](design.md#8-internal-names-and-addressing)). Targets must lie
@@ -164,7 +165,9 @@ Field notes:
 - `clientless.url` is the address users open in the browser; its host is a
   client-facing name under the same rules as any `host`.
   `clientless.upstream` is the URL the connector forwards clientless requests
-  to; its host must be one of the app's destination targets.
+  to; its host must be one of the app's destination targets, and its port
+  (443 for `https`, 80 for `http` unless given) one of that destination's
+  TCP ports.
 - `discoverable: true` makes the app visible to users who may request it, so a
   connection attempt fails with a "request access" reason instead of a lookup
   failure. A non-discoverable app stays invisible to users who cannot reach
@@ -309,9 +312,9 @@ spec:
 | `who` | `users` (IdP identifiers or emails), `groups` (IdP groups). At least one is required; there is no implicit "everyone". |
 | `what` | `apps` (names), `appSelector.matchLabels`. A selector needs at least one label; an empty one would match every app and is rejected. |
 | `when.posture` | Posture profiles that must all pass. |
-| `when.auth` | `maxAge` since the user last authenticated at the IdP; `mfa: true` requires that sign-in to have used MFA. |
+| `when.auth` | `maxAge` since the user last authenticated at the IdP; `mfa: true` requires that sign-in to have used MFA. When the IdP did not report when the user authenticated, freshness is unknown and `maxAge` fails, so the user is asked to sign in again. |
 | `when.via` | `client` (device tunnel) and/or `browser` (clientless). A `browser` session has no device, so a rule with `posture` never matches it. |
-| `when.schedule` | Weekly windows in a named time zone. |
+| `when.schedule` | Weekly windows in a time zone named as in the IANA Time Zone Database (`UTC`, `Europe/Berlin`); other names are refused. |
 | `when.network` | Source CIDRs, matched against the client's public address as observed by the relay. Trust it as much as you trust your relays, and never as the only condition. |
 
 Some things hold before any rule and no rule can change them (G1): the client
@@ -352,10 +355,15 @@ spec:
 
 - A requester can never approve their own request, whatever the approver list
   says.
+- A request belongs to the request policy it is made under. Only that
+  policy's approvers, or its automatic approval, can approve it, and only for
+  a requester its `who` names.
 - An approval creates a **grant**: runtime state owned by the control plane, not
-  an authored object. It names the user, app, reason, approvers and expiry, is
-  visible through the API, CLI and console, and is enforced on each connector's
-  own clock, so it ends on time even during a control-plane outage.
+  an authored object. It names the user, app, request policy, reason,
+  approvers and expiry, is visible through the API, CLI and console, and is
+  enforced on each connector's own clock, so it ends on time even during a
+  control-plane outage. Only the request policy that issued a grant honors it,
+  under that policy's own conditions.
 - Requests, approvals, denials, expiries and revocations are all audited with
   the stated reason. Revoking a grant cuts live connections within 10 seconds
   (G9).
@@ -394,13 +402,14 @@ The compiler generates a Cedar schema for each policy set. Its core is:
 ```cedarschema
 namespace Warren {
   entity Group;
-  entity User in [Group] { email: String };
+  entity User in [Group] { email: String, subject: String };
   entity AutoApprover;                      // warren's built-in automatic approver
   entity AppLabel;                          // one entity per "key=value" label
   entity App in [AppLabel] { connectorGroup: String };
 
   type Signal = { ok: Bool, trust: Long };  // trust: 1 device-reported,
                                             // 2 server-verified, 3 hardware-attested
+  type Grant = { app: App, policy: String }; // policy: the issuing AccessRequestPolicy
   type Device = {
     id: String,
     signals: {
@@ -418,7 +427,7 @@ namespace Warren {
     auth: { ageSeconds: Long, mfa: Bool },
     network?: { source: ipaddr },           // relay-observed
     time: { utcMinuteOfWeek: Long },        // plus one field per referenced time zone
-    grants: Set<App>,                       // the user's unexpired JIT grants
+    grants: Set<Grant>,                     // the user's unexpired JIT grants
   };
 
   action connect appliesTo { principal: [User], resource: [App], context: Context };
@@ -434,6 +443,15 @@ namespace Warren {
 The schema and the policy examples in this section validate in Cedar's strict
 mode with the Cedar 4.13 CLI.
 
+Users are identified by the IdP's issuer and subject identifier, which the
+IdP never reassigns. A user's `subject` is that identifier, and their `email`
+is the address the IdP asserted, lowercased, only when the ID token marks it
+verified (`email_verified: true`); otherwise, including when the IdP says
+nothing about verification, it is empty. They are what `who.users` matches,
+so an entry with `@` matches only a verified email: on an IdP that lets users
+set their own email address without verifying it, nobody can match another
+user's rules by taking their address.
+
 The enforcement point builds the request: the principal and groups from the
 signed entity snapshot, the device and its signals from the latest verified
 posture statement (dropping every signal once that statement is stale, as
@@ -442,19 +460,24 @@ absent and every check on it fails), authentication facts (IdP sign-in time
 and MFA) from the verified client certificate for tunnel sessions and from the
 verified clientless session assertion for browser sessions, never from the
 relay, and grants from the snapshot filtered by expiry on the local clock.
+A sign-in time of 0 means the IdP did not report one
+([protocol.md](protocol.md#102-userdevice-certificate)); `auth.ageSeconds` is
+then the time since 1970, so every `auth.maxAge` condition fails.
 
 ### 8.2 Rules
 
 Each rule compiles to exactly one Cedar policy. The policy ID is the rule's
-path, `<policy>/<rule>`, and an `@source` annotation records the file and line
-or the CRD it came from, so every decision points back to what a person wrote.
+path, `<policy>/<rule>`, carried in an `@id` annotation, and an `@source`
+annotation records the file and line of the rule or the CRD it came from, so
+every decision points back to what a person wrote. Cedar numbers policies when
+it parses a set, so enforcement points take each policy's ID from its `@id`.
 
 `observability/engineers-view-grafana` from [section 5](#5-access-policies)
 compiles to:
 
 ```cedar
 @id("observability/engineers-view-grafana")
-@source("config/policies/observability.yaml:6")
+@source("config/policies/observability.yaml:7")
 permit (
   principal in Warren::Group::"engineering",
   action == Warren::Action::"connect",
@@ -488,6 +511,37 @@ when {
 Because the posture profile requires a device, this rule can never match a
 browser session even though it lists `browser`; the compiler warns about such
 rules.
+
+`who` and `what` go into the policy scope when they name a single group, app
+or label, as above. Otherwise the scope is `principal is Warren::User` (so a
+rule naming users never matches the automatic approver) or `resource`, and
+they become the first conditions of the `when` clause: a disjunction of
+`principal in Warren::Group::"…"` for groups and
+`principal.email == "…"` or `principal.subject == "…"` for users (an entry
+with `@` is an email), and of `resource == Warren::App::"…"` for apps and
+`resource in Warren::AppLabel::"…"` for each selector label. A `via` that
+lists both `client` and `browser` adds no condition. A deny rule without
+`via` applies to every kind of session. Strings are written as Cedar string
+literals with quotes, backslashes and control characters escaped.
+
+A deny rule never lapses for want of context: where a condition reads
+something a request may lack, the device or one of its signals for posture
+and the source address for `network`, the deny's version of the condition
+holds when it is missing, so an unknown state is denied rather than let
+through:
+
+```cedar
+(if context has network then
+  context.network.source.isInRange(ip("198.51.100.0/24")) else true)
+```
+
+Every enforcement point must be able to fill each time zone's field, so a
+schedule may only name a zone from the IANA Time Zone Database. Each time
+zone a schedule names gets its own `context.time` field: the name
+lowercased with `+` written as `_plus_` and other punctuation as `_`
+(`Europe/Berlin` is `europe_berlin`, `Etc/GMT+5` is `etc_gmt_plus_5`), and
+`UTC` is `utcMinuteOfWeek`. The compiler refuses two zones whose fields would
+collide, and the bundle maps each field back to its zone.
 
 A label selector becomes membership in a label entity, and a deny rule becomes
 a `forbid`, which Cedar always lets win over any `permit`:
@@ -534,7 +588,10 @@ permit (
   action == Warren::Action::"approve",
   resource == Warren::App::"prod-db"
 )
-when { context.requester != principal };
+when {
+  context.requester in Warren::Group::"sre" &&
+  context.requester != principal
+};
 
 @id("prod-db-break-glass/connect")
 permit (
@@ -543,15 +600,18 @@ permit (
   resource == Warren::App::"prod-db"
 )
 when {
-  context.grants.contains(resource) &&
+  context.grants.contains({ app: resource, policy: "prod-db-break-glass" }) &&
   // managed-mac checks as in section 8.2, then:
   context.auth.mfa && context.auth.ageSeconds <= 3600
 };
 ```
 
+Approving requires the requester to be someone the policy's `who` names, and
+connecting requires a grant this policy issued, so one request policy's
+approvers, automatic approval or grants never stand in for another's.
 Automatic approval compiles to an `approve` policy whose principal is warren's
-built-in automatic approver, conditioned on the `automatic.when` clause as
-evaluated for the request:
+built-in automatic approver, conditioned on the requester and on the
+`automatic.when` clause as evaluated for the request:
 
 ```cedar
 @id("prod-db-break-glass/approve-automatic")
@@ -561,6 +621,7 @@ permit (
   resource == Warren::App::"prod-db"
 )
 when {
+  context.requester in Warren::Group::"sre" &&
   // minutes since Sunday 00:00 UTC: Monday 06:00 to 18:00, then one such
   // range per listed day
   context.request.time.utcMinuteOfWeek >= 1800 &&
@@ -573,10 +634,18 @@ when {
 - The compiled set is validated against the generated schema in Cedar's strict
   mode before it is signed and shipped. Any error is reported against the
   YAML file and line or CRD that produced it.
-- The compiler also rejects references to unknown apps, groups or profiles,
-  apps outside their connector group's scopes, hosts that conflict with another
-  app or claim a reserved name, and objects outside their source's delegation
-  scope; and it warns about rules that can never match.
+- The compiler also rejects references to unknown apps or profiles, time
+  zones outside the IANA Time Zone Database, apps outside their connector
+  group's scopes, hosts that conflict with another app or claim a reserved
+  name, objects outside their source's delegation scope, and deny rules whose
+  `appSelector` selects no app (a misspelt label would quietly switch the deny
+  off); and it warns about rules that can never match.
+- Group names belong to the IdP, and a correctly named group may have no
+  members yet, so the control plane checks them against the groups the IdP
+  has asserted for the users it knows (and, with SCIM, the synced
+  directory) and warns about any it has never seen, naming deny rules that
+  therefore block nobody yet. These warnings appear in the admin API's policy
+  status and the console when the control plane loads policy.
 
 ## 9. Explaining decisions
 
@@ -587,7 +656,9 @@ Every decision is explainable by named rules and named conditions (G12):
 - **Default denies** (no rule allowed) list the candidate rules, the ones
   whose `who` and `what` match the request, with the first condition each one
   failed. The compiler keeps each rule's conditions as separate expressions so
-  the explainer can evaluate them one at a time.
+  the explainer can evaluate them one at a time, and ships them in the policy
+  bundle with the reason code and message for each
+  ([protocol.md](protocol.md#112-relays-and-connectors-to-control-plane-link-e)).
 
 The connector turns the failing condition into the reason code and message the
 user sees ([protocol.md](protocol.md#7-flow-admission-and-deny-signalling)):

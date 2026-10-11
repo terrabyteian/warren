@@ -1,6 +1,6 @@
-//! Named parameters from docs/protocol.md section 14 that the data path
-//! uses. Fixed bounds are guarantees (docs/design.md section 4); the rest are
-//! initial defaults that benchmarks may change.
+//! Named parameters from docs/protocol.md section 14 that the data path or
+//! the control plane uses. Fixed bounds are guarantees (docs/design.md
+//! section 4); the rest are initial defaults that benchmarks may change.
 
 use std::time::Duration;
 
@@ -70,6 +70,9 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 /// The current warren protocol version, carried in `Warren-Protocol`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The request and response header carrying the protocol version.
+pub const PROTOCOL_HEADER: &str = "warren-protocol";
+
 /// The oldest protocol version each role still accepts (`VERSION_SKEW`:
 /// current and previous).
 pub const PROTOCOL_VERSION_MIN: u32 = 1;
@@ -101,3 +104,50 @@ pub const SYNTHETIC_POOL_V6: &str = "fd00:7761:7272:6e01::/64";
 
 /// How long a join token is valid (single use).
 pub const JOIN_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
+
+/// `POSTURE_STATEMENT_LIFETIME`: fixed upper bound (G11).
+pub const POSTURE_STATEMENT_LIFETIME_MAX: Duration = Duration::from_secs(300);
+
+/// `REVOCATION_DEADLINE`: commit at the control plane to the last cut
+/// connection (G9).
+pub const REVOCATION_DEADLINE: Duration = Duration::from_secs(10);
+
+/// `REVOCATION_APPLY_BUDGET`: node-side time to apply a revocation.
+pub const REVOCATION_APPLY_BUDGET: Duration = Duration::from_secs(1);
+
+/// `EVENT_HEARTBEAT_INTERVAL`: the longest the control plane stays silent on
+/// an event stream.
+pub const EVENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `EVENT_STALE_AFTER`: silence after which a node treats its event stream as
+/// broken and reconnects (3 heartbeats).
+pub const EVENT_STALE_AFTER: Duration = Duration::from_secs(6);
+
+/// `INFRA_CERT_LIFETIME`: relay, connector and control-plane certificates.
+pub const INFRA_CERT_LIFETIME: Duration = Duration::from_secs(24 * 3600);
+
+/// When a certificate issued at `issued_at` and valid until `not_after`
+/// should be renewed: at half-life (`CLIENT_CERT_RENEW_AT`, fixed at 0.5).
+/// Half-life counts from issuance, not from `notBefore`, which is backdated
+/// by the clock-skew allowance.
+pub fn renew_at(issued_at: i64, not_after: i64) -> i64 {
+    let mid = (i128::from(issued_at) + i128::from(not_after)) / 2;
+    // The midpoint of two i64 values is itself an i64.
+    i64::try_from(mid).unwrap_or(issued_at)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renew_at;
+
+    #[test]
+    fn renewal_is_at_half_life_without_overflow() {
+        assert_eq!(renew_at(100, 300), 200);
+        // A certificate cut short by its session's end, issued at 1000 with
+        // notBefore backdated to 880 and notAfter at 1100: renewal still
+        // lies ahead.
+        assert_eq!(renew_at(1_000, 1_100), 1_050);
+        assert_eq!(renew_at(-1, i64::MAX), i64::MAX / 2);
+        assert_eq!(renew_at(i64::MIN, i64::MAX), 0);
+    }
+}

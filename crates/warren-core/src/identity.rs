@@ -1,6 +1,6 @@
-//! warren identities: the `warren://` URIs in certificate SANs and the
-//! warren identity extension of user+device certificates
-//! (docs/protocol.md section 10).
+//! warren identities: the `warren://` URIs in certificate SANs, the warren
+//! identity extension of user+device certificates, and the names of things
+//! in a deployment (docs/protocol.md section 10).
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -30,7 +30,8 @@ pub enum TrustClass {
 }
 
 impl TrustClass {
-    fn from_u64(v: u64) -> Option<TrustClass> {
+    /// The class with this `trustClass` value, if any.
+    pub fn from_u64(v: u64) -> Option<TrustClass> {
         match v {
             1 => Some(TrustClass::DeviceReported),
             2 => Some(TrustClass::ServerVerified),
@@ -48,6 +49,11 @@ impl TrustClass {
         }
     }
 }
+
+/// `authTime` when the IdP did not report when the user authenticated:
+/// freshness is unknown, and the sign-in counts as older than any
+/// `auth.maxAge`, so freshness-gated rules ask the user to sign in again.
+pub const AUTH_TIME_UNKNOWN: u64 = 0;
 
 /// The contents of the warren identity extension.
 ///
@@ -226,27 +232,26 @@ pub enum WarrenUri {
     },
 }
 
-/// Whether `s` is a valid identifier segment: 1 to 128 characters from
-/// `[A-Za-z0-9._-]`.
+/// Whether `s` is a valid name or identifier: 1 to 63 characters of
+/// lowercase letters, digits and `-`, starting and ending with a letter or
+/// digit (a DNS label). Users, devices, nodes, connector groups and policy
+/// objects are all named this way, so a name sits in a URI path segment, a
+/// certificate or a Cedar entity ID without escaping, and two spellings of
+/// one name cannot differ only in case.
 pub fn valid_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 128
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 63
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && b[0] != b'-'
+        && b[b.len() - 1] != b'-'
 }
 
-/// Whether `s` is a valid trust domain: a lowercase DNS-style name.
+/// Whether `s` is a valid trust domain: a lowercase DNS name of at most 253
+/// characters whose labels are valid names.
 pub fn valid_trust_domain(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 253
-        && s.split('.').all(|l| {
-            !l.is_empty()
-                && l.len() <= 63
-                && l.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                && !l.starts_with('-')
-                && !l.ends_with('-')
-        })
+    !s.is_empty() && s.len() <= 253 && s.split('.').all(valid_id)
 }
 
 impl WarrenUri {
@@ -377,5 +382,28 @@ mod tests {
         let oid = identity_extension_oid();
         assert_eq!(oid[0], 105);
         assert_eq!(*oid.last().unwrap(), 1);
+    }
+
+    #[test]
+    fn names_are_lowercase_dns_labels() {
+        for ok in ["a", "grafana", "lab-web", "u-0123abcd", &"x".repeat(63)] {
+            assert!(valid_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "-a",
+            "a-",
+            "Grafana",
+            "a_b",
+            "a.b",
+            "\u{e9}",
+            &"x".repeat(64),
+        ] {
+            assert!(!valid_id(bad), "{bad}");
+        }
+        assert!(valid_trust_domain("example.com"));
+        assert!(!valid_trust_domain("example..com"));
+        assert!(!valid_trust_domain("Example.com"));
+        assert!(!valid_trust_domain("a-.example.com"));
     }
 }

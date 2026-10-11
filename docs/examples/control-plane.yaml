@@ -1,0 +1,85 @@
+# An example control-plane configuration. Start the control plane with
+#   warren control-plane --config control-plane.yaml
+# Relative paths are resolved from this file's directory.
+# crates/warren-control/tests/examples.rs keeps this file valid.
+
+# The deployment's name in every identity URI (warren://example.com/...).
+trustDomain: example.com
+
+# The organization URL clients are given. Its host is reserved: no app can
+# claim it.
+publicUrl: https://warren.example.com
+listen: "[::]:443"
+
+# The certificate the organization URL presents for browser sign-in and
+# enrollment: a PEM chain, leaf first, and its unencrypted PEM key, from
+# WebPKI or the organization's own CA. Replaced files are picked up within 30
+# seconds or on SIGHUP. Without tls, the control plane presents its own
+# certificate from the deployment's private CA, which browsers do not trust.
+# Turning tls on later: move existing relays and connectors to the internal
+# name below first (see docs/operating.md).
+tls:
+  certFile: /etc/warren/tls/tls.crt
+  keyFile: /etc/warren/tls/tls.key
+
+# More names for the control plane's own certificate. With tls set, the
+# first one other than publicUrl's host is the internal name: enrolled
+# clients, relays and connectors make every call there, verified against
+# the trust bundle, so it must reach the control plane from everywhere they
+# run. A cluster-local Service name for in-cluster relays and connectors
+# goes after it (see docs/operating.md).
+dnsNames: [nodes.warren.example.com]
+
+# Unauthenticated connections one source may hold (0: no limit), and the
+# addresses a PROXY protocol version 2 header is read and required from.
+# List a load balancer's own addresses (such as [192.0.2.10]) only when the
+# control plane sees connections arrive from them with PROXY protocol on at
+# the balancer; leave it empty when it sees clients' real addresses. Never
+# list node, pod or office ranges (see docs/operating.md).
+connections:
+  maxPerSource: 64
+  trustedProxies: []
+
+# State: the SQLite database, the admin socket and, by default, the
+# key-encryption key. Keep the key-encryption key on separate storage in
+# production (a mounted secret, for example) and back it up: without it the
+# CA and signing keys in the database cannot be opened.
+dataDir: /var/lib/warren
+# database: /var/lib/warren/warren.db       # default: warren.db in dataDir
+# adminSocket: /var/lib/warren/admin.sock   # default: admin.sock in dataDir (warren admin --socket)
+keyEncryptionKeyFile: /etc/warren/kek
+
+# The policy directory (see policy/ next to this file and docs/policy.md).
+# Reload it with `warren admin policy reload` or SIGHUP; a policy that does
+# not compile changes nothing.
+policyDir: /etc/warren/policy
+
+# Any OpenID Connect identity provider. Register warren with the redirect
+# URI https://warren.example.com/v1/auth/callback.
+idp:
+  issuer: https://idp.example.com
+  clientId: warren
+  clientSecretFile: /etc/warren/idp-client-secret   # omit for a public client (PKCE only)
+  scopes: [openid, email, profile, groups]
+  groupsClaim: groups
+  mfaAmrValues: [mfa]
+  # mfaAcrValues: []                                # acr values that also mean MFA
+  # caFile: /etc/warren/idp-ca.pem                  # for a privately signed IdP
+
+signIn:
+  sessionMaxLifetime: 7d
+
+devices:
+  approval: manual          # or automatic
+  poolV4: 100.96.0.0/16
+  poolV6: fd77:6172:7265:6e00::/64
+
+certificates:
+  clientLifetime: 4h        # at most 4h (G4)
+  clockSkewAllowance: 2m    # at most 2m
+
+audit:
+  file: /var/log/warren/audit.jsonl   # omit for standard output
+
+# Names no app may claim besides the control plane, the IdP and the relays.
+reservedNames: []

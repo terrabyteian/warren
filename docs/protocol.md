@@ -87,7 +87,8 @@ Applies to links A to E.
   keys.
 - Certificates are verified against the deployment trust bundle
   ([section 10](#10-certificate-profile)), not the system or WebPKI roots,
-  except where link D explicitly allows WebPKI before enrollment.
+  except where link D explicitly allows WebPKI
+  ([section 10.1](#101-trust-hierarchy)).
 - 0-RTT MUST NOT be used on any link (replay risk on CONNECT requests and
   control calls). Session resumption MAY be used; a resumption ticket MUST NOT
   outlive the certificate that authenticated the original handshake, and the
@@ -473,7 +474,22 @@ Requirements:
   given to clients at enrollment over HTTPS to the organization URL, verified
   with WebPKI or with a fingerprint preset by MDM. After enrollment clients
   verify relays, connectors and the control plane's client API against the
-  bundle only.
+  bundle only, and require the certificate to name the role they expect
+  (`warren://{td}/control-plane/{id}` for the control plane), so no relay or
+  connector certificate can stand in for the control plane. When the operator
+  gives the organization URL's host a certificate of its own (WebPKI or the
+  operator's CA), the control plane presents that one there for browser
+  sign-in and enrollment only: discovery, `/v1/auth/*` and `/v1/devices`,
+  which browsers and not-yet-enrolled clients verify against the system
+  trust store (or the CA their MDM profile installs). Every other call,
+  from enrolled clients and from relays and connectors, goes to an internal
+  name, where the control plane always presents its infrastructure
+  certificate; the enrollment answer gives clients that `api_base`, and the
+  control plane refuses those calls at the organization URL's host with
+  `421 misdirected_request`. A certificate the system trusts can therefore
+  never stand in for the control plane to an enrolled client. The control
+  plane never issues a node a certificate for its own or the IdP's host
+  names.
 - The trust domain `{td}` is the deployment's identifier, used in URI SANs.
 
 ### 10.2 User+device certificate
@@ -511,16 +527,21 @@ Requirements:
   Verifiers ignore fields appended after `tunnelAddresses`.
 - Group membership is deliberately absent: it changes faster than certificates
   and reaches connectors in signed policy bundles instead.
+- `notAfter` never passes the end of the sign-in session the certificate
+  belongs to (`SESSION_MAX_LIFETIME`).
 - Issuance needs a signed PKCS#10 request from the device key, a live session,
   an enabled user, an approved and unrevoked device, and passing baseline
-  posture. Renewal starts at half-life (`CLIENT_CERT_RENEW_AT`, fixed at 0.5)
-  over the existing mTLS channel.
+  posture. Renewal starts at half-life (`CLIENT_CERT_RENEW_AT`, fixed at 0.5),
+  counted from issuance rather than from `notBefore`, which is backdated by
+  `CLOCK_SKEW_ALLOWANCE`, over the existing mTLS channel.
+- No certificate is issued valid past its issuing CA's own `notAfter`; the
+  control plane warns 90 days before a CA expires.
 
 ### 10.3 Infrastructure certificates
 
 - Issued by the infrastructure CA to the control plane, relays and connectors.
-  Keys are generated on the node and never leave it (P-256 ECDSA or Ed25519,
-  `INFRA_KEY_ALG`).
+  Keys are generated on the node and never leave it (`INFRA_KEY_ALG`: ECDSA
+  P-256; Ed25519 may be added later).
 - SAN: DNS names where the node listens (control plane, relays) and a URI
   `warren://{td}/{role}/{id}`; connectors use
   `warren://{td}/connector/{group}/{id}`.
@@ -528,9 +549,17 @@ Requirements:
   connections; connectors need both (they are the TLS server of link C and the
   TLS client of links B and E).
 - Lifetime `INFRA_CERT_LIFETIME`, renewed at half-life over link E.
+- Subject: empty, as for client certificates; the SAN carries the identity.
+  Relays get both serverAuth and clientAuth as well: they listen on links A
+  and B and dial out on link E.
 - Bootstrap: a single-use join token, valid for `JOIN_TOKEN_LIFETIME` and scoped
   to one role (and one connector group), is exchanged with a signed request for
-  the first certificate.
+  the first certificate, as the join exchange below describes. An
+  administrator mints it for one node, naming the node and, for a relay, the
+  DNS names it listens on (`warren admin join-token create --role relay
+  --name relay-1 --dns-name relay1.example.com`); those are fixed in the
+  token's record and are what the certificate names. The control plane
+  stores only a hash of the token's secret.
 
 #### Join exchange
 
@@ -546,15 +575,35 @@ Requirements:
   verifies the endpoint's certificate against the root the token pins: the
   control plane presents the root in its chain, and its certificate must
   name the control-plane role in the token's trust domain.
-- The control plane checks the token (known, secret compared in constant
-  time, unused, unexpired, role and group as minted) and the request's
-  signature, spends the token, assigns the node ID and the names the token
-  was minted for, and answers `{"chain": [<base64 DER>, ...], "trustBundle":
+- The control plane checks the token (for its trust domain and root, known by
+  its secret's hash, unused, unexpired, ID, role and group as minted) and the
+  request's signature, spends the token, assigns the node ID and the names
+  the token was minted for, and answers `{"chain": [<base64 DER>, ...], "trustBundle":
   {"root": ..., "clientCas": [...], "infraCas": [...]}}`. Refusals are 4xx
   with an RFC 9457 problem body.
 - The node accepts the result only if the bundle's root is the pinned one,
   the certificate chains to it through an infrastructure CA, names the role
   and group the token was for, and carries the node's own key.
+
+### 10.4 Encodings
+
+- **Object identifiers.** `WARREN_OID_ARC` is a UUID-based arc (ITU-T
+  X.667, section 14), so it needs no registration. The identity extension is
+  `WARREN_OID_ARC.1`, encoded as in [section 10.2](#102-userdevice-certificate).
+  Until a hardware attestation path exists the enrollment trust class is
+  device-reported (1).
+- **`authTime`** in the identity extension comes only from the ID token's
+  `auth_time` claim, never from when the token was issued (a silent single
+  sign-on issues a fresh token without authenticating anyone). When the IdP
+  leaves `auth_time` out, `authTime` is 0: freshness is unknown, and every
+  `auth.maxAge` condition fails, asking the user to sign in again.
+- **Key identifiers** (Subject and Authority Key Identifier) are the leftmost
+  160 bits of the SHA-256 digest of the subject public key (RFC 7093,
+  method 1).
+- **Times** are UTCTime through 2049 and GeneralizedTime from 2050, in UTC
+  with seconds (RFC 5280 section 4.1.2.5).
+- **Signatures** on certificates and PKCS#10 requests are ECDSA P-256 with
+  SHA-256, with no algorithm parameters (RFC 5758).
 
 ## 11. Control channels
 
@@ -563,7 +612,10 @@ Requirements:
 HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
 
 1. **Discovery.** `GET https://{org}/.well-known/warren` returns the
-   deployment identifier, trust bundle, API base and sign-in endpoint.
+   deployment identifier, trust bundle, API base and sign-in endpoint. The
+   discovery API base is for sign-in and enrollment only; once enrolled, the
+   client makes every later call at the `api_base` the enrollment answer
+   gives ([section 10.1](#101-trust-hierarchy)).
 2. **Sign-in.** OAuth 2.0 for native apps (RFC 8252) in the system browser
    with authorization code and PKCE (RFC 7636). The control plane is the OIDC
    relying party toward the IdP; the client receives a one-time code bound to
@@ -594,9 +646,32 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
    needed, device revoked, posture failing, entitlements changed). It drives the
    UI only; clients are never part of enforcement.
 
+The endpoints, all JSON unless noted, are described in
+[api/openapi.yaml](api/openapi.yaml):
+
+| Step | Request |
+| --- | --- |
+| Discovery | `GET /.well-known/warren`: trust domain, API base, sign-in endpoints, trust bundle (root, client CA, infrastructure CA, PEM), protocol versions. Its `api_base` is for sign-in and enrollment only; later calls use the enrollment answer's `api_base`. |
+| Sign-in | `GET /v1/auth/authorize` with `redirect_uri`, `code_challenge`, `code_challenge_method=S256` and `state`, and `prompt=login` when the user asked to sign in again (after a `reauth_required` or `mfa_required` refusal), in the system browser. The redirect URI is an `http` loopback URI on `127.0.0.1` or `[::1]` with any port (RFC 8252 section 7.3), or one the deployment configures exactly; anything else gets an error page, never a redirect. The control plane runs its own authorization-code flow with PKCE and a nonce toward the IdP, sending `max_age` set to the shortest `auth.maxAge` in policy when policy has one, and `prompt=login` when the client sent it, so the IdP authenticates the user afresh rather than reuse its own session; either one obliges the IdP to report `auth_time` (OpenID Connect Core section 3.1.2.1), and an ID token without it leaves the sign-in time unknown ([section 10.4](#104-encodings)). It then redirects to the client with a one-time `code` (valid 2 minutes) and the client's `state`, or with `error` and a human-readable `error_description`. |
+| Session | `POST /v1/auth/token` with a compact JWS (ES256, `typ` `warren-session-request+jws`, the device's public key as the header's `jwk`) whose payload is `{code, code_verifier, redirect_uri, iat}`. The control plane checks the signature, the PKCE verifier, the redirect URI and that `iat` is within `CLOCK_SKEW_ALLOWANCE`, and returns a session bound to that key with a bearer token. |
+| Enrollment | `POST /v1/devices` with a PKCS#10 request signed by the session's device key, platform facts, and where the key lives. The answer, and `GET /v1/devices/current`, carry `api_base`: where every later call goes, verified against the trust bundle with the control-plane URI SAN ([section 10.1](#101-trust-hierarchy)). |
+| Certificates | `POST {api_base}/certificates` with a PKCS#10 request signed by the session's device key. Renewal is the same call. |
+| Entitlements | `GET {api_base}/entitlements`. |
+
+After sign-in the client authenticates link D calls with its session token,
+and every call that yields a credential also proves possession of the device
+key with a request signed by it, so a token alone yields nothing beyond the
+user's entitlement data. Errors are RFC 9457 problem details with a stable
+`reason` code and a `detail` written for people, so the client can always say
+why something failed (G12). Posture reports and notices arrive with
+posture evaluation in M2.
+
 ### 11.2 Relays and connectors to control plane (link E)
 
-- mTLS with infrastructure certificates.
+- mTLS with infrastructure certificates. When the organization URL's host has
+  an operator-supplied certificate ([section 10.1](#101-trust-hierarchy)),
+  nodes reach the control plane under one of its other names, where it still
+  presents its infrastructure certificate, and verify it against the bundle.
 - **Policy bundles.** (Until the control plane publishes them, M1 relays and
   connectors load the same content, unsigned, from a static file, reloaded
   on `SIGHUP` and subject to the same version rule.) The control plane
@@ -610,6 +685,43 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
 - **Event stream:** [section 12](#12-revocation-push-channel).
 - **Health and audit.** Nodes report health and metrics and export audit
   records to the control plane and any configured sinks.
+
+Encodings and endpoints ([api/openapi.yaml](api/openapi.yaml)):
+
+- **Joining.** The join exchange of [section 10.3](#103-infrastructure-certificates).
+  A joined node then fetches the policy-signing public key (a JWK) with
+  `GET /v1/node/policy-key` on this link, where it has verified the control
+  plane against the trust bundle its join pinned, and keeps it. Renewal at
+  half-life is `POST /v1/node/certificate` with a request signed by the same
+  key.
+- **Bundles.** `GET /v1/node/bundle` returns the latest bundle as a JWS in
+  compact serialization (RFC 7515), ES256, `typ` `warren-bundle+jws`, `kid`
+  the RFC 7638 thumbprint of the policy-signing key. The payload is JSON with
+  `format` `warren.bundle.v1`, `trust_domain`, `version`, `issued_at`,
+  `view`, the compiled `policy` (Cedar schema and policies, a `sha256:`
+  digest, and per rule the conditions the explainer evaluates one by one),
+  the Cedar `entities`, `apps`, `connector_groups`, approved `devices` with
+  their users and tunnel addresses, enabled `nodes`, `revocations`, and the
+  posture and session-assertion public `keys`. Each Cedar policy carries its
+  rule path in `@id`; enforcement points use it as the policy ID. The policy
+  also maps each `context.time` field schedules use to its time zone
+  (`timezones`). Nodes reject a bundle for another trust domain or view. The
+  control plane reads the state a bundle carries in the same transaction
+  that commits the bundle's `bundle_updated` event, so a bundle never lacks a
+  revocation whose event came before it.
+- **Views.** Each version is published twice: the connector view with
+  everything above, and the relay view with only what admission needs
+  (nodes, connector groups and revocations), so relays never hold the
+  policy, users, devices or apps.
+- **Audit.** `POST /v1/node/audit` takes OCSF-shaped records as JSON lines.
+  The control plane stamps `metadata.log_provider` with the reporting node's
+  identity, `metadata.log_name` with its role and `metadata.logged_time`, so
+  a node can pass its records off neither as another node's nor as the
+  control plane's, and writes them to its audit sinks.
+- **Node revocation.** Revoking a relay or connector also revokes every
+  certificate issued to it, so they stay in the revocation state by serial
+  until they expire, and a revoked node stays revoked even if a new node
+  later joins under its name.
 
 ## 12. Revocation push channel
 
@@ -640,7 +752,8 @@ Requirements, which together implement G9 and G10:
 7. **Measured.** Each event carries its commit time. Nodes acknowledge each
    event with the time it took effect and the number of connections it cut; the
    control plane exports the commit-to-cut latency as a metric, and an
-   integration test asserts the deadline (M2).
+   integration test asserts the deadline (the control plane's side from M1,
+   end to end through real connectors in M2).
 8. **Unknown events** are logged and trigger a bundle refresh; they are never
    silently ignored.
 9. **Partition.** While a node's stream is broken it keeps enforcing its last
@@ -652,6 +765,30 @@ Requirements, which together implement G9 and G10:
 11. **Defense in depth.** JIT grant expiry and certificate expiry are enforced
     on the node's own clock as well, so they hold even if the event never
     arrives.
+
+Wire format:
+
+- The stream is `GET /v1/node/events`, optionally with `?after=<seq>`, and
+  its body is `application/x-ndjson`: one JSON object per line, each with a
+  `type`.
+- Events: `{"type", "seq", "committed_at_ms", ...}` with these types and
+  fields: `user_disabled` (`user_id`), `device_disabled` (`device_id`,
+  `revoked`), `session_revoked` (`session_id`), `certificate_revoked`
+  (`serial`, `not_after`), `node_revoked` (`node_id`), `reauth_required`
+  (`user_id`) and `bundle_updated` (`version`, `digest`). Grant and posture
+  events arrive with just-in-time access and posture evaluation.
+- Heartbeats: `{"type": "heartbeat", "seq", "time_ms"}`, where `seq` is the
+  latest sequence number sent.
+- Snapshots: `{"type": "snapshot", "seq", "revocations", "bundle_version",
+  "bundle_digest"}`. A stream without `after`, or with an `after` the control
+  plane no longer retains (`EVENT_RETENTION`), starts with one.
+- Pruning drops only the oldest events, by sequence number, so the events
+  retained never have a gap. If events the node needs were pruned while it
+  resumed, the control plane sends a snapshot instead of skipping them.
+- The control plane closes the stream when the node is revoked, or when the
+  certificate it connected with is revoked or expires.
+- Acknowledgements: `POST /v1/node/events/ack` with
+  `{"acks": [{"seq", "applied_at_ms", "connections_cut"}]}`.
 
 ## 13. Versioning and extensibility
 
@@ -674,7 +811,7 @@ defaults are initial and may change with measurement.
 | Parameter | Value | Meaning |
 | --- | --- | --- |
 | `CLIENT_CERT_LIFETIME` | at most 4 h (fixed bound) | User+device certificate lifetime |
-| `CLIENT_CERT_RENEW_AT` | 0.5 (fixed) | Fraction of lifetime at which renewal starts |
+| `CLIENT_CERT_RENEW_AT` | 0.5 (fixed) | Fraction of lifetime, from issuance, at which renewal starts |
 | `REVOCATION_DEADLINE` | 10 s (fixed) | Commit to last connection cut |
 | `POSTURE_RECHECK_INTERVAL` | at most 5 min (fixed bound) | Maximum time between posture reports |
 | `POSTURE_STATEMENT_LIFETIME` | at most 5 min (fixed bound) | Validity of a signed posture statement, from its oldest observation |
@@ -687,6 +824,7 @@ defaults are initial and may change with measurement.
 | `INFRA_CERT_LIFETIME` | 24 h | Relay, connector and control-plane certificates |
 | `INFRA_KEY_ALG` | ECDSA P-256 | Infrastructure key algorithm |
 | `JOIN_TOKEN_LIFETIME` | 1 h, single use | Node bootstrap token |
+| `EVENT_RETENTION` | 7 days | How far back a node can resume the event stream |
 | `SESSION_MAX_LIFETIME` | deployment setting | Maximum time between browser sign-ins |
 | `TUNNEL_MTU` | 1280 | Initial tunnel MTU |
 | `TUNNEL_MTU_MAX` | 1380 | Largest tunnel MTU used when proven |

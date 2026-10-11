@@ -95,7 +95,7 @@ Removing a crate is the same in reverse; finish with `cargo vet prune`.
   These organizations publish cargo-vet audits of widely used crates;
   importing them is a trust decision recorded in `supply-chain/config.toml`.
 - **Default criteria:** `safe-to-deploy` for everything that ships.
-- **Publisher trust.** Every crate in the graph is trusted, for
+- **Publisher trust.** Every crate in the data path's graph is trusted, for
   `safe-to-deploy` until 2027-10-11, as published by the crates.io account
   that publishes its releases, or by the GitHub repository that publishes
   them through crates.io trusted publishing. Each entry in
@@ -106,10 +106,21 @@ Removing a crate is the same in reverse; finish with `cargo vet prune`.
   Windows, UEFI) say that too, since cargo-vet covers the whole lockfile.
   The M0 entries for the clap family follow the same rule. All of them lapse
   unless renewed by review.
-- There are no exemptions. Any future exemption carries a note and an issue to
-  remove it.
+- **Exemptions (M1 control plane).** The control plane brought in its own
+  dependency closure (section 5). Every crate of it that no audit or trust
+  entry covers is listed as a version-pinned exemption in
+  `supply-chain/config.toml`, each with a note. That includes crates that
+  appear in `Cargo.lock` only through optional features (Windows, wasm and
+  unused sqlx drivers, for example), because cargo-vet checks the whole lock
+  file. Replacing them with audits, imported audits or reviewed publisher
+  trust before the external audit is an open item
+  ([threat-model.md](threat-model.md#7-open-items), M4); a new version of an
+  exempted crate is not covered and fails `cargo vet` until it is reviewed.
 
 ## 5. The closure today (M1)
+
+M0 needed one direct dependency, `clap`, for the `warren` command line with
+the builder API only.
 
 The M1 data path adds these direct crates, each allowlisted with its reason in
 [`deps/allowlist.txt`](../deps/allowlist.txt): tokio, quinn, rustls,
@@ -119,26 +130,58 @@ harness, which never ships, also uses aws-lc-rs and serde_json. Interface,
 route and NAT setup for kernel forwarding calls the system's `ip` and `nft`
 commands instead of linking netlink or nftables crates.
 
-| Binary | Third-party crates (all release targets) |
-| --- | --- |
-| `warren` | 76 |
-| `warren-datapath` | 76 |
-| `warren-client` | 72 (the same without the clap family) |
+The M1 control plane adds the crates below. Each is allowlisted for exactly
+the workspace crates that use it.
 
-There are no duplicate versions. The graph brings three licenses beyond
-Apache-2.0 and MIT, each allowed in `deny.toml` with the crates that need it:
-ISC (aws-lc, rustls-webpki, untrusted), BSD-3-Clause (subtle, parts of aws-lc)
-and Unicode-3.0 (unicode-ident). `ring` appears in the lockfile only for wasm32
-(through quinn-proto) and in no release target's graph.
+| Crate | Used by | Why | Notes |
+| --- | --- | --- | --- |
+| aws-lc-rs 1.18.1 | warren-core, warren-control | ECDSA P-256 keys and signatures, SHA-256, AES-256-GCM for keys at rest, the CSPRNG | The one crypto provider (G16). FFI to AWS-LC, which aws-lc-sys builds from C and assembly. |
+| rustls 0.23.45, tokio-rustls 0.26.6 | warren-control | TLS 1.3 for the control-plane listener and IdP calls | TLS 1.3 only, aws-lc-rs provider, no `tls12` feature. |
+| rustls-native-certs 0.8.4 | warren-control | The operating system's trust store for a public IdP | An operator can point at a CA file instead. Reads the platform store; links no OpenSSL. |
+| tokio 1.53.2 | warren-control | Async runtime | |
+| hyper 1.11.1, hyper-util 0.1.21, http 1.5.0, http-body 1.1.0, http-body-util 0.1.5, bytes 1.12.1 | warren-control | HTTP/1.1 and HTTP/2 server for links D and E and the admin socket, and a one-request client for the IdP | No framework on top; routing is a `match`. |
+| sqlx 0.9.0 | warren-control | The one SQL layer: SQLite now, PostgreSQL later, one migration set (design section 12) | Features `runtime-tokio`, `sqlite-bundled` and `migrate` only: no query macros, no SQLite extension loading. Brings `url` and its Unicode tables. |
+| cedar-policy 4.13.0 | warren-policy | The policy engine (design section 7.5) | Only the `ipaddr` extension. Behind the `compiler` feature of warren-policy, so the data-path build does not link it yet. |
+| saphyr-parser 0.1.0 | warren-policy | YAML with line numbers for `@source` and diagnostics | Behind the `compiler` feature. The YAML crates built on serde are unmaintained or pull in much more. No `unsafe`. |
+| serde 1.0.229, serde_json 1.0.154 | warren-core, warren-policy, warren-control | JSON for the APIs, bundles, events, Cedar entities and audit records | |
+| base64 0.22.1 | warren-core, warren-control | base64 and base64url | The version sqlx already uses. |
+| form_urlencoded 1.2.2 | warren-control | Query strings and form bodies in the OIDC flow | Already in the closure through `url`. |
+| zeroize 1.9.1 | warren-core, warren-control | Wiping private keys and secrets after use | Already in the closure through aws-lc-rs. |
 
-`vendor/` is about 220 MB. Most of it is aws-lc-sys's C and assembly (68 MB)
-and the Windows import-library crates behind `ring`'s wasm32 and Windows
-paths (about 95 MB), which `cargo vendor` copies for every platform. Keeping
-`vendor/` lean is still the decision the Windows client milestone has to make.
+| Binary | Third-party crates | Notes |
+| --- | --- | --- |
+| `warren` | 231 | Cedar (about 100, mostly its build-time parser generator) and sqlx with `url` (about 60) are the bulk; the data path's transport stack is most of the rest. |
+| `warren-datapath` | 77 | The transport stack (tokio, quinn, rustls, h2), the aws-lc-rs build (cc, cmake and friends), clap, and base64 and zeroize through warren-core. |
+| `warren-client` | 73 | The data-path set without the clap family. |
+
+The control plane's crates stay out of both data-path closures:
+`scripts/check-closure.sh` checks them against
+[`deps/data-path-forbidden.txt`](../deps/data-path-forbidden.txt), and the
+baselines in [`deps/closure/`](../deps/closure) list every crate.
+
+Five duplicate versions are allowed in `deny.toml`, each with its reason:
+`cpufeatures` 0.2 (sha2 and keccak under sqlx and lalrpop), `hashbrown`
+(sqlx's hashlink), `itertools` (lalrpop), `syn` 2 (three proc-macro crates not
+yet on syn 3) and `unicode-width` (miette). The graph brings six licenses
+beyond Apache-2.0 and MIT, each allowed in `deny.toml` with the crates that
+need it: ISC (aws-lc, rustls-webpki, untrusted), BSD-3-Clause (subtle, parts
+of aws-lc), MIT-0 (aws-lc-sys), Unicode-3.0 (unicode-ident, and the icu_*
+crates under `url`), Zlib (foldhash) and Apache-2.0 WITH LLVM-exception
+(ar_archive_writer). `ring` appears in the lockfile only for wasm32 (through
+quinn-proto) and in no release target's graph.
+
+`vendor/` is about 340 MB. The largest parts are aws-lc-sys's C and assembly
+(69 MB), the Windows import-library crates behind `ring`'s wasm32 and Windows
+paths and tokio's Windows support (about 100 MB), which `cargo vendor` copies
+for every platform, and the SQLite amalgamation in libsqlite3-sys (21 MB).
+Keeping `vendor/` lean is still the decision the Windows client milestone has
+to make.
 
 ## 6. Measured projection for M1
 
-To size the M1 data path before writing it, the expected direct crates were
+This section is the M0 projection, kept for comparison with the measured
+closure in section 5. To size the M1 data path before writing it, the expected
+direct crates were
 resolved in a scratch crate outside this repository on 2026-10-11 against the
 then-latest crates.io releases, and measured with the same method as
 `scripts/check-closure.sh`. This is the projection as recorded at M0;

@@ -1,8 +1,8 @@
 # Contributing to warren
 
-Thanks for your interest. warren is at the design stage: the design documents
-in [docs/](docs/README.md) are the best place to start, and discussion of the
-design in issues is as valuable as code right now.
+Thanks for your interest. warren is in early development: the design
+documents in [docs/](docs/README.md) are the best place to start, and
+discussion of the design in issues is as valuable as code right now.
 
 ## Ground rules
 

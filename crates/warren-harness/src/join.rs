@@ -137,7 +137,7 @@ impl JoinServer {
     /// Mints a token for a relay (with its DNS names) or a connector in a
     /// group.
     pub fn mint(&self, group: Option<&str>, dns: &[&str]) -> JoinToken {
-        let id = base64::encode_url(&random(9));
+        let id = warren_core::keys::hex(&random(9));
         let secret = random(32);
         let exp = now() + params::JOIN_TOKEN_LIFETIME.as_secs();
         let role = if group.is_some() {
@@ -207,7 +207,7 @@ fn handle(
     };
     // Spend the token only once the request is known good.
     minted.used = true;
-    let node_id = format!("n{}", base64::encode_url(&random(6)));
+    let node_id = format!("n-{}", warren_core::keys::hex(&random(6)));
     let uri = match &minted.group {
         Some(g) => format!("warren://{}/connector/{g}/{node_id}", pki.trust_domain),
         None => format!("warren://{}/relay/{node_id}", pki.trust_domain),

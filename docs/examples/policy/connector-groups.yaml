@@ -1,0 +1,12 @@
+# The examples from docs/policy.md, kept compiling by
+# crates/warren-policy/tests/compile.rs.
+apiVersion: warren.dev/v1alpha1
+kind: ConnectorGroup
+metadata:
+  name: homelab
+spec:
+  destinations:
+    domains: ["*.lab.example.com", "nas.example.internal"]
+    cidrs: ["10.20.0.0/16", "fd00:20::/48"]
+  clientNames: ["*.lab.example.com", "*.access.example.com"]
+  relays: all          # or a list of relay names

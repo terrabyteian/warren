@@ -1,0 +1,18 @@
+apiVersion: warren.dev/v1alpha1
+kind: PostureProfile
+metadata:
+  name: managed-mac
+spec:
+  platform: macos
+  checks:
+    - signal: diskEncryption          # FileVault
+      remediation: Turn on FileVault in System Settings > Privacy & Security.
+    - signal: firewall
+    - signal: osVersion
+      minimum: "15.4"
+    - signal: screenLock
+      maxIdle: 5m
+    - signal: mdmEnrolled
+      minTrust: server-verified       # default for mdmEnrolled and securityAgent
+    - signal: securityAgent
+      name: corp-agent                # an integration configured on the control plane

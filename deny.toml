@@ -35,8 +35,15 @@ allow = [
     "ISC",
     # subtle (constant-time primitives under rustls) and parts of aws-lc.
     "BSD-3-Clause",
-    # unicode-ident's Unicode data tables (proc-macro build dependency).
+    # aws-lc-sys (code inherited from upstream projects).
+    "MIT-0",
+    # unicode-ident's Unicode data tables (proc-macro build dependency) and
+    # the icu_* crates under url (sqlx's connection strings).
     "Unicode-3.0",
+    # foldhash, the default hasher of hashbrown.
+    "Zlib",
+    # ar_archive_writer, a build dependency of stacker under Cedar's parser.
+    "Apache-2.0 WITH LLVM-exception",
 ]
 confidence-threshold = 0.93
 exceptions = []
@@ -61,7 +68,13 @@ deny = [
 ]
 # Kubernetes, operator and console crates are kept out of the data-path builds
 # by scripts/check-closure.sh, which checks each binary's closure separately.
-skip = []
+skip = [
+    { crate = "cpufeatures@0.2.17", reason = "sha2 0.10 (sqlx-core) and keccak (lalrpop's sha3) pin it; chacha20 under quinn uses 0.3" },
+    { crate = "hashbrown@0.16.1", reason = "hashlink 0.11 (sqlx-core) pins it; everything else uses 0.17" },
+    { crate = "itertools@0.14.0", reason = "lalrpop, Cedar's build-time parser generator, pins it; Cedar itself uses 0.15" },
+    { crate = "syn@2.0.119", reason = "logos-codegen, miette-derive and tracing-attributes still use syn 2; the rest use syn 3" },
+    { crate = "unicode-width@0.1.14", reason = "miette (Cedar's diagnostics) pins it; pretty uses 0.2" },
+]
 skip-tree = []
 
 [sources]

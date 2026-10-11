@@ -15,20 +15,31 @@ publish = false
 # See docs/dependencies.md before adding anything.
 [workspace.dependencies]
 aws-lc-rs = { version = "=1.18.1", default-features = false, features = ["aws-lc-sys", "alloc"] }
+base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 bytes = { version = "=1.12.1", default-features = false, features = ["std"] }
+cedar-policy = { version = "=4.13.0", default-features = false, features = ["ipaddr"] }
 clap = { version = "=4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+form_urlencoded = { version = "=1.2.2", default-features = false, features = ["std"] }
 h2 = { version = "=0.4.20", default-features = false }
 http = { version = "=1.5.0", default-features = false, features = ["std"] }
+http-body = { version = "=1.1.0", default-features = false }
+http-body-util = { version = "=0.1.5", default-features = false }
+hyper = { version = "=1.11.1", default-features = false, features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio", "server", "server-auto", "http1", "http2"] }
 libc = { version = "=0.2.190", default-features = false, features = ["std"] }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
+rustls-native-certs = { version = "=0.8.4", default-features = false }
 rustls-webpki = { version = "=0.103.15", default-features = false, features = ["std"] }
+saphyr-parser = { version = "=0.1.0", default-features = false }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate"] }
 tokio = { version = "=1.53.2", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
-tokio-rustls = { version = "=0.26.6", default-features = false }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std", "json"] }
+zeroize = { version = "=1.9.1", default-features = false, features = ["alloc"] }
 
 # Workspace crates.
 warren-client = { path = "crates/warren-client" }
