@@ -10,6 +10,7 @@ pub mod connect;
 pub mod h2;
 pub mod h3;
 pub mod http;
+pub mod join;
 pub mod session;
 pub mod tunnel;
 pub mod varint;

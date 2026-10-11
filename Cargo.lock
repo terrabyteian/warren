@@ -772,6 +772,7 @@ name = "warren"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "rustls",
  "tokio",
  "tracing",
  "warren-connector",
@@ -828,6 +829,7 @@ dependencies = [
 name = "warren-core"
 version = "0.0.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "libc",
  "quinn",
@@ -866,6 +868,8 @@ dependencies = [
  "http",
  "quinn",
  "rustls",
+ "rustls-webpki",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tracing",

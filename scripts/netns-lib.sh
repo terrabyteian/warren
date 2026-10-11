@@ -33,6 +33,7 @@ netns_cleanup() {
   done
   for ns in "$NS_CLI" "$NS_RELAY" "$NS_CONN" "$NS_APP"; do
     ip netns del "$ns" 2>/dev/null || true
+    rm -rf "/etc/netns/$ns"
   done
 }
 
@@ -92,16 +93,36 @@ write_bundle() {
 EOF
 }
 
-# Creates the PKI and bundle and starts the apps, relay and connector.
-# Sets WORK, HARNESS and WARREN.
+# Starts a stand-in control-plane join endpoint, the apps, and a relay and a
+# connector that join the deployment with single-use tokens on first
+# start. Sets WORK, HARNESS, WARREN and CONNECTOR_PID.
 start_deployment() {
   local bin=$1
   WARREN="$bin/warren"
   HARNESS="$bin/warren-harness"
   WORK=$(mktemp -d)
-  "$HARNESS" pki --dir "$WORK/pki" --trust-domain lab.test --relay-dns relay.lab.test \
-    --group homelab --client "alice,mac-1,100.96.0.2,fd00:7761:7272:6e00::2" >/dev/null
+  # A separate PKI serves the TLS-over-TCP baseline.
+  "$HARNESS" pki --dir "$WORK/pki" --trust-domain bench.test --relay-dns relay.lab.test \
+    --group homelab >/dev/null
   write_bundle "$WORK/bundle.json" 1 ""
+
+  # The join endpoint answers as cp.lab.test from the relay namespace,
+  # where the relay and the connector both reach it. `ip netns exec`
+  # mounts /etc/netns/NS/hosts over /etc/hosts.
+  local ns
+  for ns in "$NS_RELAY" "$NS_CONN"; do
+    mkdir -p "/etc/netns/$ns"
+    printf '127.0.0.1 localhost\n172.31.1.1 cp.lab.test\n' >"/etc/netns/$ns/hosts"
+  done
+  ip netns exec "$NS_RELAY" "$HARNESS" join-serve --dir "$WORK/cp" --trust-domain lab.test \
+    --listen 172.31.1.1:8443 --name cp.lab.test --relay-dns relay.lab.test --group homelab \
+    --client "alice,mac-1,100.96.0.2,fd00:7761:7272:6e00::2" >"$WORK/join.log" 2>&1 &
+  PIDS+=($!)
+  local tries=0
+  while [ ! -s "$WORK/cp/tokens.json" ] && [ "$tries" -lt 100 ]; do
+    tries=$((tries + 1))
+    sleep 0.1
+  done
 
   # Background processes run through `ip netns exec` directly (not the
   # in_ns function, which would fork a subshell) so $! is the process
@@ -111,18 +132,18 @@ start_deployment() {
     --tls 10.77.0.11:8443 --tls-cert "$WORK/pki/tls.pem" --tls-key "$WORK/pki/tls.key" \
     >"$WORK/apps.log" 2>&1 &
   PIDS+=($!)
-  ip netns exec "$NS_RELAY" "$WARREN" relay --listen 0.0.0.0:443 --cert "$WORK/pki/relay.pem" \
-    --key "$WORK/pki/relay.key" --trust-bundle "$WORK/pki/trust" --bundle "$WORK/bundle.json" \
-    --metrics 127.0.0.1:9090 2>"$WORK/relay.log" &
+  ip netns exec "$NS_RELAY" "$WARREN" relay --listen 0.0.0.0:443 \
+    --join-token "$(jq -r .relay "$WORK/cp/tokens.json")" --state-dir "$WORK/relay-state" \
+    --bundle "$WORK/bundle.json" --metrics 127.0.0.1:9090 2>"$WORK/relay.log" &
   PIDS+=($!)
   ip netns exec "$NS_CONN" "$WARREN" connector --group homelab --relay relay.lab.test@172.31.1.1:443 \
-    --cert "$WORK/pki/connector.pem" --key "$WORK/pki/connector.key" --trust-bundle "$WORK/pki/trust" \
+    --join-token "$(jq -r .connector "$WORK/cp/tokens.json")" --state-dir "$WORK/connector-state" \
     --bundle "$WORK/bundle.json" --audit "$WORK/audit.jsonl" --tun-name warren0 \
     --metrics 127.0.0.1:9091 2>"$WORK/connector.log" &
   CONNECTOR_PID=$!
   PIDS+=("$CONNECTOR_PID")
 
-  local tries=0
+  tries=0
   while [ "$tries" -lt 100 ]; do
     if relay_metric warren_relay_attachments | grep -qx 1; then
       return 0
@@ -131,7 +152,7 @@ start_deployment() {
     sleep 0.1
   done
   echo "error: the connector did not attach to the relay" >&2
-  tail -n 20 "$WORK/relay.log" "$WORK/connector.log" >&2
+  tail -n 20 "$WORK/join.log" "$WORK/relay.log" "$WORK/connector.log" >&2
   return 1
 }
 
@@ -142,6 +163,6 @@ relay_metric() {
 
 client() {
   in_ns "$NS_CLI" "$HARNESS" client --relay relay.lab.test@172.31.2.1:443 --group homelab \
-    --cert "$WORK/pki/client-alice-mac-1.pem" --key "$WORK/pki/client-alice-mac-1.key" \
-    --trust-bundle "$WORK/pki/trust" --trust-domain lab.test "$@"
+    --cert "$WORK/cp/client-alice-mac-1.pem" --key "$WORK/cp/client-alice-mac-1.key" \
+    --trust-bundle "$WORK/cp/trust" --trust-domain lab.test "$@"
 }

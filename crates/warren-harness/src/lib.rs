@@ -4,5 +4,6 @@
 
 pub mod bench;
 pub mod deploy;
+pub mod join;
 pub mod pki;
 pub mod serve;

@@ -2,13 +2,14 @@
 //! node bundle, logging, metrics, and signals.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::ArgMatches;
 use warren_core::bundle::{Bundle, CompiledBundle, NodeState};
+use warren_core::join::{JoinToken, NodeKey};
 use warren_core::metrics::Registry;
-use warren_core::pki::TrustBundle;
+use warren_core::pki::{self, TrustBundle};
 use warren_core::tls::Credentials;
 
 /// Everything a node loads at start.
@@ -23,8 +24,70 @@ fn path(m: &ArgMatches, name: &str) -> PathBuf {
     PathBuf::from(m.get_one::<String>(name).expect("required argument"))
 }
 
-/// Loads credentials, the trust bundle and the node bundle, and starts
-/// logging.
+/// Joins with a token into `dir`, unless an earlier join left credentials
+/// there; returns the certificate, key and trust bundle paths.
+fn join_into(
+    token: &str,
+    dir: &Path,
+    trust_domain: &str,
+) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let (cert, key, trust) = (dir.join("cert.pem"), dir.join("key.pem"), dir.join("trust"));
+    if cert.exists() && key.exists() && trust.exists() {
+        tracing::info!(dir = %dir.display(), "using credentials from an earlier join");
+        return Ok((cert, key, trust));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let token = JoinToken::parse(token, now).map_err(|e| e.to_string())?;
+    if token.td != trust_domain {
+        return Err(format!(
+            "the token joins {}, the bundle is for {trust_domain}",
+            token.td
+        ));
+    }
+    let node_key = NodeKey::generate().map_err(|e| e.to_string())?;
+    let joined = runtime()?
+        .block_on(warren_masque::join::join(&token, &node_key))
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&trust).map_err(|e| format!("{}: {e}", trust.display()))?;
+    let pem = |certs: &[rustls::pki_types::CertificateDer<'_>]| -> String {
+        certs
+            .iter()
+            .map(|c| warren_core::base64::pem("CERTIFICATE", c))
+            .collect()
+    };
+    let write = |p: &Path, text: String| {
+        std::fs::write(p, text).map_err(|e| format!("{}: {e}", p.display()))
+    };
+    write(
+        &trust.join(pki::ROOT_CA_FILE),
+        pem(std::slice::from_ref(&joined.trust.root)),
+    )?;
+    write(
+        &trust.join(pki::CLIENT_CA_FILE),
+        pem(&joined.trust.client_cas),
+    )?;
+    write(
+        &trust.join(pki::INFRA_CA_FILE),
+        pem(&joined.trust.infra_cas),
+    )?;
+    write(&key, node_key.private_key_pem())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    // The certificate last: its presence marks a completed join.
+    write(&cert, pem(&joined.credentials.chain))?;
+    tracing::info!(role = %joined.identity.role, id = %joined.identity.id, "joined the deployment");
+    Ok((cert, key, trust))
+}
+
+/// Loads credentials (joining first if asked to), the trust bundle and the
+/// node bundle, and starts logging.
 pub fn setup(m: &ArgMatches) -> Result<NodeSetup, String> {
     warren_core::logging::init(
         m.get_one::<String>("log-level")
@@ -32,9 +95,13 @@ pub fn setup(m: &ArgMatches) -> Result<NodeSetup, String> {
     );
     let bundle_path = path(m, "bundle");
     let bundle = Bundle::load(&bundle_path).map_err(|e| e.to_string())?;
-    let trust = TrustBundle::load_dir(&bundle.trust_domain, &path(m, "trust-bundle"))
-        .map_err(|e| e.to_string())?;
-    let credentials = Credentials::load(&path(m, "cert"), &path(m, "key"))?;
+    let (cert, key, trust_dir) = match m.get_one::<String>("join-token") {
+        Some(token) => join_into(token, &path(m, "state-dir"), &bundle.trust_domain)?,
+        None => (path(m, "cert"), path(m, "key"), path(m, "trust-bundle")),
+    };
+    let trust =
+        TrustBundle::load_dir(&bundle.trust_domain, &trust_dir).map_err(|e| e.to_string())?;
+    let credentials = Credentials::load(&cert, &key)?;
     Ok(NodeSetup {
         credentials,
         trust: Arc::new(trust),

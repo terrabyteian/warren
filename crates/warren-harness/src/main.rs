@@ -80,6 +80,37 @@ fn cli() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("join-serve")
+                .about("Stand in for the control plane's join endpoint, with a fresh test PKI")
+                .arg(Arg::new("dir").long("dir").required(true))
+                .arg(Arg::new("trust-domain").long("trust-domain").required(true))
+                .arg(
+                    Arg::new("listen")
+                        .long("listen")
+                        .required(true)
+                        .value_name("ADDR"),
+                )
+                .arg(
+                    Arg::new("name")
+                        .long("name")
+                        .required(true)
+                        .help("DNS name tokens use for the endpoint"),
+                )
+                .arg(
+                    Arg::new("relay-dns")
+                        .long("relay-dns")
+                        .action(ArgAction::Append)
+                        .required(true),
+                )
+                .arg(Arg::new("group").long("group").required(true))
+                .arg(
+                    Arg::new("client")
+                        .long("client")
+                        .action(ArgAction::Append)
+                        .value_name("USER,DEVICE,IPV4,IPV6"),
+                ),
+        )
+        .subcommand(
             Command::new("serve")
                 .about("Run stand-in apps")
                 .arg(
@@ -215,6 +246,44 @@ fn pki_cmd(m: &ArgMatches) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     emit(json!({ "pki": dir.display().to_string(), "trust_domain": pki.trust_domain }));
+    Ok(())
+}
+
+/// Writes the trust bundle and client credentials, mints one relay and one
+/// connector token into `tokens.json`, and serves joins until stopped.
+async fn join_serve_cmd(m: &ArgMatches) -> Result<(), String> {
+    let dir = PathBuf::from(s(m, "dir"));
+    let pki = Arc::new(TestPki::new(s(m, "trust-domain")));
+    pki.write_bundle(&dir.join("trust"))
+        .map_err(|e| e.to_string())?;
+    for c in m.get_many::<String>("client").into_iter().flatten() {
+        let parts: Vec<&str> = c.split(',').collect();
+        let [user, device, v4, v6] = parts[..] else {
+            return Err(format!("--client {c}: expected USER,DEVICE,IPV4,IPV6"));
+        };
+        write_credentials(
+            &dir,
+            &format!("client-{user}-{device}"),
+            &pki.client(&ClientCert::new(user, device, v4, v6)),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let server =
+        warren_harness::join::JoinServer::start_on(pki, s(m, "name"), sock(s(m, "listen"))?)
+            .await
+            .map_err(|e| e.to_string())?;
+    let dns: Vec<&str> = m
+        .get_many::<String>("relay-dns")
+        .expect("required")
+        .map(String::as_str)
+        .collect();
+    let tokens = json!({
+        "relay": server.mint(None, &dns).encode(),
+        "connector": server.mint(Some(s(m, "group")), &[]).encode(),
+    });
+    std::fs::write(dir.join("tokens.json"), tokens.to_string()).map_err(|e| e.to_string())?;
+    emit(json!({ "serving": "join", "addr": server.addr.to_string() }));
+    std::future::pending::<()>().await;
     Ok(())
 }
 
@@ -650,6 +719,7 @@ fn main() -> ExitCode {
     let result = rt.block_on(async {
         match matches.subcommand() {
             Some(("pki", m)) => pki_cmd(m),
+            Some(("join-serve", m)) => join_serve_cmd(m).await,
             Some(("serve", m)) => serve_cmd(m).await,
             Some(("client", m)) => client_cmd(m).await,
             Some(("bench", m)) => bench_cmd(m).await,

@@ -73,6 +73,18 @@ impl H2Client {
         tls: Arc<rustls::ClientConfig>,
         server_name: rustls::pki_types::ServerName<'static>,
     ) -> Result<(H2Client, ClientTlsInfo), H2Error> {
+        Self::connect_with(tcp, tls, server_name, true).await
+    }
+
+    /// Like [`H2Client::connect`]; `extended_connect` says whether to wait
+    /// for the server to enable extended CONNECT (tunnels need it; plain
+    /// requests do not).
+    pub async fn connect_with(
+        tcp: TcpStream,
+        tls: Arc<rustls::ClientConfig>,
+        server_name: rustls::pki_types::ServerName<'static>,
+        extended_connect: bool,
+    ) -> Result<(H2Client, ClientTlsInfo), H2Error> {
         tcp.set_nodelay(true)?;
         let tls = tokio_rustls::TlsConnector::from(tls)
             .connect(server_name, tcp)
@@ -99,7 +111,7 @@ impl H2Client {
         // h2 sends nothing until told, and exposes no event for the peer's
         // SETTINGS; poll briefly for extended CONNECT to be enabled.
         let deadline = tokio::time::Instant::now() + crate::h3::SETTINGS_TIMEOUT;
-        while !send_request.is_extended_connect_protocol_enabled() {
+        while extended_connect && !send_request.is_extended_connect_protocol_enabled() {
             if tokio::time::Instant::now() >= deadline {
                 return Err(H2Error::NoExtendedConnect);
             }
@@ -141,6 +153,51 @@ impl H2Client {
             headers: header_pairs(&parts.headers)?,
         };
         Ok((head, send, recv))
+    }
+}
+
+impl H2Client {
+    /// Sends a request with a body and returns the response with its body,
+    /// which may be at most `max_body` bytes.
+    pub async fn exchange(
+        &mut self,
+        head: &RequestHead,
+        body: Bytes,
+        max_body: usize,
+    ) -> Result<(ResponseHead, Bytes), H2Error> {
+        let uri = format!(
+            "{}://{}{}",
+            head.scheme.as_deref().unwrap_or("https"),
+            head.authority.as_deref().unwrap_or_default(),
+            head.path.as_deref().unwrap_or("/"),
+        );
+        let mut builder = ::http::Request::builder()
+            .method(head.method.as_str())
+            .uri(uri);
+        for (n, v) in &head.headers {
+            builder = builder.header(n.as_str(), v.as_str());
+        }
+        let request = builder
+            .body(())
+            .map_err(|e| H2Error::Message(e.to_string()))?;
+        let mut ready = self.send_request.clone().ready().await?;
+        let (response, mut send) = ready.send_request(request, false)?;
+        send_all(&mut send, body).await?;
+        send.send_data(Bytes::new(), true)?;
+        let response = response.await?;
+        let (parts, mut recv) = response.into_parts();
+        let mut out = bytes::BytesMut::new();
+        while let Some(chunk) = recv_chunk(&mut recv).await? {
+            if out.len() + chunk.len() > max_body {
+                return Err(H2Error::Message("response body too large".into()));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        let head = ResponseHead {
+            status: parts.status.as_u16(),
+            headers: header_pairs(&parts.headers)?,
+        };
+        Ok((head, out.freeze()))
     }
 }
 

@@ -93,3 +93,6 @@ pub const SYNTHETIC_POOL_V4: &str = "100.80.0.0/16";
 
 /// Default `SYNTHETIC_POOL_V6` (a deployment setting).
 pub const SYNTHETIC_POOL_V6: &str = "fd00:7761:7272:6e01::/64";
+
+/// How long a join token is valid (single use).
+pub const JOIN_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);

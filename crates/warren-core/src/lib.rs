@@ -8,9 +8,11 @@
 //! and `docs/protocol.md`.
 
 pub mod audit;
+pub mod base64;
 pub mod bundle;
 pub mod der;
 pub mod identity;
+pub mod join;
 pub mod logging;
 pub mod metrics;
 pub mod packet;

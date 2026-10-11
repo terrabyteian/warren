@@ -24,22 +24,37 @@ fn node_args(cmd: Command) -> Command {
         Arg::new("cert")
             .long("cert")
             .value_name("PEM")
-            .required(true)
+            .requires_all(["key", "trust-bundle"])
+            .required_unless_present("join-token")
             .help("Infrastructure certificate chain, leaf first"),
     )
     .arg(
         Arg::new("key")
             .long("key")
             .value_name("PEM")
-            .required(true)
+            .requires("cert")
             .help("Private key for the certificate"),
     )
     .arg(
         Arg::new("trust-bundle")
             .long("trust-bundle")
             .value_name("DIR")
-            .required(true)
+            .requires("cert")
             .help("Directory with root-ca.pem, client-ca.pem and infra-ca.pem"),
+    )
+    .arg(
+        Arg::new("join-token")
+            .long("join-token")
+            .value_name("TOKEN")
+            .conflicts_with("cert")
+            .requires("state-dir")
+            .help("Join the deployment with this single-use token on first start"),
+    )
+    .arg(
+        Arg::new("state-dir")
+            .long("state-dir")
+            .value_name("DIR")
+            .help("Where a joined node keeps its key, certificate and trust bundle"),
     )
     .arg(
         Arg::new("bundle")

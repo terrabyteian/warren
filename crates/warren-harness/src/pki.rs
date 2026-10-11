@@ -228,11 +228,28 @@ pub struct Issuer<'a> {
 
 /// Builds and signs a certificate. `issuer` `None` means self-signed.
 pub fn issue(spec: &CertSpec, subject_key: &KeyPair, issuer: Option<&Issuer<'_>>) -> Vec<u8> {
-    let subject = name(spec.subject_cn.as_deref());
-    let (issuer_key, issuer_name) = match issuer {
-        Some(i) => (i.key, i.name.clone()),
-        None => (subject_key, subject.clone()),
+    let own = Issuer {
+        key: subject_key,
+        name: name(spec.subject_cn.as_deref()),
     };
+    issue_for(spec, &subject_key.spki(), issuer.unwrap_or(&own))
+}
+
+/// The key identifier of a SubjectPublicKeyInfo: the first 20 bytes of
+/// the SHA-256 of its public key bits.
+fn spki_key_id(spki: &[u8]) -> Vec<u8> {
+    let mut outer = warren_core::der::Reader::new(spki);
+    let mut seq = warren_core::der::Reader::new(outer.read(tag::SEQUENCE).expect("SPKI"));
+    seq.read(tag::SEQUENCE).expect("algorithm");
+    let bits = seq.read(tag::BIT_STRING).expect("key bits");
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &bits[1..]).as_ref()[..20].to_vec()
+}
+
+/// Builds and signs a certificate for a public key (from a certificate
+/// request, say) whose private key this process never sees.
+pub fn issue_for(spec: &CertSpec, subject_spki: &[u8], issuer: &Issuer<'_>) -> Vec<u8> {
+    let subject = name(spec.subject_cn.as_deref());
+    let (issuer_key, issuer_name) = (issuer.key, issuer.name.clone());
     let mut exts = Vec::new();
     if let Some(ca) = spec.ca {
         let bc = if ca {
@@ -277,7 +294,7 @@ pub fn issue(spec: &CertSpec, subject_key: &KeyPair, issuer: Option<&Issuer<'_>>
         exts.push(extension(
             oid::SKI,
             false,
-            &der::tlv(tag::OCTET_STRING, &subject_key.key_id()),
+            &der::tlv(tag::OCTET_STRING, &spki_key_id(subject_spki)),
         ));
         let aki = der::sequence(&[&der::tlv(tag::context_primitive(0), &issuer_key.key_id())]);
         exts.push(extension(oid::AKI, false, &aki));
@@ -297,7 +314,7 @@ pub fn issue(spec: &CertSpec, subject_key: &KeyPair, issuer: Option<&Issuer<'_>>
         &issuer_name,
         &validity,
         &subject,
-        &subject_key.spki(),
+        subject_spki,
         &extensions,
     ]);
     let mut sig = vec![0u8];
@@ -439,6 +456,26 @@ impl TestPki {
         self.issue_infra(&self.infra_spec(&uri, dns))
     }
 
+    /// A control-plane certificate listening on `dns` names; its chain
+    /// includes the root, so a node can pin it while joining.
+    pub fn control_plane(&self, id: &str, dns: &[&str]) -> Credentials {
+        let uri = format!("warren://{}/control-plane/{id}", self.trust_domain);
+        let mut creds = self.issue_infra(&self.infra_spec(&uri, dns));
+        creds
+            .chain
+            .push(CertificateDer::from(self.root.cert.clone()));
+        creds
+    }
+
+    /// Issues an infrastructure certificate for a public key.
+    pub fn issue_infra_for(&self, spec: &CertSpec, spki: &[u8]) -> Vec<CertificateDer<'static>> {
+        let leaf = issue_for(spec, spki, &self.infra_ca.issuer());
+        vec![
+            CertificateDer::from(leaf),
+            CertificateDer::from(self.infra_ca.cert.clone()),
+        ]
+    }
+
     /// A connector certificate in `group`.
     pub fn connector(&self, group: &str, id: &str) -> Credentials {
         let uri = format!("warren://{}/connector/{group}/{id}", self.trust_domain);
@@ -517,26 +554,5 @@ pub fn write_credentials(dir: &Path, name: &str, creds: &Credentials) -> std::io
 
 /// PEM-encodes DER.
 pub fn pem(label: &str, der_bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut b64 = String::new();
-    for chunk in der_bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |acc, (i, b)| acc | u32::from(*b) << (16 - 8 * i));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                b64.push(ALPHABET[(n >> (18 - 6 * i) & 0x3f) as usize] as char);
-            } else {
-                b64.push('=');
-            }
-        }
-    }
-    let mut out = format!("-----BEGIN {label}-----\n");
-    for line in b64.as_bytes().chunks(64) {
-        out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
-        out.push('\n');
-    }
-    out.push_str(&format!("-----END {label}-----\n"));
-    out
+    warren_core::base64::pem(label, der_bytes)
 }

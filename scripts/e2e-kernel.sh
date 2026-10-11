@@ -44,6 +44,14 @@ netns_setup
 start_deployment "$BIN"
 out="$WORK/client.jsonl"
 
+# 0. The relay and the connector joined with single-use tokens.
+if grep -q 'joined the deployment' "$WORK/relay.log" && grep -q 'joined the deployment' "$WORK/connector.log"; then
+  echo "ok   relay and connector joined with tokens"
+else
+  echo "FAIL relay and connector joined with tokens" >&2
+  failures=$((failures + 1))
+fi
+
 # 1. QUIC: TCP, UDP and ICMP apps, a name app, and a deny with its reason.
 client --transport quic --tun wc0 --route 10.77.0.0/24 --route 100.80.0.0/16 \
   --bind grafana.lab.test=grafana@100.80.0.5 \
