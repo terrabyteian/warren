@@ -82,7 +82,7 @@ through its local admin socket:
 warren admin devices list
 warren admin devices approve <device>
 warren admin users disable alice@example.com      # cut within 10 seconds
-warren admin join-token create --role connector --group homelab
+warren admin join-token create --role connector --group homelab --name lab-1
 warren admin policy reload
 ```
 
