@@ -1,0 +1,10 @@
+# Direct third-party dependencies warren is allowed to declare.
+#
+# One crate per line: crate name, the workspace crates allowed to depend on it
+# (comma-separated, or * for any), then the reason it is here. Every entry must
+# be in use, declared once in [workspace.dependencies] with an exact `=`
+# version, vendored, and covered by cargo-vet. scripts/check-deps.sh enforces
+# this list; docs/dependencies.md explains how to add a crate.
+#
+# crate          users           purpose
+clap             warren          command-line parsing (builder API only: no derive, no color)
