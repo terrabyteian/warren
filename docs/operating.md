@@ -109,45 +109,51 @@ connections:
 
 ### Behind a load balancer
 
-A TCP load balancer that does not keep client addresses makes every peer
-look like the balancer, so the per-source limit, and the addresses in audit
-records, would see only it. Either keep client addresses or have the
-balancer send them:
+The control plane applies one rule: it reads a PROXY protocol version 2
+header only from connections whose TCP source address is in
+`connections.trustedProxies`, and it requires one from them. Every other
+connection must start with TLS. A trusted address that sends anything but a
+valid header is disconnected; an untrusted address whose connection starts
+with a PROXY header is disconnected too, with a warning in the log naming
+that address.
 
-- **PROXY protocol version 2.** List only the balancer's own addresses in
-  `connections.trustedProxies`. Every connection from those addresses must
-  then start with a PROXY protocol version 2 header, and the control plane
-  uses the source it names; a `LOCAL` header (a health check) counts as the
-  balancer itself. A trusted address that sends anything else is
-  disconnected, and no other peer's connection is read for a header. So
-  never list a range that peers also connect from directly, such as node,
-  pod or office ranges: a relay, connector or client connecting from such
-  an address without passing through the balancer sends no header and is
-  disconnected. The balancer must terminate nothing: TLS goes through to the
-  control plane, since relays, connectors and enrolled clients authenticate
-  with certificates.
-- **Kubernetes.** Give the control plane's `LoadBalancer` Service
-  `externalTrafficPolicy: Local`, so pods see client addresses, or enable
-  PROXY protocol version 2 on the cloud load balancer (usually with an
-  annotation on the Service) and list only the load balancer's own
-  addresses in `trustedProxies`. PROXY protocol needs connections to reach
-  the pod from the balancer's own addresses, so use it with
-  `externalTrafficPolicy: Local` or a load balancer that targets pod IPs
-  directly: under the default `externalTrafficPolicy: Cluster`, kube-proxy
-  rewrites each connection's source to a node address, which is not
-  trusted, so the header is never read and every TLS handshake fails. With
-  `externalTrafficPolicy: Cluster` and no PROXY protocol, every peer
-  appears as a node address: set `maxPerSource` to 0 rather than let the
-  limit refuse legitimate peers.
-- **Relays and connectors in the same cluster.** kube-proxy sends in-cluster
-  traffic for a `LoadBalancer` IP straight to the pod, bypassing the load
-  balancer, so it carries no PROXY header; if it arrives from a trusted
-  address it is disconnected. Give in-cluster relays and connectors a
-  ClusterIP Service name that is also in `dnsNames`, after the internal
-  name (for example
-  `dnsNames: [nodes.warren.example.com, warren.warren-system.svc.cluster.local]`),
-  so they reach the control plane directly under its own certificate. Or,
-  where the cloud provider supports it, request `ipMode: Proxy` through the
-  provider's annotation on the `LoadBalancer` Service; the cloud controller
-  then reports it in the Service's status and kube-proxy sends in-cluster
-  traffic through the load balancer too.
+So the setting follows from the source address the control plane sees for
+a client outside the deployment. Find it before configuring anything:
+with PROXY protocol off and `trustedProxies` empty, the `source` recorded in
+the audit log for a refused relay or connector is the address the control
+plane sees; or turn PROXY protocol on at the balancer with `trustedProxies`
+still empty, and the warning the control plane logs for each connection
+names the address the balancer connects from.
+
+- **It sees the client's real address.** The balancer keeps client
+  addresses (on Kubernetes, for example, `externalTrafficPolicy: Local` with
+  a balancer that preserves client IPs). PROXY protocol is not needed: leave
+  it off at the balancer and leave `trustedProxies` empty.
+- **It sees the balancer's own addresses.** The balancer connects from its
+  own addresses, with client IP preservation off. Turn PROXY protocol
+  version 2 on at the balancer and list exactly those addresses in
+  `trustedProxies`. The control plane then uses the source each header
+  names; a `LOCAL` header (a health check) counts as the balancer itself.
+- **It sees some other address**, such as a node's, because something
+  between the balancer and the control plane rewrites the source. Neither
+  of the above holds: do not turn PROXY protocol on. Without it the
+  per-source limit would see every peer as that address, so set
+  `connections.maxPerSource` to 0.
+
+Never turn PROXY protocol on at a balancer whose connections arrive from
+client or node addresses, and never list node, pod or office ranges in
+`trustedProxies`: a peer connecting from such an address without passing
+through the balancer sends no header and is disconnected. The balancer must
+terminate nothing: TLS goes through to the control plane, since relays,
+connectors and enrolled clients authenticate with certificates.
+
+On Kubernetes, relays and connectors in the control plane's own cluster
+should not go through the load balancer at all; traffic for a load
+balancer's address from inside the cluster may be sent straight to the pod
+from a node or pod address. Give them a ClusterIP Service name that is also
+in `dnsNames`, listed after the internal name, since the first name other
+than `publicUrl`'s host is the one clients and nodes are given (for example
+`dnsNames: [nodes.warren.example.com, warren.warren-system.svc.cluster.local]`),
+and point them at it. Where the provider supports it, `ipMode: Proxy`,
+requested through the provider's Service annotation, sends in-cluster
+traffic through the balancer instead.

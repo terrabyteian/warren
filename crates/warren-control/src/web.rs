@@ -777,14 +777,25 @@ pub async fn serve_tls<H: Handler>(
                     .trusted_proxies
                     .iter()
                     .any(|p| p.contains(addr.ip().to_canonical()));
-                let source = if proxied {
-                    read_proxy_header(&mut tcp, addr).await?
-                } else {
-                    addr
+                let count = |ip: IpAddr| match options.max_per_source {
+                    0 => Some(None),
+                    limit => sources.acquire(ip, limit).map(Some),
                 };
-                let counted = match options.max_per_source {
-                    0 => None,
-                    limit => Some(sources.acquire(source.ip(), limit)?),
+                let (source, counted) = if proxied {
+                    let source = read_proxy_header(&mut tcp, addr).await?;
+                    (source, count(source.ip())?)
+                } else {
+                    let counted = count(addr.ip())?;
+                    let mut first = [0u8; 12];
+                    if tcp.peek(&mut first).await.ok()? == first.len() && first == PROXY_SIGNATURE {
+                        crate::log::warn_with(
+                            "listener",
+                            "a connection from an address not in connections.trustedProxies started with a PROXY protocol header; add the load balancer's own address to connections.trustedProxies, or turn PROXY protocol off at the load balancer",
+                            &[("source", &addr.to_string())],
+                        );
+                        return None;
+                    }
+                    (addr, counted)
                 };
                 let tls = acceptor.accept(tcp).await.ok()?;
                 Some((source, counted, tls))

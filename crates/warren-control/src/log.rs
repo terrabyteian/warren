@@ -36,6 +36,11 @@ pub fn warn(component: &str, message: &str) {
     write("warn", component, message, &[]);
 }
 
+/// A warning with fields.
+pub fn warn_with(component: &str, message: &str, fields: &[(&str, &str)]) {
+    write("warn", component, message, fields);
+}
+
 /// An error.
 pub fn error(component: &str, message: &str) {
     write("error", component, message, &[]);

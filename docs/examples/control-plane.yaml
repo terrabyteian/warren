@@ -30,12 +30,12 @@ tls:
 # goes after it (see docs/operating.md).
 dnsNames: [nodes.warren.example.com]
 
-# Unauthenticated connections one source may hold (0: no limit), and load
-# balancers that send PROXY protocol version 2 headers naming the real
-# source: list only the load balancer's own addresses (such as
-# [192.0.2.10]), never ranges peers also connect from directly, since a
-# trusted address that sends no header is disconnected (see
-# docs/operating.md).
+# Unauthenticated connections one source may hold (0: no limit), and the
+# addresses a PROXY protocol version 2 header is read and required from.
+# List a load balancer's own addresses (such as [192.0.2.10]) only when the
+# control plane sees connections arrive from them with PROXY protocol on at
+# the balancer; leave it empty when it sees clients' real addresses. Never
+# list node, pod or office ranges (see docs/operating.md).
 connections:
   maxPerSource: 64
   trustedProxies: []

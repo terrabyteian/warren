@@ -18,7 +18,7 @@ use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use serde_json::{Value, json};
 use support::{IdpUser, RunningIdp, StubNode, TempDir, free_port, write};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -654,4 +654,28 @@ async fn trusted_proxies_name_the_real_source() {
     // A trusted proxy that sends no header is refused.
     let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     assert!(echo(tcp, &pki.connector(true)).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_header_from_an_untrusted_address_is_refused_before_tls() {
+    let pki = EchoPki::new();
+    let (port, _stop) = pki.serve(ListenOptions::default()).await;
+    let ada = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 5555);
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp.write_all(&proxy_header(Some(ada))).await.unwrap();
+    // Closed without a word: no TLS alert, as a header fed to the TLS
+    // handshake would draw.
+    let mut answer = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut answer))
+        .await
+        .expect("the connection stayed open");
+    assert!(
+        read.is_err() || answer.is_empty(),
+        "got {} bytes back",
+        answer.len()
+    );
+
+    // An ordinary connection from the same address still works.
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(echo(tcp, &pki.connector(false)).await.is_ok());
 }
