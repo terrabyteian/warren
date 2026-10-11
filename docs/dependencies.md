@@ -56,10 +56,14 @@ binaries tracked today:
 The Kubernetes operator joins this list when it becomes a binary in M2.
 
 **CI-only tools.** cargo-deny and cargo-vet run only in CI and are never
-product dependencies. CI installs pinned release binaries (cargo-deny 0.20.2,
-cargo-vet 0.10.0) and verifies them against SHA-256 digests recorded in
-[`scripts/install-ci-tools.sh`](../scripts/install-ci-tools.sh). Locally,
-`cargo install --locked cargo-deny@0.20.2 cargo-vet@0.10.0`.
+product dependencies. CI installs pinned releases verified against SHA-256
+digests recorded in [`scripts/install-ci-tools.sh`](../scripts/install-ci-tools.sh):
+cargo-deny 0.20.2 as its release binary, and cargo-vet 0.10.2 as its source
+crate, built with the lockfile inside it. cargo-vet publishes no binaries
+after 0.10.0, and 0.10.2 is the first release that can record trust in crates
+published through crates.io trusted publishing, which several crates in the
+M1 graph are. Locally, `cargo install --locked cargo-deny@0.20.2
+cargo-vet@0.10.2`.
 
 ## 3. Adding or updating a crate
 
@@ -91,37 +95,54 @@ Removing a crate is the same in reverse; finish with `cargo vet prune`.
   These organizations publish cargo-vet audits of widely used crates;
   importing them is a trust decision recorded in `supply-chain/config.toml`.
 - **Default criteria:** `safe-to-deploy` for everything that ships.
-- **Publisher trust (M0):** `clap`, `clap_builder`, `clap_lex` and `anstyle`
-  are trusted as published by the clap maintainer's crates.io account,
-  `safe-to-deploy`, until 2027-10-11. The imported Mozilla, ISRG and Bytecode
-  Alliance audit sets trust the same publisher. The entries live in
-  `supply-chain/audits.toml` and lapse unless renewed by review.
-- There are no exemptions today. Any future exemption carries a note and an
-  issue to remove it.
+- **Publisher trust.** Every crate in the graph is trusted, for
+  `safe-to-deploy` until 2027-10-11, as published by the crates.io account
+  that publishes its releases, or by the GitHub repository that publishes
+  them through crates.io trusted publishing. Each entry in
+  `supply-chain/audits.toml` carries a note naming the publisher's role (the
+  crate's author or maintainer, or the Rust project's owner account); where
+  an imported audit set trusts the same publisher, the note says so; and
+  crates that appear only on targets warren does not release for (wasm32,
+  Windows, UEFI) say that too, since cargo-vet covers the whole lockfile.
+  The M0 entries for the clap family follow the same rule. All of them lapse
+  unless renewed by review.
+- There are no exemptions. Any future exemption carries a note and an issue to
+  remove it.
 
-## 5. The closure today (M0)
+## 5. The closure today (M1)
 
-The skeleton needs one direct dependency: `clap` for the `warren` command line,
-with the builder API only (no derive macros, no color support).
+The M1 data path adds these direct crates, each allowlisted with its reason in
+[`deps/allowlist.txt`](../deps/allowlist.txt): tokio, quinn, rustls,
+rustls-webpki, aws-lc-rs, bytes, h2, http, tokio-rustls, serde, serde_json,
+tracing, tracing-subscriber and libc (Linux, for the TUN device). The test
+harness, which never ships, also uses aws-lc-rs and serde_json. Interface,
+route and NAT setup for kernel forwarding calls the system's `ip` and `nft`
+commands instead of linking netlink or nftables crates.
 
-| Binary | Third-party crates | Crates |
-| --- | --- | --- |
-| `warren` | 4 | anstyle 1.0.14, clap 4.6.7, clap_builder 4.6.7, clap_lex 1.1.1 |
-| `warren-datapath` | 4 | same as `warren` |
-| `warren-client` | 0 | none |
+| Binary | Third-party crates (all release targets) |
+| --- | --- |
+| `warren` | 76 |
+| `warren-datapath` | 76 |
+| `warren-client` | 72 (the same without the clap family) |
 
-Enabling clap's derive API would add five proc-macro crates (heck,
-proc-macro2, quote, syn, unicode-ident), so M0 uses the builder API instead.
-Those crates will arrive with the first serde or tokio macros in M1, through
-this same review.
+There are no duplicate versions. The graph brings three licenses beyond
+Apache-2.0 and MIT, each allowed in `deny.toml` with the crates that need it:
+ISC (aws-lc, rustls-webpki, untrusted), BSD-3-Clause (subtle, parts of aws-lc)
+and Unicode-3.0 (unicode-ident). `ring` appears in the lockfile only for wasm32
+(through quinn-proto) and in no release target's graph.
+
+`vendor/` is about 220 MB. Most of it is aws-lc-sys's C and assembly (68 MB)
+and the Windows import-library crates behind `ring`'s wasm32 and Windows
+paths (about 95 MB), which `cargo vendor` copies for every platform. Keeping
+`vendor/` lean is still the decision the Windows client milestone has to make.
 
 ## 6. Measured projection for M1
 
 To size the M1 data path before writing it, the expected direct crates were
 resolved in a scratch crate outside this repository on 2026-10-11 against the
 then-latest crates.io releases, and measured with the same method as
-`scripts/check-closure.sh`. Nothing below is a dependency of this repository
-yet; each crate still goes through section 3.
+`scripts/check-closure.sh`. This is the projection as recorded at M0;
+[section 5](#5-the-closure-today-m1) has what M1 ships.
 
 - **Transport stack:** tokio 1.53.2 (`rt-multi-thread`, `net`, `time`, `sync`),
   quinn 0.11.12 (`runtime-tokio`, `rustls-aws-lc-rs`), rustls 0.23.45
@@ -137,7 +158,10 @@ Third-party crates in the closure, each including the four clap crates:
 | Cedar | 111 | 72 | 111 | 116 |
 | Transport stack and Cedar | 160 | 115 | 159 | 186 |
 
-What the measurement shows, and what M1 must decide:
+What the measurement showed, and what M1 decided (the transport stack M1
+ships has 76 crates against the 91 projected, because h3, h3-quinn and
+h3-datagram gave way to warren's own HTTP/3 subset; Cedar is not in this
+closure yet):
 
 - **Cedar is the largest single cost**, mostly at build time: its parser is
   generated with lalrpop, which brings regex, petgraph and more into the build.
@@ -154,8 +178,8 @@ What the measurement shows, and what M1 must decide:
   `unicode-width` versions under Cedar, two `windows-sys` versions). cargo-deny
   denies duplicates, so each will need a reviewed `skip` entry or an upstream
   fix.
-- **h3 is pre-1.0.** If it churns, warren carries its own minimal HTTP/3
-  subset, as the design allows.
+- **h3 is pre-1.0.** It also cannot carry `:protocol = connect-ip`, so M1
+  carries its own minimal HTTP/3 subset, as the design allows.
 - **aws-lc-sys compiles C and assembly** at build time (cc, cmake), so the
   build environment, not only the source, is part of the supply chain and of
   the reproducible-build work in M4.

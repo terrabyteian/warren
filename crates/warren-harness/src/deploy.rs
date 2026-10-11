@@ -225,6 +225,8 @@ pub struct Options {
     pub connector_tuning: TransportTuning,
     /// How many relays (the connector attaches to all of them).
     pub relays: usize,
+    /// A policy decision point in place of the bundle's rules.
+    pub policy: Option<Arc<dyn warren_core::policy::PolicyDecisionPoint>>,
 }
 
 impl Default for Options {
@@ -235,6 +237,7 @@ impl Default for Options {
             connector_transport: TransportMode::QuicOnly,
             connector_tuning: TransportTuning::default(),
             relays: 1,
+            policy: None,
         }
     }
 }
@@ -323,6 +326,9 @@ impl Deployment {
                 transport: opts.connector_transport,
                 credentials: pki.connector(GROUP, "c1"),
                 trust: trust.clone(),
+                policy: opts.policy.clone().unwrap_or_else(|| {
+                    Arc::new(warren_core::policy::StaticPolicy::new(state.clone()))
+                }),
                 state,
                 audit,
                 resolver: Arc::new(resolver),

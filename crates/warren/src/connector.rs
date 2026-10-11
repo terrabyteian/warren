@@ -101,6 +101,7 @@ pub fn run(m: &ArgMatches) -> Result<(), String> {
         transport,
         credentials: setup.credentials,
         trust: setup.trust,
+        policy: Arc::new(warren_core::policy::StaticPolicy::new(setup.state.clone())),
         state: setup.state,
         audit,
         resolver: Arc::new(SystemResolver),

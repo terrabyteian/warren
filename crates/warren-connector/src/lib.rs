@@ -60,8 +60,13 @@ pub struct ConnectorConfig {
     pub credentials: Credentials,
     /// The deployment trust bundle.
     pub trust: Arc<TrustBundle>,
-    /// The node bundle: policy, entities, revocations.
+    /// The node bundle: entities, scopes, revocations (and, for the static
+    /// decision point, rules).
     pub state: Arc<NodeState>,
+    /// The policy decision point every flow that passes the invariants is
+    /// put to: [`warren_core::policy::StaticPolicy`] over the bundle until
+    /// the control plane's compiled policy is available.
+    pub policy: Arc<dyn warren_core::policy::PolicyDecisionPoint>,
     /// Where audit records go.
     pub audit: AuditSink,
     /// Name resolution for name apps.

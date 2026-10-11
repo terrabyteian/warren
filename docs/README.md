@@ -7,6 +7,7 @@
 | [threat-model.md](threat-model.md) | Assets, actors, trust boundaries, and threats with mitigations, each tied to a guarantee. |
 | [policy.md](policy.md) | The policy schema (connector groups, apps, posture profiles, access rules, just-in-time access) and how it compiles to Cedar, with examples. |
 | [dependencies.md](dependencies.md) | The dependency policy, how CI enforces it, and the measured dependency closure. |
+| [benchmarks.md](benchmarks.md) | How the data path is benchmarked (setup time, latency, throughput through a relay against TLS over TCP), how to run it, and recorded results. |
 
 Read [design.md](design.md) first; the others refine it. When documents
 disagree, the design's guarantees win and the other document is the one to

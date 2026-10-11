@@ -4,9 +4,14 @@ warren is open-source, zero-trust private access: a replacement for VPNs that
 gives people identity- and device-aware access to internal applications
 through outbound-only connectors and self-hosted relays.
 
-> **Status: design stage (milestone M0).** The design is written down and the
-> project skeleton is in place, but nothing runs yet. The `warren` binary
-> answers `--help` and `--version` and nothing else.
+> **Status: milestone M1 in progress.** The data path runs: `warren relay`
+> and `warren connector` (kernel forwarding on Linux) carry a test client's
+> traffic end to end through the relay, with per-flow policy decisions and
+> audit records, the HTTP/2 fallback and the 1280-byte MTU floor
+> ([scripts/e2e-kernel.sh](scripts/e2e-kernel.sh),
+> [docs/benchmarks.md](docs/benchmarks.md)). Until the control plane lands,
+> nodes read policy from a static bundle file. The control plane and the
+> macOS app are next.
 
 ## What warren will be
 

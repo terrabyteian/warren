@@ -116,6 +116,7 @@ async fn joined_nodes_carry_traffic() {
             transport: TransportMode::QuicOnly,
             credentials: conn_joined.credentials,
             trust: Arc::new(conn_joined.trust),
+            policy: Arc::new(warren_core::policy::StaticPolicy::new(state.clone())),
             state,
             audit: AuditSink::discard(NodeInfo {
                 role: "connector".into(),

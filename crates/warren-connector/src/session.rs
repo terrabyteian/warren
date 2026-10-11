@@ -20,7 +20,7 @@ use warren_core::audit::{self, DecisionRecord, FlowRecord, Subject};
 use warren_core::bundle::{CompiledApp, CompiledBundle, DestKind, normalize_name, proto};
 use warren_core::packet::{self, IcmpError, Parsed, Side, tcp};
 use warren_core::pki::{self, ClientIdentity};
-use warren_core::policy::{Decision, FlowRequest, PolicyDecisionPoint, Reason, StaticPolicy, Via};
+use warren_core::policy::{Decision, FlowRequest, PolicyDecisionPoint, Reason, Via};
 use warren_core::tls::{self, AcceptClients, RevocationCheck};
 use warren_masque::capsule::{
     AddressEntry, Capsule, CertRefresh, FlowDenied, FlowTuple, IpRange, NameBind, NameBound,
@@ -134,7 +134,7 @@ struct Session {
     peer: SocketAddr,
     tx: TunnelSender,
     events: mpsc::Sender<Event>,
-    policy: StaticPolicy,
+    policy: Arc<dyn PolicyDecisionPoint>,
     assigned: Vec<IpAddr>,
     binds: HashMap<IpAddr, Binding>,
     flows: HashMap<FlowKey, Flow>,
@@ -158,7 +158,7 @@ pub(crate) async fn run(
     let id = shared
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let policy = StaticPolicy::new(shared.config.state.clone());
+    let policy = shared.config.policy.clone();
     let mut s = Session {
         expires: client.not_after,
         shared,

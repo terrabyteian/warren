@@ -637,3 +637,61 @@ async fn sessions_end_with_their_certificate() {
     }
     assert!(ended, "the session outlived its certificate");
 }
+
+/// A decision point that asks for a fresh MFA sign-in for everything.
+#[derive(Debug)]
+struct RequireStepUp;
+
+impl warren_core::policy::PolicyDecisionPoint for RequireStepUp {
+    fn decide(&self, req: &warren_core::policy::FlowRequest<'_>) -> warren_core::policy::Decision {
+        let mut d = warren_core::policy::Decision::deny(
+            warren_core::policy::Reason::MfaRequired,
+            format!(
+                "Sign in again with multi-factor authentication to reach {}.",
+                req.app.name
+            ),
+            42,
+        );
+        d.rules = vec!["test/step-up".into()];
+        d
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_enforcement_interface_takes_any_decision_point() {
+    let d = Deployment::start(Options {
+        policy: Some(std::sync::Arc::new(RequireStepUp)),
+        ..Options::default()
+    })
+    .await;
+    let mut t = warren_client::connect(d.client(&alice(), TransportMode::QuicOnly))
+        .await
+        .unwrap();
+    let mut events = t.events();
+    t.send(&packet::udp(
+        SocketAddr::new(v4(&t), 48_000),
+        "10.77.0.10:7".parse().unwrap(),
+        b"x",
+    ));
+    let _ = recv(&mut t).await;
+    let denial = next_denial(&mut events).await;
+    assert_eq!(denial.reason, "mfa_required");
+    assert_eq!(
+        denial.message,
+        "Sign in again with multi-factor authentication to reach echo-udp."
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let records = d.audit_records();
+    let r = find_record(&records, |r| r["status_code"] == "mfa_required");
+    assert_eq!(r["policy"]["uid"], "test/step-up");
+    assert_eq!(r["unmapped"]["warren"]["policy_version"], 42);
+    // The invariants still come first: no decision point can open what is
+    // outside every app.
+    t.send(&packet::udp(
+        SocketAddr::new(v4(&t), 48_001),
+        "10.99.0.1:7".parse().unwrap(),
+        b"x",
+    ));
+    let _ = recv(&mut t).await;
+    assert_eq!(next_denial(&mut events).await.reason, "out_of_scope");
+}
