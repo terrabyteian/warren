@@ -33,9 +33,32 @@ fn bare_invocation_prints_help_and_fails() {
 
 #[cfg(feature = "relay")]
 #[test]
-fn unimplemented_role_fails_with_a_reason() {
+fn relay_without_credentials_fails_with_usage() {
     let out = warren(&["relay"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8(out.stderr).expect("utf-8");
-    assert!(stderr.contains("not implemented yet"), "{stderr}");
+    assert!(stderr.contains("--cert"), "{stderr}");
+}
+
+#[cfg(feature = "connector")]
+#[test]
+fn connector_with_missing_files_fails_with_a_reason() {
+    let out = warren(&[
+        "connector",
+        "--group",
+        "homelab",
+        "--relay",
+        "relay.example.test@127.0.0.1:443",
+        "--cert",
+        "/nonexistent/c.pem",
+        "--key",
+        "/nonexistent/c.key",
+        "--trust-bundle",
+        "/nonexistent",
+        "--bundle",
+        "/nonexistent/bundle.json",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    assert!(stderr.contains("bundle.json"), "{stderr}");
 }

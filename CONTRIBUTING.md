@@ -95,6 +95,7 @@ cargo clippy -p warren --no-default-features --features relay,connector --all-ta
 cargo build --workspace --all-targets --locked --offline
 cargo test --workspace --locked --offline
 cargo test -p warren --no-default-features --features relay,connector --locked --offline
+sudo scripts/e2e-kernel.sh target/debug   # Linux, root: network namespaces
 scripts/check-deps.sh
 scripts/check-closure.sh
 scripts/check-vendor.sh        # needs network access to crates.io
@@ -103,7 +104,10 @@ cargo vet --locked             # needs cargo-vet
 ```
 
 [docs/dependencies.md](docs/dependencies.md#2-how-it-is-enforced) says how to
-install cargo-deny and cargo-vet.
+install cargo-deny and cargo-vet. CI also runs the benchmarks
+(`scripts/bench-inprocess.sh` and `sudo scripts/bench-kernel.sh`) and
+publishes their results in the job summary; they never gate a change
+([docs/benchmarks.md](docs/benchmarks.md)).
 
 Code conventions:
 

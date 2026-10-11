@@ -1,7 +1,10 @@
 # warren wire protocol profile
 
-Status: profile for M1, recorded at M0. It fixes the requirements and
-invariants an implementation must meet. Tunable values are named parameters
+Status: profile for M1, recorded at M0 and refined by the M1 data-path
+implementation (the bound-UDP revision, capsule codepoints and formats, the
+identity extension encoding, the outer-layer delivery rule in
+[section 9](#9-mtu-budget), and the join exchange). It fixes the
+requirements and invariants an implementation must meet. Tunable values are named parameters
 (`UPPER_SNAKE_CASE`) collected in [section 14](#14-named-parameters); their
 initial defaults are starting points that M1 benchmarks may change. Bounds
 that are part of a guarantee in [design.md](design.md#4-guarantees) are marked
@@ -95,6 +98,12 @@ Applies to links A to E.
   on every QUIC connection.
 - The ALPN is `h3` for QUIC links and `h2` for the TCP fallback. The warren
   protocol version travels in requests ([section 13](#13-versioning-and-extensibility)).
+- HTTP/3 is the subset MASQUE needs: SETTINGS, request streams with one
+  HEADERS exchange followed by DATA frames, HTTP Datagrams and GOAWAY; no
+  server push. Endpoints advertise `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0`
+  and `SETTINGS_QPACK_BLOCKED_STREAMS = 0`, so field sections never refer to
+  a dynamic table. Clients wait for the peer's SETTINGS before sending an
+  extended CONNECT (RFC 9220).
 
 ## 4. Outer layer
 
@@ -131,22 +140,51 @@ Applies to links A to E.
   group are enabled in its pushed state.
 - Request: CONNECT-UDP in bind mode, as specified by the IETF MASQUE
   working group's bound-UDP extension (draft-ietf-masque-connect-udp-listen).
-  warren pins one draft revision (`BIND_DRAFT_REVISION`) until an RFC exists.
+  warren pins one draft revision (`BIND_DRAFT_REVISION`, revision 16) until
+  an RFC exists. The request targets `/.well-known/masque/udp/%2A/%2A/` with
+  `Connect-UDP-Bind: ?1`; the relay answers `Connect-UDP-Bind: ?1` and a
+  `Proxy-Public-Address` naming its virtual peer prefix.
   Bind mode lets one request stream carry datagrams from many peers; the relay
   assigns each peer its own compressed context ID and announces the peer's
   address with the extension's capsules. Context IDs on a bind stream stay
   within the MTU budget's bound ([section 9](#9-mtu-budget)), and the
   extension's uncompressed context, which carries the peer address in every
   datagram, MUST NOT be used.
+- Contexts in this profile: only the relay registers contexts on a bind
+  stream, one odd context ID per spliced client, with COMPRESSION_ASSIGN
+  naming the client's virtual peer address; the connector answers
+  COMPRESSION_ACK, and either side ends a context with COMPRESSION_CLOSE.
+  Context IDs are never reused on a stream. The draft lets a proxy open
+  compressed contexts only while the client keeps an uncompressed one; warren
+  replaces that rule with the splice itself (the relay opens a context only
+  for a client it splices to this replica), and `Warren-Protocol` on the
+  request says this profile applies. A connector rejects any other
+  registration with COMPRESSION_CLOSE, and MAY hold a few datagrams for a
+  context whose COMPRESSION_ASSIGN it has not processed yet.
 - Peers are virtual: each spliced client stream appears to the connector as a
   distinct peer address that the relay allocates from a private range
   (`RELAY_PEER_PREFIX`). The connector's inner QUIC endpoint uses these
   addresses only to tell sessions apart.
 - Each connector replica keeps one attachment per relay in its relay set
   (default: every relay in the deployment) and re-attaches immediately when an
-  attachment drops.
-- Draining: a connector that is shutting down sends HTTP/3 GOAWAY on the outer
-  connection; the relay MUST stop assigning new client streams to it and MAY
+  attachment drops. An attachment is one outer connection carrying one or
+  more bind streams.
+- Rollover: so a bind stream never runs out of context IDs, a relay sends a
+  `WARREN_NOTICE` capsule with reason `bind_rollover` on a stream each time
+  it assigns that stream context ID `BIND_ROLLOVER` or above. The connector
+  then opens a fresh bind stream on the same outer connection, alongside the
+  old one, retrying with backoff until it is open. Until then the old stream
+  keeps taking clients from its reserve of IDs above `BIND_ROLLOVER`. When
+  the fresh stream attaches, the relay rolls every stream of that connector
+  past `BIND_ROLLOVER` over: a rolled-over stream takes no new contexts, and
+  the relay closes it once its last context ends; the connector's other
+  streams carry on. Within a replica, the relay assigns new clients to its
+  streams before `BIND_ROLLOVER` first, then by load.
+- Draining: a connector that is shutting down sends a `WARREN_NOTICE` capsule
+  with reason `draining` on each bind stream, over either carrier, and HTTP/3
+  GOAWAY on an HTTP/3 outer connection; it keeps serving its existing peers.
+  The relay MUST stop assigning new client streams to it, except re-dials
+  naming it in `Warren-Connector` ([section 4.3](#43-relay-splicing)), and MAY
   keep existing ones until they close or `DRAIN_TIMEOUT` passes.
 - If the semantics change incompatibly before the draft is final, warren keeps
   the same semantics behind warren-specific capsules. The semantics, not the
@@ -157,7 +195,14 @@ Applies to links A to E.
 When a client's CONNECT-UDP names group G, the relay:
 
 1. selects a healthy replica of G attached to it (`REPLICA_SELECTION`, default
-   least-loaded) and pins the client stream to that replica for its lifetime;
+   least-loaded, counting the open contexts over all of the replica's bind
+   streams) and pins the client stream to that replica for its lifetime.
+   A request carrying `Warren-Connector: {node ID}` goes to one of that
+   connector's bind streams, draining or not, whenever it has one attached
+   to this relay; the relay never picks another replica for it then, and
+   refuses it with 503 if none of those streams has a free context ID. Only
+   when the connector has no bind stream here does the request get the
+   `REPLICA_SELECTION` choice;
 2. allocates a virtual peer address and announces it on the replica's bind
    stream;
 3. forwards datagram payloads between the two streams byte for byte.
@@ -180,6 +225,12 @@ Invariants:
 - A relay closes an outer connection when the certificate that authenticated it
   expires. Clients open a new outer connection with their renewed certificate
   before then and migrate the inner session onto it.
+- The inner session lives on one connector replica, so a client re-dialling
+  for a renewed certificate or after losing its outer path sends
+  `Warren-Connector` with the node ID from the connector certificate its inner
+  session verified. The header is a routing hint only: a relay never forwards
+  anywhere it would not otherwise, and the inner session still authenticates
+  the connector end to end.
 
 ## 5. Inner session (link C)
 
@@ -209,8 +260,11 @@ Invariants:
 - Certificate refresh: a session never outlives the certificate that
   authenticated it. Before `notAfter` the client sends its renewed certificate
   in a `WARREN_CERT_REFRESH` capsule with a signature by the device key over a
-  TLS exporter value of the inner session (RFC 8446 section 7.5), which binds
-  the new certificate to this session and this key. The connector MUST verify
+  TLS exporter value of the inner session (RFC 8446 section 7.5; label
+  `EXPORTER-warren-cert-refresh`, empty context, 32 bytes; ECDSA P-256 with
+  SHA-256, DER), which binds the new certificate to this session and this
+  key. The client also opens a new outer connection with the renewed
+  certificate and migrates the inner session onto it (section 4.3). The connector MUST verify
   the new certificate exactly as at the handshake and MUST check that it names
   the same user and device and carries the same public key; it then extends the
   session. Otherwise it closes the session at `notAfter`.
@@ -291,6 +345,27 @@ Invariants:
 - Before closing a session for revocation, draining or policy reasons, the
   connector SHOULD send a `WARREN_NOTICE` capsule with the reason.
 
+### 7.1 warren capsule formats
+
+warren's capsules use provisional codepoints from the unregistered space
+(`WARREN_CAPSULE_*`, [section 14](#14-named-parameters)). Fields use the
+notation of RFC 9000: `(i)` is a variable-length integer, an address is an
+IP Version byte (4 or 6) followed by 4 or 16 bytes, and text is a length
+`(i)` followed by that many bytes of UTF-8. Receivers ignore bytes after the
+fields they know, so later versions can append fields.
+
+| Capsule | Fields |
+| --- | --- |
+| `WARREN_NAME_BIND` | synthetic address, name (text), app (text) |
+| `WARREN_NAME_BOUND` | synthetic address, result (8: 0 bound, 1 rejected), reason code (text), message (text) |
+| `WARREN_FLOW_DENIED` | IP protocol (8), source address, source port (16), destination address, destination port (16), decision ID (text), reason code (text), message (text), remediation (text) |
+| `WARREN_POSTURE` | the signed posture statement, opaque |
+| `WARREN_CERT_REFRESH` | certificate count (i), each certificate as length (i) and DER, leaf first; signature as length (i) and DER |
+| `WARREN_NOTICE` | reason code (text), message (text) |
+| `WARREN_PEER_INFO` | context ID (i), the client's address and port (16) as the relay observed them |
+
+For ICMP flows both ports carry the echo identifier.
+
 ## 8. HTTP/2 fallback
 
 - When UDP 443 is blocked or degraded, the outer layer runs over TLS 1.3 on
@@ -360,6 +435,22 @@ Requirements:
   of dropping it. This keeps the 1280 floor on constrained paths at the cost of
   reliable delivery for those packets, and the client reports the constrained
   path in diagnostics.
+- **Inner QUIC packets always cross the outer hops.** QUIC implementations
+  size DATAGRAM frames conservatively: quinn, which warren uses, reserves a
+  4-byte packet number and a frame length, 10 bytes beyond the minimal
+  encoding counted above, so a 1200-byte inner packet does not fit an outer
+  DATAGRAM frame on a 1280-byte path even though the wire format allows it.
+  On links A and B, a sender that cannot fit an inner QUIC packet of at most
+  1200 bytes (the QUIC minimum) into a DATAGRAM frame MUST carry it in a
+  DATAGRAM capsule on the CONNECT-UDP stream instead; relays apply the same
+  rule toward the next hop. Larger inner packets that do not fit a frame are
+  dropped, as a path that is too small drops them, which is what the inner
+  session's DPLPMTUD expects. Together with the rule above, every packet up to
+  the tunnel MTU is delivered on any path QUIC itself can run on.
+- **Refusing below the floor.** A client MUST refuse to set up a tunnel
+  whose MTU would be below 1280 bytes, and MUST refuse a relay or connector
+  that does not support HTTP Datagrams, rather than run a tunnel that cannot
+  meet the floor.
 - **Tunnel MTU choice.** The client sets the tunnel MTU at session setup to
   `TUNNEL_MTU` (default 1280, always deliverable). It MAY use a larger value,
   up to `TUNNEL_MTU_MAX`, only when the inner session's own DPLPMTUD, which
@@ -400,9 +491,24 @@ Requirements:
 | Extended Key Usage | id-kp-clientAuth only |
 | Basic Constraints | CA:FALSE |
 | Key identifiers | Authority and Subject Key Identifier present |
-| warren identity extension | non-critical, OID under `WARREN_OID_ARC`: session ID, IdP authentication time, MFA performed (from the IdP's `amr`/`acr`), device enrollment trust class, device tunnel addresses |
+| warren identity extension | non-critical, OID `WARREN_OID_ARC.1`: session ID, IdP authentication time, MFA performed (from the IdP's `amr`/`acr`), device enrollment trust class, device tunnel addresses (encoding below) |
 | Revocation pointers | none (no CRL distribution points, no OCSP); revocation is pushed |
 
+- The identity extension's value is DER:
+
+  ```asn1
+  WarrenIdentity ::= SEQUENCE {
+    version          INTEGER (1),
+    sessionId        UTF8String,     -- 1 to 128 bytes
+    authTime         INTEGER,        -- IdP authentication, Unix seconds
+    mfa              BOOLEAN,
+    trustClass       ENUMERATED { deviceReported(1), serverVerified(2),
+                                  hardwareAttested(3) },
+    tunnelAddresses  SEQUENCE OF OCTET STRING  -- one of 4 and one of 16 octets
+  }
+  ```
+
+  Verifiers ignore fields appended after `tunnelAddresses`.
 - Group membership is deliberately absent: it changes faster than certificates
   and reaches connectors in signed policy bundles instead.
 - Issuance needs a signed PKCS#10 request from the device key, a live session,
@@ -425,6 +531,30 @@ Requirements:
 - Bootstrap: a single-use join token, valid for `JOIN_TOKEN_LIFETIME` and scoped
   to one role (and one connector group), is exchanged with a signed request for
   the first certificate.
+
+#### Join exchange
+
+- The token is `warren-join-v1.` followed by the base64url (no padding)
+  encoding of a JSON object: `td` (trust domain), `cp` (the join endpoint,
+  `host:port`), `role` (`relay` or `connector`), `group` (connectors only),
+  `root` (lowercase hex SHA-256 of the root CA certificate, DER), `id`,
+  `secret` (base64url, at least 16 bytes) and `exp` (Unix seconds).
+- The node generates its key, builds a PKCS#10 request (RFC 2986) with an
+  empty subject signed by that key (ECDSA P-256 with SHA-256), and sends
+  `POST /v1/join` over HTTPS (TLS 1.3, HTTP/2) to `cp` with the JSON body
+  `{"token": ..., "csr": <base64 DER>}`. Without a trust bundle yet, it
+  verifies the endpoint's certificate against the root the token pins: the
+  control plane presents the root in its chain, and its certificate must
+  name the control-plane role in the token's trust domain.
+- The control plane checks the token (known, secret compared in constant
+  time, unused, unexpired, role and group as minted) and the request's
+  signature, spends the token, assigns the node ID and the names the token
+  was minted for, and answers `{"chain": [<base64 DER>, ...], "trustBundle":
+  {"root": ..., "clientCas": [...], "infraCas": [...]}}`. Refusals are 4xx
+  with an RFC 9457 problem body.
+- The node accepts the result only if the bundle's root is the pinned one,
+  the certificate chains to it through an infrastructure CA, names the role
+  and group the token was for, and carries the node's own key.
 
 ## 11. Control channels
 
@@ -467,7 +597,10 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
 ### 11.2 Relays and connectors to control plane (link E)
 
 - mTLS with infrastructure certificates.
-- **Policy bundles.** The control plane publishes a signed, versioned bundle:
+- **Policy bundles.** (Until the control plane publishes them, M1 relays and
+  connectors load the same content, unsigned, from a static file, reloaded
+  on `SIGHUP` and subject to the same version rule.) The control plane
+  publishes a signed, versioned bundle:
   the compiled Cedar policy set and schema, the entity snapshot (users, groups,
   devices, apps, connector scopes, active JIT grants with expiries), the current
   revocation state, and the posture-signing and session-assertion-signing
@@ -565,11 +698,12 @@ defaults are initial and may change with measurement.
 | `FLOW_IDLE_TIMEOUT` | UDP 60 s, ICMP 10 s | Idle time that ends a UDP or ICMP flow |
 | `DRAIN_TIMEOUT` | 5 min | Longest a draining connector keeps existing streams |
 | `REPLICA_SELECTION` | least loaded | Relay's choice of connector replica |
+| `BIND_ROLLOVER` | context ID 12287 | Context ID at which a relay asks the connector for a fresh bind stream (three quarters of the 2-byte bound) |
 | `RELAY_LIMITS` | deployment setting | Per-client and per-connector relay limits |
 | `RELAY_PEER_PREFIX` | an IPv6 ULA /64 per relay | Virtual peer addresses on bind streams |
-| `DEVICE_POOL_V4`, `DEVICE_POOL_V6` | deployment setting | Device tunnel addresses |
-| `SYNTHETIC_POOL_V4`, `SYNTHETIC_POOL_V6` | deployment setting with local fallbacks | Synthetic addresses for name apps |
+| `DEVICE_POOL_V4`, `DEVICE_POOL_V6` | deployment setting (defaults `100.96.0.0/16`, `fd00:7761:7272:6e00::/64`) | Device tunnel addresses |
+| `SYNTHETIC_POOL_V4`, `SYNTHETIC_POOL_V6` | deployment setting with local fallbacks (defaults `100.80.0.0/16`, `fd00:7761:7272:6e01::/64`) | Synthetic addresses for name apps |
 | `VERSION_SKEW` | current and previous | Protocol versions each role accepts |
-| `BIND_DRAFT_REVISION` | chosen in M1 | Pinned revision of the bound-UDP draft |
-| `WARREN_OID_ARC` | to be assigned | OID arc for the warren identity extension |
-| `WARREN_CAPSULE_*` | to be assigned in M1 | `NAME_BIND`, `NAME_BOUND`, `FLOW_DENIED`, `POSTURE`, `CERT_REFRESH`, `NOTICE`, `PEER_INFO` |
+| `BIND_DRAFT_REVISION` | 16 | Pinned revision of the bound-UDP draft |
+| `WARREN_OID_ARC` | `2.25.97285697713720826090513308506181383429` | OID arc for the warren identity extension: a UUID-based arc (ITU-T X.667), which needs no registration |
+| `WARREN_CAPSULE_*` | `NAME_BIND` 0x3a726e10, `NAME_BOUND` 0x3a726e11, `FLOW_DENIED` 0x3a726e12, `POSTURE` 0x3a726e13, `CERT_REFRESH` 0x3a726e14, `NOTICE` 0x3a726e15, `PEER_INFO` 0x3a726e16 | Provisional capsule types (none is a GREASE value) |

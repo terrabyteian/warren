@@ -266,8 +266,9 @@ Residual risk: a fully compromised device acts as its user until detected.
   licenses and sources; the per-binary closure gate fails CI on any growth
   (G17). See [dependencies.md](dependencies.md).
 - Builds use only vendored sources, offline, with a pinned toolchain.
-- CI actions are pinned by commit; CI-only tools are pinned binaries verified
-  against recorded digests and never ship in products.
+- CI actions are pinned by commit; CI-only tools are pinned releases (a
+  release binary, or a source crate built with its own lockfile) verified
+  against recorded digests, and never ship in products.
 - Data-path builds exclude console, operator and Kubernetes crates, so the
   largest dependency trees cannot reach the data path (G17).
 - Release signing and reproducible-build checks are added before v1.0 (M4).
@@ -275,7 +276,10 @@ Residual risk: a fully compromised device acts as its user until detected.
 ### T12. Rogue relay or connector through a stolen join token
 
 Join tokens are single-use, short-lived and scoped to one role and one
-connector group. A node's identity is an infrastructure certificate the admin
+connector group. A token also pins the deployment root, so a node being
+bootstrapped cannot be steered to an impostor control plane, and the node's
+key is generated on the node: only its signed certificate request leaves
+it. A node's identity is an infrastructure certificate the admin
 can see and revoke (G9). A rogue relay gains only what T1 describes. A rogue
 connector in a group could receive that group's sessions until it is noticed
 and revoked; every attachment is audited (G13). Admin approval of new

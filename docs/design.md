@@ -512,9 +512,12 @@ through it; clients re-establish sessions on another replica automatically.
   operator are Rust too. Native shells per OS stay thin: Swift on macOS first.
 - **Crypto.** rustls on aws-lc-rs only; TLS 1.3 only; no hand-rolled
   cryptography (G16).
-- **Transport stack.** quinn, rustls/aws-lc-rs and h3, with warren's own
-  CONNECT-UDP and CONNECT-IP layer. If h3 churns, warren carries its own
-  minimal HTTP/3 subset. The MTU budget honors RFC 9484's 1280-byte floor.
+- **Transport stack.** quinn and rustls/aws-lc-rs, with warren's own
+  CONNECT-UDP and CONNECT-IP layer over warren's own minimal HTTP/3 subset
+  (no server push, no QPACK dynamic table): the published h3 crate cannot
+  carry `:protocol = connect-ip`, which the inner session needs, so M1 took
+  the option this decision left open. The HTTP/2 fallback uses the h2 crate.
+  The MTU budget honors RFC 9484's 1280-byte floor.
 - **Policy engine.** Cedar.
 - **Dependencies.** A small allowlist of direct crates, every crate pinned and
   vendored, cargo-deny and cargo-vet in CI, and a per-binary closure report
@@ -534,6 +537,7 @@ through it; clients re-establish sessions on another replica automatically.
 | `warren-control` | Control plane role | M1 |
 | `warren-console` | Web console (never in data-path builds) | M3 |
 | `warren-operator` | Kubernetes operator, its own binary (never in data-path builds) | M2 |
+| `warren-harness` | Test client, test PKI, stand-in apps and benchmarks; never shipped | M1 |
 
 ## 15. Roadmap
 

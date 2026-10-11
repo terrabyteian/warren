@@ -10,6 +10,69 @@ start = "2022-05-18"
 end = "2027-10-11"
 notes = "clap family maintainer; publisher also trusted by the mozilla, isrg and bytecode-alliance audit sets this repository imports"
 
+[[trusted.atomic-waker]]
+criteria = "safe-to-deploy"
+user-id = 69526
+start = "2023-04-07"
+end = "2027-10-11"
+notes = "John Nunley, smol-rs maintainer (atomic-waker)"
+
+[[trusted.aws-lc-rs]]
+criteria = "safe-to-deploy"
+user-id = 156764 # Justin W Smith (justsmth)
+start = "2023-04-11"
+end = "2027-10-11"
+notes = "Justin Smith, AWS-LC maintainer at AWS (aws-lc-rs, aws-lc-sys)"
+
+[[trusted.aws-lc-sys]]
+criteria = "safe-to-deploy"
+user-id = 156764 # Justin W Smith (justsmth)
+start = "2022-11-09"
+end = "2027-10-11"
+notes = "Justin Smith, AWS-LC maintainer at AWS (aws-lc-rs, aws-lc-sys)"
+
+[[trusted.bumpalo]]
+criteria = "safe-to-deploy"
+user-id = 696 # Nick Fitzgerald (fitzgen)
+start = "2019-03-16"
+end = "2027-10-11"
+notes = "Nick Fitzgerald, bumpalo author (Bytecode Alliance). Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.bytes]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-01-11"
+end = "2027-10-11"
+notes = "Alice Ryhl, tokio maintainer; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.cc]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-lang/cc-rs"
+start = "2025-09-01"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from rust-lang/cc-rs"
+
+[[trusted.cfg-if]]
+criteria = "safe-to-deploy"
+user-id = 55123 # rust-lang-owner
+start = "2025-06-09"
+end = "2027-10-11"
+notes = "the Rust project's crates.io owner account"
+
+[[trusted.cfg_aliases]]
+criteria = "safe-to-deploy"
+user-id = 47500 # Zicklag (zicklag)
+start = "2020-04-05"
+end = "2027-10-11"
+notes = "cfg_aliases author"
+
+[[trusted.chacha20]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/stream-ciphers"
+start = "2026-02-06"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from RustCrypto/stream-ciphers"
+
 [[trusted.clap]]
 criteria = "safe-to-deploy"
 user-id = 6743 # Ed Page (epage)
@@ -30,3 +93,626 @@ user-id = 6743 # Ed Page (epage)
 start = "2022-04-15"
 end = "2027-10-11"
 notes = "clap family maintainer; publisher also trusted by the mozilla, isrg and bytecode-alliance audit sets this repository imports"
+
+[[trusted.cmake]]
+criteria = "safe-to-deploy"
+user-id = 55123 # rust-lang-owner
+start = "2022-10-29"
+end = "2027-10-11"
+notes = "the Rust project's crates.io owner account"
+
+[[trusted.cpufeatures]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2021-04-26"
+end = "2027-10-11"
+notes = "Tony Arcieri, RustCrypto maintainer"
+
+[[trusted.dunce]]
+criteria = "safe-to-deploy"
+user-id = 988 # Kornel (kornelski)
+start = "2019-03-14"
+end = "2027-10-11"
+notes = "Kornel Lesiński, dunce author"
+
+[[trusted.equivalent]]
+criteria = "safe-to-deploy"
+user-id = 539 # Josh Stone (cuviper)
+start = "2023-02-05"
+end = "2027-10-11"
+notes = "Josh Stone, indexmap maintainer (Rust project); the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.errno]]
+criteria = "safe-to-deploy"
+user-id = 6825 # Dan Gohman (sunfishcode)
+start = "2023-08-29"
+end = "2027-10-11"
+notes = "Dan Gohman, errno and rustix maintainer; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.find-msvc-tools]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-lang/cc-rs"
+start = "2025-09-05"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from rust-lang/cc-rs"
+
+[[trusted.fnv]]
+criteria = "safe-to-deploy"
+user-id = 1139
+start = "2020-05-14"
+end = "2027-10-11"
+notes = "Manish Goregaokar, fnv maintainer (Rust project)"
+
+[[trusted.fs_extra]]
+criteria = "safe-to-deploy"
+user-id = 5882 # Denis Kurilenko (webdesus)
+start = "2020-08-25"
+end = "2027-10-11"
+notes = "fs_extra author"
+
+[[trusted.futures-core]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2020-10-05"
+end = "2027-10-11"
+notes = "Taiki Endo, futures-rs and pin-project maintainer"
+
+[[trusted.futures-sink]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2020-10-05"
+end = "2027-10-11"
+notes = "Taiki Endo, futures-rs and pin-project maintainer"
+
+[[trusted.futures-task]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2019-07-29"
+end = "2027-10-11"
+notes = "Taiki Endo, futures-rs and pin-project maintainer. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.futures-util]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2020-10-05"
+end = "2027-10-11"
+notes = "Taiki Endo, futures-rs and pin-project maintainer. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.getrandom]]
+criteria = "safe-to-deploy"
+user-id = 5059 # Artyom Pavlov (newpavlov)
+start = "2019-06-28"
+end = "2027-10-11"
+notes = "Artyom Pavlov, getrandom and RustCrypto maintainer. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.getrandom]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-random/getrandom"
+start = "2025-12-27"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from rust-random/getrandom. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.h2]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-03-13"
+end = "2027-10-11"
+notes = "Sean McArthur, hyperium (hyper, h2, http) maintainer; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.hashbrown]]
+criteria = "safe-to-deploy"
+user-id = 55123 # rust-lang-owner
+start = "2025-04-30"
+end = "2027-10-11"
+notes = "the Rust project's crates.io owner account; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.http]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-04-05"
+end = "2027-10-11"
+notes = "Sean McArthur, hyperium (hyper, h2, http) maintainer; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.indexmap]]
+criteria = "safe-to-deploy"
+user-id = 539 # Josh Stone (cuviper)
+start = "2020-01-15"
+end = "2027-10-11"
+notes = "Josh Stone, indexmap maintainer (Rust project); the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.itoa]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-05-02"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.jobserver]]
+criteria = "safe-to-deploy"
+user-id = 55123 # rust-lang-owner
+start = "2024-07-23"
+end = "2027-10-11"
+notes = "the Rust project's crates.io owner account"
+
+[[trusted.js-sys]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:wasm-bindgen/wasm-bindgen"
+start = "2026-04-28"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from wasm-bindgen/wasm-bindgen. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.lazy_static]]
+criteria = "safe-to-deploy"
+user-id = 55123 # rust-lang-owner
+start = "2026-10-01"
+end = "2027-10-11"
+notes = "the Rust project's crates.io owner account"
+
+[[trusted.libc]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-lang/libc"
+start = "2026-10-02"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from rust-lang/libc"
+
+[[trusted.lru-slab]]
+criteria = "safe-to-deploy"
+user-id = 5298 # Benjamin Saunders (Ralith)
+start = "2024-05-31"
+end = "2027-10-11"
+notes = "Benjamin Saunders, quinn maintainer"
+
+[[trusted.memchr]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-07-07"
+end = "2027-10-11"
+notes = "Andrew Gallant, memchr author; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.mio]]
+criteria = "safe-to-deploy"
+user-id = 6025 # Thomas de Zeeuw (Thomasdezeeuw)
+start = "2019-12-17"
+end = "2027-10-11"
+notes = "Thomas de Zeeuw, mio and socket2 maintainer (tokio-rs); the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.once_cell]]
+criteria = "safe-to-deploy"
+user-id = 2699 # Alex Kladov (matklad)
+start = "2019-05-07"
+end = "2027-10-11"
+notes = "Aleksey Kladov, once_cell author"
+
+[[trusted.pin-project-lite]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:taiki-e/pin-project-lite"
+start = "2026-02-27"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from taiki-e/pin-project-lite"
+
+[[trusted.pkg-config]]
+criteria = "safe-to-deploy"
+user-id = 3623
+start = "2019-07-25"
+end = "2027-10-11"
+notes = "Sebastian Dröge, pkg-config maintainer"
+
+[[trusted.proc-macro2]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-04-23"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.quinn]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2019-09-09"
+end = "2027-10-11"
+notes = "Dirkjan Ochtman, quinn and rustls maintainer"
+
+[[trusted.quinn-proto]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2019-09-09"
+end = "2027-10-11"
+notes = "Dirkjan Ochtman, quinn and rustls maintainer"
+
+[[trusted.quinn-udp]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2021-10-07"
+end = "2027-10-11"
+notes = "Dirkjan Ochtman, quinn and rustls maintainer"
+
+[[trusted.quote]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-04-09"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.r-efi]]
+criteria = "safe-to-deploy"
+user-id = 12177 # David Rheinsberg (dvdhrm)
+start = "2019-03-01"
+end = "2027-10-11"
+notes = "David Rheinsberg, r-efi author. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.rand]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-random/rand"
+start = "2026-01-26"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from rust-random/rand"
+
+[[trusted.rand_core]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-random/rand_core"
+start = "2026-01-20"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from rust-random/rand_core"
+
+[[trusted.rand_pcg]]
+criteria = "safe-to-deploy"
+user-id = 1234 # Diggory Hardy (dhardy)
+start = "2019-02-23"
+end = "2027-10-11"
+notes = "Diggory Hardy, rand maintainer"
+
+[[trusted.ring]]
+criteria = "safe-to-deploy"
+user-id = 2342 # Brian Smith (briansmith)
+start = "2019-07-03"
+end = "2027-10-11"
+notes = "Brian Smith, ring and untrusted author. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.rustc-hash]]
+criteria = "safe-to-deploy"
+user-id = 130181 # nora (Noratrieb)
+start = "2024-11-30"
+end = "2027-10-11"
+notes = "Nora, rustc-hash maintainer (Rust compiler team)"
+
+[[trusted.rustls]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2019-04-02"
+end = "2027-10-11"
+notes = "Joseph Birr-Pixton, rustls author and maintainer"
+
+[[trusted.rustls-pki-types]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2023-08-31"
+end = "2027-10-11"
+notes = "Dirkjan Ochtman, quinn and rustls maintainer"
+
+[[trusted.rustls-webpki]]
+criteria = "safe-to-deploy"
+user-id = 209038 # Daniel McCarney (cpu)
+start = "2023-07-04"
+end = "2027-10-11"
+notes = "Daniel McCarney, rustls and rustls-webpki maintainer"
+
+[[trusted.rustversion]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-07-08"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.serde]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.serde_core]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2025-09-13"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.serde_derive]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.serde_json]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-02-28"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.sharded-slab]]
+criteria = "safe-to-deploy"
+user-id = 1249
+start = "2019-10-02"
+end = "2027-10-11"
+notes = "Eliza Weisman, tracing and sharded-slab author"
+
+[[trusted.shlex]]
+criteria = "safe-to-deploy"
+user-id = 1214
+start = "2021-02-03"
+end = "2027-10-11"
+notes = "shlex maintainer"
+
+[[trusted.signal-hook-registry]]
+criteria = "safe-to-deploy"
+user-id = 5906 # Michal 'vorner' Vaner (vorner)
+start = "2019-04-28"
+end = "2027-10-11"
+notes = "Michal Vaner, signal-hook author"
+
+[[trusted.slab]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-10-13"
+end = "2027-10-11"
+notes = "Alice Ryhl, tokio maintainer; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.socket2]]
+criteria = "safe-to-deploy"
+user-id = 6025 # Thomas de Zeeuw (Thomasdezeeuw)
+start = "2020-09-09"
+end = "2027-10-11"
+notes = "Thomas de Zeeuw, mio and socket2 maintainer (tokio-rs); the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.subtle]]
+criteria = "safe-to-deploy"
+user-id = 5289
+start = "2020-12-17"
+end = "2027-10-11"
+notes = "isis lovecruft, subtle author (dalek-cryptography)"
+
+[[trusted.syn]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.thiserror]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.thiserror-impl]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.thread_local]]
+criteria = "safe-to-deploy"
+user-id = 2915 # Amanieu d'Antras (Amanieu)
+start = "2019-09-07"
+end = "2027-10-11"
+notes = "Amanieu d'Antras, thread_local maintainer (Rust libs team); the isrg, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.tinyvec]]
+criteria = "safe-to-deploy"
+user-id = 7211 # Lokathor (Lokathor)
+start = "2020-01-07"
+end = "2027-10-11"
+notes = "Lokathor, tinyvec author"
+
+[[trusted.tokio]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2020-12-25"
+end = "2027-10-11"
+notes = "Alice Ryhl, tokio maintainer; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.tokio-macros]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2020-10-26"
+end = "2027-10-11"
+notes = "Alice Ryhl, tokio maintainer; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.tokio-rustls]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2023-06-09"
+end = "2027-10-11"
+notes = "Dirkjan Ochtman, quinn and rustls maintainer"
+
+[[trusted.tokio-util]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-01-12"
+end = "2027-10-11"
+notes = "Alice Ryhl, tokio maintainer; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.tracing]]
+criteria = "safe-to-deploy"
+user-id = 172786 # Hayden Stainsby (hds)
+start = "2024-11-27"
+end = "2027-10-11"
+notes = "Hayden Stainsby, tokio-rs tracing maintainer"
+
+[[trusted.tracing-core]]
+criteria = "safe-to-deploy"
+user-id = 172786 # Hayden Stainsby (hds)
+start = "2024-11-25"
+end = "2027-10-11"
+notes = "Hayden Stainsby, tokio-rs tracing maintainer"
+
+[[trusted.tracing-serde]]
+criteria = "safe-to-deploy"
+user-id = 172786 # Hayden Stainsby (hds)
+start = "2024-11-27"
+end = "2027-10-11"
+notes = "Hayden Stainsby, tokio-rs tracing maintainer"
+
+[[trusted.tracing-subscriber]]
+criteria = "safe-to-deploy"
+user-id = 172786 # Hayden Stainsby (hds)
+start = "2024-11-29"
+end = "2027-10-11"
+notes = "Hayden Stainsby, tokio-rs tracing maintainer"
+
+[[trusted.unicode-ident]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2021-10-02"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher"
+
+[[trusted.untrusted]]
+criteria = "safe-to-deploy"
+user-id = 2342 # Brian Smith (briansmith)
+start = "2019-07-03"
+end = "2027-10-11"
+notes = "Brian Smith, ring and untrusted author"
+
+[[trusted.valuable]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2025-01-17"
+end = "2027-10-11"
+notes = "Taiki Endo, futures-rs and pin-project maintainer"
+
+[[trusted.wasi]]
+criteria = "safe-to-deploy"
+user-id = 1 # Alex Crichton (alexcrichton)
+start = "2020-06-03"
+end = "2027-10-11"
+notes = "Alex Crichton, wasi and wasm-bindgen author (Bytecode Alliance); the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.wasm-bindgen]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:wasm-bindgen/wasm-bindgen"
+start = "2026-04-28"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from wasm-bindgen/wasm-bindgen. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.wasm-bindgen-macro]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:wasm-bindgen/wasm-bindgen"
+start = "2026-04-28"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from wasm-bindgen/wasm-bindgen. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.wasm-bindgen-macro-support]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:wasm-bindgen/wasm-bindgen"
+start = "2026-04-28"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from wasm-bindgen/wasm-bindgen. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.wasm-bindgen-shared]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:wasm-bindgen/wasm-bindgen"
+start = "2026-04-28"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from wasm-bindgen/wasm-bindgen. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.web-time]]
+criteria = "safe-to-deploy"
+user-id = 34642 # daxpedda
+start = "2023-03-27"
+end = "2027-10-11"
+notes = "web-time author. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows-link]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2024-07-17"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows-sys]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-11-15"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows-targets]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2022-09-09"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows_aarch64_gnullvm]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2022-09-01"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows_aarch64_msvc]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-11-05"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows_i686_gnu]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-28"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows_i686_gnullvm]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2024-04-02"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows_i686_msvc]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-27"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows_x86_64_gnu]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-28"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows_x86_64_gnullvm]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2022-09-01"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.windows_x86_64_msvc]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-27"
+end = "2027-10-11"
+notes = "Kenny Kerr, windows-rs maintainer at Microsoft; the bytecode-alliance, isrg, mozilla audit sets this repository imports trust the same publisher. Only reachable on targets warren does not release for (wasm32, Windows, UEFI), but cargo vet covers the whole lockfile"
+
+[[trusted.zeroize]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/utils"
+start = "2026-06-12"
+end = "2027-10-11"
+notes = "Releases are published by crates.io trusted publishing from RustCrypto/utils"
+
+[[trusted.zmij]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2025-12-18"
+end = "2027-10-11"
+notes = "David Tolnay, maintainer of serde, syn and the proc-macro stack; the isrg audit sets this repository imports trust the same publisher"

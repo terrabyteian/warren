@@ -262,7 +262,9 @@ blocks them.
 
 An `AccessPolicy` holds rules. A rule names **who**, **what**, and optional
 **when** conditions, all of which must hold. Rules allow by default; a rule
-with `effect: deny` carves out an exception and always wins over allows.
+with `effect: deny` carves out an exception and always wins over allows. A
+deny rule cannot have `when` conditions: it applies whenever its `who` and
+`what` match, and a policy that gives one conditions is rejected.
 
 ```yaml
 apiVersion: warren.dev/v1alpha1
@@ -305,7 +307,7 @@ spec:
 | Part | Fields |
 | --- | --- |
 | `who` | `users` (IdP identifiers or emails), `groups` (IdP groups). At least one is required; there is no implicit "everyone". |
-| `what` | `apps` (names), `appSelector.matchLabels`. |
+| `what` | `apps` (names), `appSelector.matchLabels`. A selector needs at least one label; an empty one would match every app and is rejected. |
 | `when.posture` | Posture profiles that must all pass. |
 | `when.auth` | `maxAge` since the user last authenticated at the IdP; `mfa: true` requires that sign-in to have used MFA. |
 | `when.via` | `client` (device tunnel) and/or `browser` (clientless). A `browser` session has no device, so a rule with `posture` never matches it. |
