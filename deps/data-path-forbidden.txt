@@ -1,0 +1,12 @@
+# Crates that must never appear in a data-path closure (the client core and the
+# relay/connector build of the warren binary). scripts/check-closure.sh fails if
+# any data-path build reaches one of them, directly or transitively.
+warren-control
+warren-console
+warren-operator
+kube
+kube-client
+kube-core
+kube-derive
+kube-runtime
+k8s-openapi

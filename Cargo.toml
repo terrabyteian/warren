@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "Apache-2.0"
+repository = "https://github.com/terrabyteian/warren"
+publish = false
+
+# Every third-party crate is declared here, once, with an exact version, and
+# must also appear in deps/allowlist.txt. Members opt in with `workspace = true`.
+# See docs/dependencies.md before adding anything.
+[workspace.dependencies]
+clap = { version = "=4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+
+# Workspace crates.
+warren-client = { path = "crates/warren-client" }
+warren-connector = { path = "crates/warren-connector" }
+warren-console = { path = "crates/warren-console" }
+warren-control = { path = "crates/warren-control" }
+warren-core = { path = "crates/warren-core" }
+warren-masque = { path = "crates/warren-masque" }
+warren-operator = { path = "crates/warren-operator" }
+warren-policy = { path = "crates/warren-policy" }
+warren-relay = { path = "crates/warren-relay" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+# Builds never touch the network: .cargo/config.toml points cargo at vendor/,
+# and every cargo invocation passes --locked --offline. The toolchain comes from
+# rust-toolchain.toml. Third-party actions are pinned by commit.
+jobs:
+  lint:
+    name: rustfmt, shellcheck and script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo fmt --all --check
+      - run: shellcheck scripts/*.sh
+      - name: DCO gate tests
+        run: scripts/test-check-dco.sh
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: clippy, all roles
+        run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
+      - name: clippy, data-path build
+        run: cargo clippy -p warren --no-default-features --features relay,connector --all-targets --locked --offline -- -D warnings
+
+  test:
+    name: build and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build --workspace --all-targets --locked --offline
+      - run: cargo test --workspace --locked --offline
+      - name: test the data-path build
+        run: cargo test -p warren --no-default-features --features relay,connector --locked --offline
+
+  deps:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: install pinned cargo-deny and cargo-vet (CI-only tools)
+        run: |
+          scripts/install-ci-tools.sh "$RUNNER_TEMP/ci-tools"
+          echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"
+      - name: direct dependencies are allowlisted and pinned
+        run: scripts/check-deps.sh
+      - name: per-binary closure report and growth gate
+        run: scripts/check-closure.sh
+      - name: vendor/ matches Cargo.lock
+        run: scripts/check-vendor.sh
+      - name: cargo deny (advisories, licenses, bans, sources)
+        run: cargo deny --locked check
+      - name: cargo vet
+        run: cargo vet --locked
+
+  dco:
+    name: DCO sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: every outside commit is signed off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/check-dco.sh "$BASE_SHA" "$HEAD_SHA"

@@ -1,0 +1,65 @@
+# cargo-deny configuration: advisories, licenses, bans and sources for the
+# whole workspace. CI runs `cargo deny --locked check`. See
+# docs/dependencies.md for the policy this file encodes.
+
+[graph]
+# The release targets. Keep in sync with TARGETS in scripts/check-closure.sh.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+# Vulnerabilities always fail. Unmaintained, unsound and yanked crates fail
+# too; an exception needs an entry here with a reason and a tracking issue.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses compatible with Apache-2.0 distribution. Adding one is a
+# reviewed change.
+allow = [
+    "Apache-2.0",
+    "MIT",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+[licenses.private]
+# Workspace crates are unpublished and licensed by the repository LICENSE.
+ignore = true
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+    # Crypto comes from rustls on aws-lc-rs and nothing else.
+    { crate = "ring", reason = "aws-lc-rs is warren's only crypto provider" },
+    { crate = "openssl", reason = "aws-lc-rs is warren's only crypto provider" },
+    { crate = "openssl-sys", reason = "aws-lc-rs is warren's only crypto provider" },
+    { crate = "native-tls", reason = "TLS is rustls only" },
+]
+# Kubernetes, operator and console crates are kept out of the data-path builds
+# by scripts/check-closure.sh, which checks each binary's closure separately.
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
