@@ -15,3 +15,1293 @@ url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/au
 
 [imports.mozilla]
 url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[[exemptions.aho-corasick]]
+version = "1.1.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.android_system_properties]]
+version = "0.1.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.ar_archive_writer]]
+version = "0.5.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.arrayvec]]
+version = "0.5.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.ascii-canvas]]
+version = "4.0.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.atoi]]
+version = "2.0.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.autocfg]]
+version = "1.5.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.aws-lc-rs]]
+version = "1.18.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.aws-lc-sys]]
+version = "0.45.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.base64]]
+version = "0.23.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.bitflags]]
+version = "2.13.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.block-buffer]]
+version = "0.10.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.block-buffer]]
+version = "0.12.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.borsh]]
+version = "1.8.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.bs58]]
+version = "0.5.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.bumpalo]]
+version = "3.20.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.bytes]]
+version = "1.12.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cc]]
+version = "1.8.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cedar-policy]]
+version = "4.13.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cedar-policy-core]]
+version = "4.13.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cedar-policy-formatter]]
+version = "4.13.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cfg-if]]
+version = "1.0.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cfg_aliases]]
+version = "0.1.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.chacha20]]
+version = "0.10.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.chrono]]
+version = "0.4.45"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cmake]]
+version = "0.1.58"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cmov]]
+version = "0.5.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.core-foundation]]
+version = "0.10.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cpufeatures]]
+version = "0.2.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.cpufeatures]]
+version = "0.3.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.crc]]
+version = "3.4.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.crc-catalog]]
+version = "2.5.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.crossbeam-queue]]
+version = "0.3.14"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.crossbeam-utils]]
+version = "0.8.23"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.crypto-common]]
+version = "0.2.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.ctutils]]
+version = "0.4.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.darling]]
+version = "0.24.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.darling_core]]
+version = "0.24.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.darling_macro]]
+version = "0.24.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.defmt]]
+version = "1.1.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.defmt-macros]]
+version = "1.1.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.defmt-parser]]
+version = "1.0.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.digest]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.digest]]
+version = "0.11.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.displaydoc]]
+version = "0.2.7"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.dotenvy]]
+version = "0.15.7"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.dunce]]
+version = "1.0.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.dyn-clone]]
+version = "1.0.20"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.educe]]
+version = "0.7.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.either]]
+version = "1.19.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.ena]]
+version = "0.14.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.enum-ordinalize]]
+version = "4.4.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.enum-ordinalize-derive]]
+version = "4.4.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.errno]]
+version = "0.3.14"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.etcetera]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.event-listener]]
+version = "5.4.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.find-msvc-tools]]
+version = "0.1.14"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.fixedbitset]]
+version = "0.5.7"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.flume]]
+version = "0.12.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.fs_extra]]
+version = "1.3.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.futures-channel]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.futures-executor]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.futures-intrusive]]
+version = "0.5.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.futures-io]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.futures-sink]]
+version = "0.3.34"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.futures-task]]
+version = "0.3.21"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.futures-util]]
+version = "0.3.21"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.generic-array]]
+version = "0.14.9"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.getrandom]]
+version = "0.2.17"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.getrandom]]
+version = "0.4.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.h2]]
+version = "0.4.20"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.hashbrown]]
+version = "0.14.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.hashlink]]
+version = "0.11.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.hkdf]]
+version = "0.13.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.hmac]]
+version = "0.13.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.http]]
+version = "1.5.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.http-body]]
+version = "1.1.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.http-body-util]]
+version = "0.1.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.httparse]]
+version = "1.10.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.hybrid-array]]
+version = "0.4.15"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.hyper]]
+version = "1.11.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.hyper-util]]
+version = "0.1.21"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.iana-time-zone]]
+version = "0.1.65"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.icu_collections]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.icu_locale_core]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.icu_normalizer]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.icu_normalizer_data]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.icu_properties]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.icu_properties_data]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.icu_provider]]
+version = "2.3.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.ident_case]]
+version = "1.0.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.idna]]
+version = "0.4.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.idna_adapter]]
+version = "1.2.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.indexmap]]
+version = "1.9.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.indexmap]]
+version = "2.14.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.itertools]]
+version = "0.10.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.itoa]]
+version = "1.0.18"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.jiff]]
+version = "0.2.38"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.jiff-core]]
+version = "0.1.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.jiff-static]]
+version = "0.2.38"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.jiff-tzdb]]
+version = "0.1.9"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.jiff-tzdb-platform]]
+version = "0.1.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.jobserver]]
+version = "0.1.35"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.js-sys]]
+version = "0.3.106"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.lalrpop]]
+version = "0.22.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.lalrpop-util]]
+version = "0.22.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.libc]]
+version = "0.2.189"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.libsqlite3-sys]]
+version = "0.37.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.linked_hash_set]]
+version = "0.1.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.litemap]]
+version = "0.8.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.lock_api]]
+version = "0.4.14"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.log]]
+version = "0.4.34"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.logos]]
+version = "0.16.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.logos-codegen]]
+version = "0.16.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.logos-derive]]
+version = "0.16.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.md-5]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.memchr]]
+version = "2.8.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.miette]]
+version = "7.6.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.miette-derive]]
+version = "7.6.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.mio]]
+version = "1.2.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.new_debug_unreachable]]
+version = "1.0.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.nonempty]]
+version = "0.12.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.num-conv]]
+version = "0.2.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.object]]
+version = "0.39.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.once_cell]]
+version = "1.12.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.openssl-probe]]
+version = "0.2.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.parking_lot]]
+version = "0.12.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.parking_lot_core]]
+version = "0.9.12"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.petgraph]]
+version = "0.7.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.phf_shared]]
+version = "0.11.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.pico-args]]
+version = "0.5.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.pin-project-lite]]
+version = "0.2.17"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.portable-atomic]]
+version = "1.15.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.portable-atomic-util]]
+version = "0.2.8"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.potential_utf]]
+version = "0.1.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.powerfmt]]
+version = "0.2.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.pretty]]
+version = "0.12.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.proc-macro2]]
+version = "1.0.107"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.psm]]
+version = "0.1.32"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.r-efi]]
+version = "6.0.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.rand]]
+version = "0.10.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.rand_core]]
+version = "0.10.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.redox_syscall]]
+version = "0.5.18"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.ref-cast]]
+version = "1.0.27"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.ref-cast-impl]]
+version = "1.0.27"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.regex]]
+version = "1.13.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.regex-automata]]
+version = "0.4.18"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.regex-syntax]]
+version = "0.8.11"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.ring]]
+version = "0.17.14"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.rustc-literal-escaper]]
+version = "0.0.8"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.rustls]]
+version = "0.23.37"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.rustls-native-certs]]
+version = "0.8.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.rustls-pki-types]]
+version = "1.15.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.rustls-webpki]]
+version = "0.103.10"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.rustversion]]
+version = "1.0.23"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.same-file]]
+version = "1.0.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.saphyr-parser]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.schannel]]
+version = "0.1.29"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.schemars]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.schemars]]
+version = "1.2.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.scopeguard]]
+version = "1.2.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.security-framework]]
+version = "3.7.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.security-framework-sys]]
+version = "2.17.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.serde]]
+version = "1.0.229"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.serde_core]]
+version = "1.0.229"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.serde_derive]]
+version = "1.0.229"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.serde_with]]
+version = "3.24.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.serde_with_macros]]
+version = "3.24.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sha1]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sha2]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sha3]]
+version = "0.10.9"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.signal-hook-registry]]
+version = "1.4.8"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.siphasher]]
+version = "1.0.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.slab]]
+version = "0.4.12"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.smallvec]]
+version = "1.16.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.smol_str]]
+version = "0.3.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.socket2]]
+version = "0.6.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.spin]]
+version = "0.9.9"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sqlx]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sqlx-core]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sqlx-macros]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sqlx-macros-core]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sqlx-mysql]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sqlx-postgres]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.sqlx-sqlite]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.stable_deref_trait]]
+version = "1.2.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.stacker]]
+version = "0.1.25"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.string_cache]]
+version = "0.8.9"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.stringprep]]
+version = "0.1.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.syn]]
+version = "2.0.119"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.syn]]
+version = "3.0.8"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.synstructure]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.term]]
+version = "1.2.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.thiserror]]
+version = "2.0.21"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.thiserror-impl]]
+version = "2.0.21"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.time]]
+version = "0.3.55"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.time-core]]
+version = "0.1.9"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.time-macros]]
+version = "0.2.32"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.tinystr]]
+version = "0.8.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.tinyvec]]
+version = "1.13.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.tokio]]
+version = "1.53.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.tokio-macros]]
+version = "2.7.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.tokio-rustls]]
+version = "0.26.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.tokio-stream]]
+version = "0.1.19"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.tokio-util]]
+version = "0.7.20"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.tracing]]
+version = "0.1.44"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.tracing-attributes]]
+version = "0.1.31"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.try-lock]]
+version = "0.2.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.typed-arena]]
+version = "2.0.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.typenum]]
+version = "1.20.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.unicode-ident]]
+version = "1.0.26"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.unicode-normalization]]
+version = "0.1.25"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.unicode-properties]]
+version = "0.1.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.unicode-script]]
+version = "0.5.8"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.unicode-security]]
+version = "0.1.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.unicode-width]]
+version = "0.1.14"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.unicode-width]]
+version = "0.2.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.untrusted]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.url]]
+version = "2.5.8"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.utf8_iter]]
+version = "1.0.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.version_check]]
+version = "0.9.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.walkdir]]
+version = "2.5.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.want]]
+version = "0.3.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.wasi]]
+version = "0.11.1+wasi-snapshot-preview1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.wasm-bindgen]]
+version = "0.2.129"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.wasm-bindgen-macro]]
+version = "0.2.129"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.wasm-bindgen-macro-support]]
+version = "0.2.129"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.wasm-bindgen-shared]]
+version = "0.2.129"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.whoami]]
+version = "2.1.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.winapi-util]]
+version = "0.1.11"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows-core]]
+version = "0.62.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows-implement]]
+version = "0.60.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows-interface]]
+version = "0.59.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows-link]]
+version = "0.2.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows-result]]
+version = "0.4.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows-strings]]
+version = "0.5.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows-sys]]
+version = "0.52.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows-sys]]
+version = "0.61.2"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows-targets]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows_aarch64_gnullvm]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows_aarch64_msvc]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows_i686_gnu]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows_i686_gnullvm]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows_i686_msvc]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows_x86_64_gnu]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows_x86_64_gnullvm]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.windows_x86_64_msvc]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.writeable]]
+version = "0.6.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.yasna]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.yoke]]
+version = "0.8.3"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.yoke-derive]]
+version = "0.8.4"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.zerofrom]]
+version = "0.1.8"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.zerofrom-derive]]
+version = "0.1.8"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.zeroize]]
+version = "1.9.1"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.zerotrie]]
+version = "0.2.5"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.zerovec]]
+version = "0.11.8"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.zerovec-derive]]
+version = "0.11.6"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
+[[exemptions.zmij]]
+version = "1.0.23"
+criteria = "safe-to-deploy"
+notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
