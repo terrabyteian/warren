@@ -87,13 +87,19 @@ Client-facing names are claimed, not just declared:
 
 - A host must lie inside its connector group's `clientNames` and inside its
   source's delegation scope ([section 7](#7-ownership-and-delegation)).
-- A host maps to exactly one app across the whole deployment. Two apps that
-  claim the same host conflict, and so do two hosts from different sources
-  where one covers the other (an exact name under a wildcard, or nested
-  wildcards); the compiler rejects the newcomer, the first owner keeps
-  the name, and the conflict is reported in `warren plan` and the console.
-  Within one source, an exact host takes precedence over a wildcard that
-  covers it.
+- Every client-facing name has exactly one **owning app** across the whole
+  deployment: the app whose exact host matches it, otherwise the app with the
+  most specific (longest) matching wildcard. Two apps that claim the same exact
+  host or the same wildcard conflict, and so do two hosts from different
+  sources where one covers the other (an exact name under a wildcard, or nested
+  wildcards); the compiler rejects the newcomer, the first owner keeps the
+  name, and the conflict is reported in `warren plan` and the console. Within
+  one source, exact hosts and narrower wildcards may sit under a broader
+  wildcard, and the more specific claim owns the names it covers: below,
+  `grafana.lab.example.com` belongs to `grafana`, not to `lab-web`.
+- Clients and connectors map a name to an app only through its owning app
+  ([protocol.md](protocol.md#6-names-addresses-and-routes)), so a broader
+  wildcard app can never be used to reach a more specific app's name.
 - warren's own names (the control plane, the relays, and the configured IdP
   sign-in hosts) are reserved: no app can claim them, and no wildcard host
   covers them.

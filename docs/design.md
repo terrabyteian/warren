@@ -353,13 +353,16 @@ Non-web clientless access (SSH, RDP, VNC in the browser) comes later.
   stands for; the connector resolves that name's target (the name itself unless
   the app sets a separate one) inside the private network and translates
   addresses (NAT). No internal DNS data is exposed to the client
-  beyond the user's own entitlements.
+  beyond the user's own entitlements and the names other apps own beneath
+  them.
 - **Names are claimed once.** Each connector group and each delegated source
-  has a deployment-admin-owned scope of client-facing names. A name maps to
-  exactly one app across the deployment, and warren's own names (control
-  plane, relays, IdP sign-in hosts) are reserved, so no app or cluster can take
-  over a name another app or warren itself uses
-  ([policy.md](policy.md#3-apps)).
+  has a deployment-admin-owned scope of client-facing names. Every name has
+  exactly one owning app across the deployment (an exact host first, otherwise
+  the most specific matching wildcard), and the client and connector bind a
+  name only to that app, so a broader wildcard app never reaches a more
+  specific app's name. warren's own names (control plane, relays, IdP sign-in
+  hosts) are reserved, so no app or cluster can take over a name another app
+  or warren itself uses ([policy.md](policy.md#3-apps)).
 - **CIDR and IP apps keep real addresses** and are routed as-is.
 - **Split DNS.** On macOS the client claims only the internal DNS suffixes in
   use. Names outside them, and names under them that warren does not publish,

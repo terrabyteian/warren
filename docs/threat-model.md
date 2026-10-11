@@ -214,8 +214,10 @@ step independent of the IdP.
   answers them itself from entitlement data. Public names are outside warren's
   scope (G14).
 - **Synthetic address misuse.** A synthetic address means something only after
-  the connector accepts its name binding, which it checks against the app's
-  declared names and its own scope (G8).
+  the connector accepts its name binding, which it accepts only for the name's
+  single owning app (an exact host first, otherwise the most specific matching
+  wildcard) and within its own scope (G8). Binding a name to a broader wildcard
+  app to dodge a more specific app's rules is rejected.
 
 ### T8. Hostile client network
 

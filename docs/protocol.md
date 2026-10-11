@@ -222,18 +222,25 @@ Invariants:
 
 - The control plane gives each device stable tunnel addresses from
   `DEVICE_POOL_V4` and `DEVICE_POOL_V6`, unique within the deployment.
+- Every client-facing name has exactly one owning app: the app whose exact
+  host matches it, otherwise the app with the most specific matching wildcard
+  ([policy.md](policy.md#3-apps)).
 - For FQDN and wildcard apps the client answers DNS queries for entitled names
   with synthetic addresses from its local pools `SYNTHETIC_POOL_V4` and
   `SYNTHETIC_POOL_V6`. Synthetic addresses are meaningful only inside one
-  client's sessions.
+  client's sessions. The client binds a name only to its owning app; a name
+  under an entitled wildcard that another app owns is never bound to the
+  wildcard app, and a connection to it fails fast with a deny reason (G12).
 - Before releasing packets to a synthetic address, the client binds it on the
   inner session with a `WARREN_NAME_BIND` capsule {synthetic address, name,
-  app}. The connector MUST check that the name belongs to that app and that the
-  app is served by its group, then answers `WARREN_NAME_BOUND` {synthetic
-  address, result, reason}. Binding happens when the name resolves, so it
-  usually completes before the application's first packet; until it does, the
-  client holds that destination's packets (`FIRST_PACKET_HOLD`, bounded by
-  `FIRST_PACKET_QUEUE`).
+  app}. The connector MUST check, against its verified bundle, that the named
+  app is the name's owning app and that the app is served by its group, and
+  MUST reject the bind otherwise, so a broader wildcard app can never be used
+  to reach a more specific app's name. It then answers `WARREN_NAME_BOUND`
+  {synthetic address, result, reason}. Binding happens when the name resolves,
+  so it usually completes before the application's first packet; until it
+  does, the client holds that destination's packets (`FIRST_PACKET_HOLD`,
+  bounded by `FIRST_PACKET_QUEUE`).
 - The connector resolves the name's target (the name itself unless the app
   sets a separate target, [policy.md](policy.md#3-apps)) with its own resolver
   when a flow starts, MUST check that every address used is inside its group's
@@ -448,7 +455,8 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
    clock and then drop it, so stale posture fails closed at the connector even
    if the client stops reporting (G11).
 6. **Entitlements.** Apps the user may reach or request, with names, ranges,
-   ports, connector groups and the relay list. Nothing in it is secret.
+   ports, connector groups and the relay list, and under each wildcard name
+   the more specific names that other apps own. Nothing in it is secret.
 7. **Notices.** A server-to-client stream of user-facing events (re-auth
    needed, device revoked, posture failing, entitlements changed). It drives the
    UI only; clients are never part of enforcement.
