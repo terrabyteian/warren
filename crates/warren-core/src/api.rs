@@ -121,6 +121,10 @@ pub struct DeviceInfo {
     pub tunnel_v6: String,
     /// The enrollment trust class, 1 to 3.
     pub trust_class: u8,
+    /// Where the enrolled client makes every later call (certificates,
+    /// entitlements): a base URL under which the control plane always
+    /// presents its own certificate, verified against the trust bundle.
+    pub api_base: String,
 }
 
 /// `POST /v1/certificates` and `POST /v1/node/certificate`: issue or renew a

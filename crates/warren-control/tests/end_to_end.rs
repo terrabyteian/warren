@@ -816,6 +816,7 @@ async fn automatic_approval_and_disabled_sign_in() {
     let (status, device) = client.enroll().await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(device["status"], "approved");
+    assert_eq!(device["api_base"], format!("{}/v1", d.base));
     assert!(client.certificate().await.is_ok());
     // Enrolling the same key again binds, it does not duplicate.
     let (status, again) = client.enroll().await;

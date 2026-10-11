@@ -13,4 +13,6 @@ fn the_example_configuration_is_valid() {
     assert_eq!(config.public_host, "warren.example.com");
     assert_eq!(config.device_approval, Approval::Manual);
     assert!(config.reserved().contains(&"idp.example.com".to_owned()));
+    assert_eq!(config.internal_url(), "https://nodes.warren.example.com");
+    assert_eq!(config.connections.max_per_source, 64);
 }

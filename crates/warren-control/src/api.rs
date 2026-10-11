@@ -82,6 +82,31 @@ async fn route(
     check_protocol(&req)?;
     let path = req.uri().path().to_owned();
     let method = req.method().clone();
+    // The operator's certificate serves sign-in and enrollment only; every
+    // other call goes where the trust bundle verifies the control plane.
+    let pinned_only = !matches!(
+        path.as_str(),
+        "/.well-known/warren"
+            | "/v1/auth/authorize"
+            | "/v1/auth/callback"
+            | "/v1/auth/token"
+            | "/v1/devices"
+            | "/v1/devices/current"
+    );
+    if pinned_only
+        && !app
+            .config
+            .presents_own_certificate(peer.server_name.as_deref())
+    {
+        return Err(ApiError::new(
+            StatusCode::MISDIRECTED_REQUEST,
+            "misdirected_request",
+            format!(
+                "Make this call at {}/v1, where the control plane presents the certificate the deployment trust bundle verifies.",
+                app.config.internal_url()
+            ),
+        ));
+    }
     match (method, path.as_str()) {
         (Method::GET, "/.well-known/warren") => Ok(discovery(&app)),
         (Method::GET, "/v1/auth/authorize") => authorize(&app, &req).await,
@@ -447,13 +472,14 @@ async fn token(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
     ))
 }
 
-fn device_info(d: &Device) -> DeviceInfo {
+fn device_info(app: &App, d: &Device) -> DeviceInfo {
     DeviceInfo {
         id: d.id.clone(),
         status: d.status.as_str().into(),
         tunnel_v4: d.tunnel_v4.clone(),
         tunnel_v6: d.tunnel_v6.clone(),
         trust_class: d.trust_class,
+        api_base: format!("{}/v1", app.config.internal_url()),
     }
 }
 
@@ -581,14 +607,14 @@ async fn enroll_device(
         } else {
             StatusCode::OK
         },
-        &device_info(&device),
+        &device_info(app, &device),
     ))
 }
 
 async fn current_device<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiError> {
     let (session, user) = app.session(req).await?;
     match app.store.device_by_key(&session.public_key).await? {
-        Some(d) if d.users.contains(&user.id) => Ok(json(StatusCode::OK, &device_info(&d))),
+        Some(d) if d.users.contains(&user.id) => Ok(json(StatusCode::OK, &device_info(app, &d))),
         _ => Err(ApiError::not_found("This device is not enrolled yet.")),
     }
 }

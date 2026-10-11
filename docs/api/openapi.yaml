@@ -153,6 +153,7 @@ paths:
               schema: { $ref: "#/components/schemas/Certificate" }
         "401": { $ref: "#/components/responses/Problem" }
         "403": { $ref: "#/components/responses/Problem" }
+        "421": { $ref: "#/components/responses/Problem" }
   /v1/entitlements:
     get:
       tags: [client]
@@ -165,6 +166,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Entitlements" }
+        "421": { $ref: "#/components/responses/Problem" }
   /v1/join:
     post:
       tags: [node]
@@ -490,6 +492,14 @@ components:
         tunnel_v4: { type: string }
         tunnel_v6: { type: string }
         trust_class: { type: integer, minimum: 1, maximum: 3 }
+        api_base:
+          type: string
+          description: >-
+            Where the enrolled client makes every later call, verified against
+            the trust bundle with the control-plane URI SAN. With an operator
+            certificate on the organization URL's host, this is under an
+            internal name, and those calls are refused at the organization
+            URL's host with 421.
     CertificateRequest:
       type: object
       required: [csr]

@@ -32,6 +32,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use warren_core::api::Problem;
 use warren_core::params::{PROTOCOL_HEADER, PROTOCOL_VERSION};
+use warren_policy::names::Cidr;
 
 use crate::Error;
 
@@ -328,8 +329,17 @@ impl http_body::Body for ChannelBody {
 pub struct Peer {
     /// The chain, leaf first; empty when the client presented none.
     pub certificates: Vec<CertificateDer<'static>>,
-    /// The client's address.
+    /// The client's address: the source a trusted proxy reported, or the
+    /// connection's own.
     pub addr: Option<SocketAddr>,
+    /// The name the client asked for in TLS (SNI).
+    pub server_name: Option<String>,
+}
+
+/// Whether `server_name` is one of `internal_names`, where the control plane
+/// always presents its own certificate.
+pub fn is_internal_name(internal_names: &[String], server_name: Option<&str>) -> bool {
+    server_name.is_some_and(|name| internal_names.iter().any(|n| n.eq_ignore_ascii_case(name)))
 }
 
 /// Something that answers requests.
@@ -436,12 +446,7 @@ fn certified_key(chain: Vec<Vec<u8>>, key: PrivateKeyDer<'static>) -> Result<Cer
 
 impl ResolvesServerCert for ServerCert {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let internal = hello.server_name().is_some_and(|name| {
-            self.internal_names
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(name))
-        });
-        if !internal
+        if !is_internal_name(&self.internal_names, hello.server_name())
             && let Ok(operator) = self.operator.read()
             && let Some(key) = operator.as_ref()
         {
@@ -494,12 +499,75 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// the process's file descriptors.
 const MAX_CONNECTIONS: usize = 4096;
 
-/// The most connections one source holds at once: one IPv4 address, or one
-/// IPv6 /64. Beyond it the source's new connections are closed at once, so
-/// no single source can take every slot of [`MAX_CONNECTIONS`]. Clients and
-/// nodes need one connection each, so this only binds when many share an
-/// address behind NAT.
+/// The default for [`ListenOptions::max_per_source`].
 pub const MAX_CONNECTIONS_PER_SOURCE: usize = 64;
+
+/// How the HTTPS listener treats sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenOptions {
+    /// The most connections one source (an IPv4 address, or an IPv6 /64)
+    /// holds before they authenticate. Beyond it the source's new
+    /// connections are closed at once, so no single source can take every
+    /// slot of [`MAX_CONNECTIONS`]. A connection that presents a client
+    /// certificate the listener verifies stops counting. 0 means no limit.
+    pub max_per_source: usize,
+    /// Load balancers and proxies whose connections start with a PROXY
+    /// protocol version 2 header naming the real source. Connections from
+    /// them must carry one; nobody else's are read for one.
+    pub trusted_proxies: Vec<Cidr>,
+}
+
+impl Default for ListenOptions {
+    fn default() -> ListenOptions {
+        ListenOptions {
+            max_per_source: MAX_CONNECTIONS_PER_SOURCE,
+            trusted_proxies: Vec::new(),
+        }
+    }
+}
+
+/// The PROXY protocol version 2 signature.
+const PROXY_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
+
+/// The source a PROXY protocol version 2 header names, given its fixed
+/// 16-byte start and the `len` bytes after it, for a connection from
+/// `proxy`. Only `LOCAL` (the proxy's own connection, such as a health
+/// check) and `PROXY` over TCP on IPv4 or IPv6 are accepted.
+fn proxy_source(head: &[u8; 16], body: &[u8], proxy: SocketAddr) -> Option<SocketAddr> {
+    if head[..12] != PROXY_SIGNATURE
+        || usize::from(u16::from_be_bytes([head[14], head[15]])) != body.len()
+    {
+        return None;
+    }
+    match (head[12], head[13]) {
+        (0x20, _) => Some(proxy),
+        (0x21, 0x11) if body.len() >= 12 => {
+            let ip: [u8; 4] = body[..4].try_into().ok()?;
+            let port = u16::from_be_bytes([body[8], body[9]]);
+            Some(SocketAddr::from((ip, port)))
+        }
+        (0x21, 0x21) if body.len() >= 36 => {
+            let ip: [u8; 16] = body[..16].try_into().ok()?;
+            let port = u16::from_be_bytes([body[32], body[33]]);
+            Some(SocketAddr::from((ip, port)))
+        }
+        _ => None,
+    }
+}
+
+/// Reads the PROXY protocol version 2 header a trusted proxy sends first,
+/// and returns the source it names.
+async fn read_proxy_header(tcp: &mut TcpStream, proxy: SocketAddr) -> Option<SocketAddr> {
+    use tokio::io::AsyncReadExt;
+    let mut head = [0u8; 16];
+    tcp.read_exact(&mut head).await.ok()?;
+    if head[..12] != PROXY_SIGNATURE {
+        return None;
+    }
+    let mut body = vec![0u8; usize::from(u16::from_be_bytes([head[14], head[15]]))];
+    tcp.read_exact(&mut body).await.ok()?;
+    proxy_source(&head, &body, proxy)
+}
 
 /// The most requests one HTTP/2 connection may have in progress at once.
 const MAX_CONCURRENT_STREAMS: u32 = 32;
@@ -587,14 +655,14 @@ struct Sources(Arc<Mutex<HashMap<IpAddr, usize>>>);
 struct SourceSlot(Sources, IpAddr);
 
 impl Sources {
-    fn acquire(&self, addr: IpAddr) -> Option<SourceSlot> {
+    fn acquire(&self, addr: IpAddr, limit: usize) -> Option<SourceSlot> {
         let source = match addr.to_canonical() {
             IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !(u128::MAX >> 64))),
             v4 => v4,
         };
         let mut open = self.0.lock().ok()?;
         let n = open.entry(source).or_default();
-        if *n >= MAX_CONNECTIONS_PER_SOURCE {
+        if *n >= limit {
             return None;
         }
         *n += 1;
@@ -676,45 +744,70 @@ pub async fn serve_tls<H: Handler>(
     listener: tokio::net::TcpListener,
     config: Arc<rustls::ServerConfig>,
     handler: Arc<H>,
+    options: ListenOptions,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let acceptor = TlsAcceptor::from(config);
     let mut connections = tokio::task::JoinSet::new();
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let sources = Sources::default();
+    let options = Arc::new(options);
     loop {
         let accepted = tokio::select! {
             a = listener.accept() => a,
             _ = shutdown.changed() => break,
         };
-        let Ok((tcp, addr)) = accepted else {
+        let Ok((mut tcp, addr)) = accepted else {
             tokio::time::sleep(ACCEPT_BACKOFF).await;
             continue;
         };
-        let (Ok(slot), Some(source)) = (
-            slots.clone().try_acquire_owned(),
-            sources.acquire(addr.ip()),
-        ) else {
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
             // At capacity: close this one rather than queue it.
             drop(tcp);
             continue;
         };
         let acceptor = acceptor.clone();
         let handler = handler.clone();
+        let sources = sources.clone();
+        let options = options.clone();
         connections.spawn(async move {
-            let _slots = (slot, source);
-            let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await
+            let _slot = slot;
+            let authenticate = async {
+                let proxied = options
+                    .trusted_proxies
+                    .iter()
+                    .any(|p| p.contains(addr.ip().to_canonical()));
+                let source = if proxied {
+                    read_proxy_header(&mut tcp, addr).await?
+                } else {
+                    addr
+                };
+                let counted = match options.max_per_source {
+                    0 => None,
+                    limit => Some(sources.acquire(source.ip(), limit)?),
+                };
+                let tls = acceptor.accept(tcp).await.ok()?;
+                Some((source, counted, tls))
+            };
+            let Ok(Some((source, mut counted, tls))) =
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate).await
             else {
                 return;
             };
+            let certificates: Vec<CertificateDer<'static>> = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .map(|c| c.iter().map(|c| c.clone().into_owned()).collect())
+                .unwrap_or_default();
+            if !certificates.is_empty() {
+                counted = None;
+            }
+            let _counted = counted;
             let peer = Arc::new(Peer {
-                certificates: tls
-                    .get_ref()
-                    .1
-                    .peer_certificates()
-                    .map(|c| c.iter().map(|c| c.clone().into_owned()).collect())
-                    .unwrap_or_default(),
-                addr: Some(addr),
+                certificates,
+                addr: Some(source),
+                server_name: tls.get_ref().1.server_name().map(str::to_owned),
             });
             let activity = Activity::new();
             let requests = activity.clone();
@@ -983,6 +1076,52 @@ mod tests {
             escape_html("<a href=\"x\">'&'</a>"),
             "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;"
         );
+    }
+
+    #[test]
+    fn proxy_headers_are_read_strictly() {
+        let proxy: SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let head = |cmd: u8, fam: u8, len: u16| {
+            let mut h = [0u8; 16];
+            h[..12].copy_from_slice(&PROXY_SIGNATURE);
+            h[12] = cmd;
+            h[13] = fam;
+            h[14..].copy_from_slice(&len.to_be_bytes());
+            h
+        };
+        let v4 = [203, 0, 113, 7, 10, 0, 0, 1, 0x15, 0xb3, 1, 187];
+        assert_eq!(
+            proxy_source(&head(0x21, 0x11, 12), &v4, proxy),
+            Some("203.0.113.7:5555".parse().unwrap())
+        );
+        let mut v6 = [0u8; 36];
+        v6[..16].copy_from_slice(&"2001:db8::7".parse::<Ipv6Addr>().unwrap().octets());
+        v6[32..34].copy_from_slice(&5555u16.to_be_bytes());
+        assert_eq!(
+            proxy_source(&head(0x21, 0x21, 36), &v6, proxy),
+            Some("[2001:db8::7]:5555".parse().unwrap())
+        );
+        // TLVs after the addresses are allowed.
+        let mut with_tlv = v4.to_vec();
+        with_tlv.extend([0x04, 0, 1, 0]);
+        assert!(proxy_source(&head(0x21, 0x11, 16), &with_tlv, proxy).is_some());
+        assert_eq!(proxy_source(&head(0x20, 0x00, 0), &[], proxy), Some(proxy));
+        // Wrong signature, version or command, UDP, UNIX, UNSPEC, or too
+        // short a body for the family: refused.
+        let mut bad = head(0x21, 0x11, 12);
+        bad[0] = b'P';
+        assert_eq!(proxy_source(&bad, &v4, proxy), None);
+        for (cmd, fam) in [
+            (0x11, 0x11),
+            (0x22, 0x11),
+            (0x21, 0x12),
+            (0x21, 0x31),
+            (0x21, 0x00),
+        ] {
+            assert_eq!(proxy_source(&head(cmd, fam, 12), &v4, proxy), None);
+        }
+        assert_eq!(proxy_source(&head(0x21, 0x21, 12), &v4, proxy), None);
+        assert_eq!(proxy_source(&head(0x21, 0x11, 13), &v4, proxy), None);
     }
 
     #[test]

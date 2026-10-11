@@ -478,11 +478,18 @@ Requirements:
   (`warren://{td}/control-plane/{id}` for the control plane), so no relay or
   connector certificate can stand in for the control plane. When the operator
   gives the organization URL's host a certificate of its own (WebPKI or the
-  operator's CA), the control plane presents that one there, and clients
-  verify link D at that host against the system trust store (or the CA their
-  MDM profile installs) instead; under its other names the control plane
-  keeps presenting its infrastructure certificate, for link E. The control
-  plane never issues a node a certificate for its own or the IdP's host names.
+  operator's CA), the control plane presents that one there for browser
+  sign-in and enrollment only: discovery, `/v1/auth/*` and `/v1/devices`,
+  which browsers and not-yet-enrolled clients verify against the system
+  trust store (or the CA their MDM profile installs). Every other call,
+  from enrolled clients and from relays and connectors, goes to an internal
+  name, where the control plane always presents its infrastructure
+  certificate; the enrollment answer gives clients that `api_base`, and the
+  control plane refuses those calls at the organization URL's host with
+  `421 misdirected_request`. A certificate the system trusts can therefore
+  never stand in for the control plane to an enrolled client. The control
+  plane never issues a node a certificate for its own or the IdP's host
+  names.
 - The trust domain `{td}` is the deployment's identifier, used in URI SANs.
 
 ### 10.2 User+device certificate
@@ -643,9 +650,9 @@ The endpoints, all JSON unless noted, are described in
 | Discovery | `GET /.well-known/warren`: trust domain, API base, sign-in endpoints, trust bundle (root, client CA, infrastructure CA, PEM), protocol versions. |
 | Sign-in | `GET /v1/auth/authorize` with `redirect_uri`, `code_challenge`, `code_challenge_method=S256` and `state`, and `prompt=login` when the user asked to sign in again (after a `reauth_required` or `mfa_required` refusal), in the system browser. The redirect URI is an `http` loopback URI on `127.0.0.1` or `[::1]` with any port (RFC 8252 section 7.3), or one the deployment configures exactly; anything else gets an error page, never a redirect. The control plane runs its own authorization-code flow with PKCE and a nonce toward the IdP, sending `max_age` set to the shortest `auth.maxAge` in policy when policy has one, and `prompt=login` when the client sent it, so the IdP authenticates the user afresh rather than reuse its own session; either one obliges the IdP to report `auth_time` (OpenID Connect Core section 3.1.2.1), and an ID token without it leaves the sign-in time unknown ([section 10.4](#104-encodings)). It then redirects to the client with a one-time `code` (valid 2 minutes) and the client's `state`, or with `error` and a human-readable `error_description`. |
 | Session | `POST /v1/auth/token` with a compact JWS (ES256, `typ` `warren-session-request+jws`, the device's public key as the header's `jwk`) whose payload is `{code, code_verifier, redirect_uri, iat}`. The control plane checks the signature, the PKCE verifier, the redirect URI and that `iat` is within `CLOCK_SKEW_ALLOWANCE`, and returns a session bound to that key with a bearer token. |
-| Enrollment | `POST /v1/devices` with a PKCS#10 request signed by the session's device key, platform facts, and where the key lives. |
-| Certificates | `POST /v1/certificates` with a PKCS#10 request signed by the session's device key. Renewal is the same call. |
-| Entitlements | `GET /v1/entitlements`. |
+| Enrollment | `POST /v1/devices` with a PKCS#10 request signed by the session's device key, platform facts, and where the key lives. The answer, and `GET /v1/devices/current`, carry `api_base`: where every later call goes, verified against the trust bundle with the control-plane URI SAN ([section 10.1](#101-trust-hierarchy)). |
+| Certificates | `POST {api_base}/certificates` with a PKCS#10 request signed by the session's device key. Renewal is the same call. |
+| Entitlements | `GET {api_base}/entitlements`. |
 
 After sign-in the client authenticates link D calls with its session token,
 and every call that yields a credential also proves possession of the device

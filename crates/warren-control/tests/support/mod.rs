@@ -323,7 +323,13 @@ impl RunningIdp {
             .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified)));
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let (tx, rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(web::serve_tls(listener, Arc::new(config), idp.clone(), rx));
+        tokio::spawn(web::serve_tls(
+            listener,
+            Arc::new(config),
+            idp.clone(),
+            web::ListenOptions::default(),
+            rx,
+        ));
         RunningIdp {
             idp,
             pki,

@@ -15,6 +15,7 @@ use warren_policy::names::{Cidr, is_host_name};
 use warren_policy::yaml::{self, Node, Value};
 
 use crate::Error;
+use crate::web::{ListenOptions, is_internal_name};
 
 /// How new devices are approved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +81,8 @@ pub struct Config {
     pub tls: Option<TlsFiles>,
     /// Where the HTTPS API listens.
     pub listen: SocketAddr,
+    /// Per-source limits and trusted proxies for the HTTPS listener.
+    pub connections: ListenOptions,
     /// Where the local admin API listens: a Unix socket, created mode 0600.
     pub admin_socket: PathBuf,
     /// Where state lives.
@@ -121,6 +124,7 @@ const KEYS: &[&str] = &[
     "dnsNames",
     "tls",
     "listen",
+    "connections",
     "adminSocket",
     "dataDir",
     "database",
@@ -346,6 +350,27 @@ impl Config {
             ));
             SocketAddr::from(([0, 0, 0, 0], 0))
         });
+        let mut connections = ListenOptions::default();
+        if let Some(n) = get(&f, "connections") {
+            let cf = r.map(n, "connections", &["maxPerSource", "trustedProxies"]);
+            if let Some(m) = get(&cf, "maxPerSource") {
+                match r.string(m, "maxPerSource").map(|t| t.parse::<usize>()) {
+                    Some(Ok(limit)) => connections.max_per_source = limit,
+                    Some(Err(_)) => {
+                        r.err(m, "maxPerSource must be a whole number; 0 means no limit")
+                    }
+                    None => {}
+                }
+            }
+            if let Some(p) = get(&cf, "trustedProxies") {
+                for text in r.strings(p, "trustedProxies") {
+                    match Cidr::parse(&text) {
+                        Ok(c) => connections.trusted_proxies.push(c),
+                        Err(e) => r.err(p, format!("trustedProxies entry {text:?}: {e}")),
+                    }
+                }
+            }
+        }
         let admin_socket = path_or(&mut r, "adminSocket", data_dir.join("admin.sock"));
         let database = path_or(&mut r, "database", data_dir.join("warren.db"));
         let kek_file = path_or(&mut r, "keyEncryptionKeyFile", data_dir.join("kek"));
@@ -462,6 +487,7 @@ impl Config {
             dns_names,
             tls,
             listen,
+            connections,
             admin_socket,
             data_dir,
             database,
@@ -512,18 +538,32 @@ impl Config {
         }
     }
 
-    /// Where relays and connectors reach the control plane: `public_url`,
-    /// or with an operator certificate on its host, the same URL under the
-    /// first other name in `dns_names`, which keeps the control plane's own
-    /// certificate.
-    pub fn node_url(&self) -> String {
-        match (
-            &self.tls,
-            self.dns_names.iter().find(|n| **n != self.public_host),
-        ) {
+    /// Where enrolled clients, relays and connectors reach the control
+    /// plane, always under its own certificate: `public_url`, or with an
+    /// operator certificate on its host, the same URL under the first
+    /// internal name.
+    pub fn internal_url(&self) -> String {
+        match (&self.tls, self.internal_names().first()) {
             (Some(_), Some(name)) => self.public_url.replacen(&self.public_host, name, 1),
             _ => self.public_url.clone(),
         }
+    }
+
+    /// The names in `dns_names` other than `public_host`, which always get
+    /// the control plane's own certificate.
+    pub fn internal_names(&self) -> Vec<String> {
+        self.dns_names
+            .iter()
+            .filter(|n| **n != self.public_host)
+            .cloned()
+            .collect()
+    }
+
+    /// Whether a connection that asked for `server_name` was given the
+    /// control plane's own certificate, which the trust bundle verifies,
+    /// rather than the operator's.
+    pub fn presents_own_certificate(&self, server_name: Option<&str>) -> bool {
+        self.tls.is_none() || is_internal_name(&self.internal_names(), server_name)
     }
 
     /// The control plane's own names, which no app may claim: its host, its
@@ -615,6 +655,26 @@ mod tests {
     }
 
     #[test]
+    fn connection_limits_and_trusted_proxies() {
+        let c = Config::parse(MINIMAL).unwrap();
+        assert_eq!(c.connections, ListenOptions::default());
+        assert_eq!(c.connections.max_per_source, 64);
+        let c = Config::parse(&format!(
+            "{MINIMAL}connections:\n  maxPerSource: 0\n  trustedProxies: [10.0.0.0/8, \"fd00::1\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(c.connections.max_per_source, 0);
+        assert_eq!(c.connections.trusted_proxies.len(), 2);
+        let e = Config::parse(&format!("{MINIMAL}connections:\n  maxPerSource: -1\n")).unwrap_err();
+        assert!(e.contains("maxPerSource"), "{e}");
+        let e = Config::parse(&format!(
+            "{MINIMAL}connections:\n  trustedProxies: [10.0.0.1/8]\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("trustedProxies"), "{e}");
+    }
+
+    #[test]
     fn bounds_are_enforced() {
         let e =
             Config::parse(&format!("{MINIMAL}certificates:\n  clientLifetime: 5h\n")).unwrap_err();
@@ -678,12 +738,14 @@ mod tests {
                 key_file: "/etc/warren/key.pem".into(),
             })
         );
-        assert_eq!(c.node_url(), "https://nodes.warren.example.com");
-        assert_eq!(Config::parse(MINIMAL).unwrap().tls, None);
-        assert_eq!(
-            Config::parse(MINIMAL).unwrap().node_url(),
-            "https://warren.example.com"
-        );
+        assert_eq!(c.internal_url(), "https://nodes.warren.example.com");
+        assert!(c.presents_own_certificate(Some("Nodes.Warren.Example.com")));
+        assert!(!c.presents_own_certificate(Some("warren.example.com")));
+        assert!(!c.presents_own_certificate(None));
+        let plain = Config::parse(MINIMAL).unwrap();
+        assert_eq!(plain.tls, None);
+        assert_eq!(plain.internal_url(), "https://warren.example.com");
+        assert!(plain.presents_own_certificate(Some("warren.example.com")));
 
         let e = Config::parse(&format!(
             "{MINIMAL}dnsNames: [nodes.warren.example.com]\ntls:\n  certFile: cert.pem\n"

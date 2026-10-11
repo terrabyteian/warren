@@ -1,29 +1,36 @@
 //! The HTTPS listener: an operator-supplied certificate on the public host
-//! with the infrastructure certificate kept for relays and connectors, its
-//! reload, and the per-source connection cap.
+//! for sign-in and enrollment, with the infrastructure certificate kept for
+//! everything else, its reload, the per-source cap on unauthenticated
+//! connections, and sources named by trusted proxies.
 
 mod support;
 
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::{Request, StatusCode};
+use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty};
+use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, ServerName};
-use serde_json::Value;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use serde_json::{Value, json};
 use support::{IdpUser, RunningIdp, StubNode, TempDir, free_port, write};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use warren_control::config::Config;
-use warren_control::web::MAX_CONNECTIONS_PER_SOURCE;
+use warren_control::web::{
+    self, Body, Handler, ListenOptions, MAX_CONNECTIONS_PER_SOURCE, Peer, ServerCert,
+};
 use warren_control::{ControlPlane, Error, admin_request};
 use warren_core::clock;
 use warren_core::keys::SigningKey;
 use warren_core::x509::{self, CertificateSpec, EMPTY_NAME, IssuerInfo, Usage};
+use warren_policy::names::Cidr;
 
 const PUBLIC_HOST: &str = "warren.example.test";
 const INTERNAL_HOST: &str = "localhost";
@@ -194,6 +201,28 @@ async fn the_public_host_presents_the_operator_certificate() {
     let discovery: Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(discovery["trust_domain"], "example.test");
+    // Calls after enrollment are refused there: they belong where the
+    // trust bundle verifies the control plane.
+    let resp = sender
+        .send_request(
+            Request::get("/v1/entitlements")
+                .header("host", PUBLIC_HOST)
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+    let problem: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(problem["reason"], "misdirected_request");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("https://{INTERNAL_HOST}:{port}/v1")),
+        "{problem}"
+    );
 
     // The trust bundle does not vouch for the public host any more, but
     // still does for the internal name, where relays and connectors join,
@@ -320,4 +349,309 @@ async fn one_source_cannot_hold_every_connection() {
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
+}
+
+/// Answers every request with the source and whether the peer presented a
+/// certificate.
+struct Echo;
+
+impl Handler for Echo {
+    async fn handle(self: Arc<Self>, _req: Request<Incoming>, peer: Arc<Peer>) -> Response<Body> {
+        web::json(
+            StatusCode::OK,
+            &json!({
+                "source": peer.addr.map(|a| a.to_string()),
+                "authenticated": !peer.certificates.is_empty(),
+            }),
+        )
+    }
+}
+
+/// A CA, a server certificate for localhost and a client certificate.
+struct EchoPki {
+    ca: Vec<u8>,
+    server: (Vec<Vec<u8>>, Vec<u8>),
+    client: (Vec<Vec<u8>>, Vec<u8>),
+}
+
+impl EchoPki {
+    fn new() -> EchoPki {
+        let ca_key = SigningKey::generate().unwrap();
+        let name = x509::common_name("echo CA");
+        let now = clock::now_secs();
+        let issuer = IssuerInfo {
+            name: name.clone(),
+            key_id: ca_key.public_key().key_id(),
+        };
+        let spec = |key: &SigningKey, usage, serial, dns: Vec<String>, uris: Vec<String>| {
+            x509::build_certificate(
+                &CertificateSpec {
+                    serial: [serial; 16],
+                    not_before: now - 60,
+                    not_after: now + 3_600,
+                    subject: if serial == 1 {
+                        name.clone()
+                    } else {
+                        EMPTY_NAME.to_vec()
+                    },
+                    public_key: key.public_key(),
+                    usage,
+                    uris,
+                    dns_names: dns,
+                    identity: None,
+                },
+                &issuer,
+                |tbs| ca_key.sign_der(tbs),
+            )
+            .unwrap()
+        };
+        let ca = spec(&ca_key, Usage::Ca { path_len: 0 }, 1, vec![], vec![]);
+        let server_key = SigningKey::generate().unwrap();
+        let server = spec(
+            &server_key,
+            Usage::Leaf {
+                server_auth: true,
+                client_auth: false,
+            },
+            2,
+            vec!["localhost".into()],
+            vec![],
+        );
+        let client_key = SigningKey::generate().unwrap();
+        let client = spec(
+            &client_key,
+            Usage::Leaf {
+                server_auth: false,
+                client_auth: true,
+            },
+            3,
+            vec![],
+            vec!["warren://example.test/relay/n-1".into()],
+        );
+        EchoPki {
+            server: (
+                vec![server, ca.clone()],
+                server_key.to_pkcs8().unwrap().to_vec(),
+            ),
+            client: (
+                vec![client, ca.clone()],
+                client_key.to_pkcs8().unwrap().to_vec(),
+            ),
+            ca,
+        }
+    }
+
+    /// Serves [`Echo`] on 127.0.0.1 with `options`, requiring nothing of
+    /// clients but checking any certificate they present.
+    async fn serve(&self, options: ListenOptions) -> (u16, tokio::sync::watch::Sender<bool>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cert = ServerCert::new(self.server.0.clone(), &self.server.1, vec![]).unwrap();
+        let config = web::server_config(Arc::new(cert), std::slice::from_ref(&self.ca)).unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(web::serve_tls(
+            listener,
+            config,
+            Arc::new(Echo),
+            options,
+            rx,
+        ));
+        (port, tx)
+    }
+
+    /// A TLS client trusting the CA, presenting the client certificate
+    /// when `authenticate`.
+    fn connector(&self, authenticate: bool) -> TlsConnector {
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(self.ca.clone())).unwrap();
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots);
+        let mut config = if authenticate {
+            builder
+                .with_client_auth_cert(
+                    self.client
+                        .0
+                        .iter()
+                        .cloned()
+                        .map(CertificateDer::from)
+                        .collect(),
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.client.1.clone())),
+                )
+                .unwrap()
+        } else {
+            builder.with_no_client_auth()
+        };
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        TlsConnector::from(Arc::new(config))
+    }
+}
+
+/// Completes TLS over `tcp` and asks the echo server who it thinks we are.
+async fn echo(tcp: TcpStream, connector: &TlsConnector) -> std::io::Result<(Value, Held)> {
+    let tls = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .map_err(std::io::Error::other)?;
+    let task = tokio::spawn(conn);
+    let resp = sender
+        .send_request(
+            Request::get("/")
+                .header("host", "localhost")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    Ok((
+        serde_json::from_slice(&body).unwrap(),
+        Held {
+            _sender: sender,
+            task,
+        },
+    ))
+}
+
+/// Keeps a connection open until dropped.
+struct Held {
+    _sender: hyper::client::conn::http1::SendRequest<Empty<Bytes>>,
+    task: tokio::task::JoinHandle<Result<(), hyper::Error>>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_unauthenticated_connections_count_against_their_source() {
+    let pki = EchoPki::new();
+    let (port, _stop) = pki
+        .serve(ListenOptions {
+            max_per_source: 2,
+            trusted_proxies: vec![],
+        })
+        .await;
+    let connect = || TcpStream::connect(("127.0.0.1", port));
+
+    // Connections with a client certificate stop counting once verified.
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let (who, conn) = echo(connect().await.unwrap(), &pki.connector(true))
+            .await
+            .unwrap();
+        assert_eq!(who["authenticated"], true);
+        held.push(conn);
+    }
+
+    // Two anonymous connections fill the source's allowance.
+    let raw = [connect().await.unwrap(), connect().await.unwrap()];
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        echo(connect().await.unwrap(), &pki.connector(false))
+            .await
+            .is_err()
+    );
+    drop(raw);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match echo(connect().await.unwrap(), &pki.connector(false)).await {
+            Ok((who, _)) => {
+                assert_eq!(who["authenticated"], false);
+                break;
+            }
+            Err(e) if Instant::now() > deadline => panic!("still refused: {e}"),
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+
+    // 0 turns the limit off.
+    let (open_port, _stop) = pki
+        .serve(ListenOptions {
+            max_per_source: 0,
+            trusted_proxies: vec![],
+        })
+        .await;
+    let mut raw = Vec::new();
+    for _ in 0..8 {
+        raw.push(TcpStream::connect(("127.0.0.1", open_port)).await.unwrap());
+    }
+    let tcp = TcpStream::connect(("127.0.0.1", open_port)).await.unwrap();
+    assert!(echo(tcp, &pki.connector(false)).await.is_ok());
+}
+
+/// A PROXY protocol version 2 header: `PROXY` for TCP over IPv4 from
+/// `source`, or `LOCAL` when there is none.
+fn proxy_header(source: Option<SocketAddrV4>) -> Vec<u8> {
+    let mut out = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    match source {
+        Some(src) => {
+            out.extend([0x21, 0x11, 0, 12]);
+            out.extend(src.ip().octets());
+            out.extend([127, 0, 0, 1]);
+            out.extend(src.port().to_be_bytes());
+            out.extend(443u16.to_be_bytes());
+        }
+        None => out.extend([0x20, 0x00, 0, 0]),
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_proxies_name_the_real_source() {
+    let pki = EchoPki::new();
+    let (port, _stop) = pki
+        .serve(ListenOptions {
+            max_per_source: 1,
+            trusted_proxies: vec![Cidr::parse("127.0.0.0/8").unwrap()],
+        })
+        .await;
+    let via_proxy = |header: Vec<u8>| async move {
+        let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tcp.write_all(&header).await.unwrap();
+        tcp
+    };
+    let ada = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 5555);
+    let (who, _first) = echo(
+        via_proxy(proxy_header(Some(ada))).await,
+        &pki.connector(false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(who["source"], "203.0.113.7:5555");
+
+    // The limit applies to the source the proxy names, not to the proxy.
+    assert!(
+        echo(
+            via_proxy(proxy_header(Some(ada))).await,
+            &pki.connector(false)
+        )
+        .await
+        .is_err()
+    );
+    let bob = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 6000);
+    let (who, _second) = echo(
+        via_proxy(proxy_header(Some(bob))).await,
+        &pki.connector(false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(who["source"], "198.51.100.1:6000");
+
+    // The proxy's own health checks use LOCAL and count as the proxy.
+    let (who, _third) = echo(via_proxy(proxy_header(None)).await, &pki.connector(true))
+        .await
+        .unwrap();
+    assert!(who["source"].as_str().unwrap().starts_with("127.0.0.1:"));
+
+    // A trusted proxy that sends no header is refused.
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(echo(tcp, &pki.connector(true)).await.is_err());
 }

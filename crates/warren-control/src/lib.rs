@@ -221,14 +221,8 @@ impl ControlPlane {
         app.publish().await?;
 
         let (chain, pkcs8) = issue_own_cert(&app.authority, config, &app.id)?;
-        let internal_names = config
-            .dns_names
-            .iter()
-            .filter(|n| **n != config.public_host)
-            .cloned()
-            .collect();
         let certificates = Arc::new(Certificates {
-            server: Arc::new(ServerCert::new(chain, &pkcs8, internal_names)?),
+            server: Arc::new(ServerCert::new(chain, &pkcs8, config.internal_names())?),
             operator: config.tls.clone(),
             seen: Mutex::new([0; 32]),
         });
@@ -236,6 +230,25 @@ impl ControlPlane {
             certificates
                 .reload()
                 .map_err(|e| Error::Config(e.to_string()))?;
+            let nodes: Vec<String> = app
+                .store
+                .nodes()
+                .await?
+                .into_iter()
+                .filter(|n| n.revoked_at.is_none())
+                .map(|n| format!("{} {}", n.role, n.name))
+                .collect();
+            if !nodes.is_empty() {
+                log::warn(
+                    "tls",
+                    &format!(
+                        "{} now presents the operator's certificate, which relays and connectors do not accept; any of these that still use it must be pointed at {} to keep receiving bundles and revocations: {}",
+                        config.public_url,
+                        config.internal_url(),
+                        nodes.join(", ")
+                    ),
+                );
+            }
         } else {
             log::warn(
                 "tls",
@@ -261,6 +274,7 @@ impl ControlPlane {
             listener,
             tls,
             Arc::new(api::Api(app.clone())),
+            config.connections.clone(),
             rx.clone(),
         )));
 
