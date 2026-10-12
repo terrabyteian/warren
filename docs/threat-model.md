@@ -114,7 +114,9 @@ control.
 
 - **Locked or powered off.** Disk encryption (a posture check) protects data at
   rest. The device key lives in the Secure Enclave and cannot be extracted
-  (G3). An admin or the user disables the device, cutting access within
+  (G3); a software key on a Mac without one is sealed under a key in the
+  login keychain, which stays locked until the user signs in to the Mac. An
+  admin or the user disables the device, cutting access within
   10 seconds (G9); otherwise access ends within one certificate lifetime when
   renewal fails (G4).
 - **Unlocked, with a live session.** The thief can use whatever the user can
@@ -129,7 +131,10 @@ Residual risk: the window between theft and report on an unlocked device.
 
 A certificate is public data; it is useless without its private key. Client
 keys are non-exportable Secure Enclave keys, so a copied certificate cannot
-complete a TLS handshake (G3). Even if a key were usable remotely through a
+complete a TLS handshake (G3). A Mac without a Secure Enclave has a software
+key instead, which malware running as the user could copy (T10); such
+devices are recorded as such at enrollment and approving them is the
+administrator's decision. Even if a key were usable remotely through a
 compromised device (see T10), the certificate lasts at most 4 hours (G4) and
 revoking its session, device or serial cuts it within 10 seconds (G9). TLS 1.3
 encrypts client certificates in the handshake, so passive observers do not
@@ -260,6 +265,17 @@ sensitive apps that require fresh MFA; and full audit of what the device
 reached (G13). The system extension's access to the enclave key is restricted
 to warren's signed code.
 
+Until the app is signed, the command-line client ([macos.md](macos.md))
+stands in for it, with three differences. The enclave key's handle is a
+file only the user can read, so malware running as the user can have the
+enclave sign with the key, though never extract it. On a Mac without a
+Secure Enclave the key is a software key, sealed under a key in the user's
+login keychain, which such malware can read. And `sudo warren up` runs as
+root only a helper that configures its own tunnel interface and adds or
+removes routes through it, refusing a default route, any range wider than
+a /8 and local ranges; the tunnel, TLS, QUIC, HTTP and the key run as the
+user, so a flaw in them does not yield root.
+
 Residual risk: a fully compromised device acts as its user until detected.
 
 ### T11. Supply-chain compromise
@@ -376,6 +392,9 @@ extend access past the other's view (G4, G9).
 - A compromised control plane is a full compromise until detected (T5).
 - Device-level access means any process on an enrolled, unlocked device can
   use the user's access (T2, T10).
+- Macs without a Secure Enclave enroll with software keys, which do not meet
+  G3; they are recorded as such for administrators to approve or not (T3,
+  T10).
 - An IdP without shared signals or SCIM leaves a lag bounded by the
   certificate lifetime until polling arrives in v1.x (T6).
 
@@ -383,7 +402,8 @@ extend access past the other's view (G4, G9).
 
 | Item | Milestone |
 | --- | --- |
-| Choose the hardware attestation path for Mac device keys and its trust class | M1 |
+| Hardware attestation of Mac device keys (MDM-managed device attestation), so a Secure Enclave key can be trust class 3; M1 found no path for an unsigned client, so every key is device-reported until then | with the signed app |
+| Keep the device key in a keychain access group only warren's signed app and extension can use | with the signed app |
 | Specify the posture-statement encoding and signature (policy bundles are specified in [protocol.md](protocol.md#112-relays-and-connectors-to-control-plane-link-e)) | M2 |
 | Specify the clientless session-assertion format and its signature | M3 |
 | Revocation-deadline integration test and published latency metric | M2 |

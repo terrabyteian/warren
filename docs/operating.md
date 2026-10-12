@@ -73,6 +73,9 @@ Without `tls`, the organization URL presents the control plane's own
 certificate. Warren clients that pin the trust bundle (from an MDM profile,
 for example) work, but browsers do not trust it, so browser sign-in shows a
 certificate error; the control plane logs a warning saying so at startup.
+`warren admin deployment` prints the deployment root's fingerprint, which
+clients pin with `warren login --fingerprint` ([macos.md](macos.md)) and MDM
+profiles preset.
 
 ## Connection limits
 

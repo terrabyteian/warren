@@ -111,6 +111,59 @@ fn cli() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("idp")
+                .about("Run a test OpenID Connect provider that signs one user in without a form")
+                .arg(Arg::new("listen").long("listen").required(true).value_name("ADDR"))
+                .arg(
+                    Arg::new("host")
+                        .long("host")
+                        .default_value("localhost")
+                        .help("The host name in the issuer URL and the TLS certificate"),
+                )
+                .arg(Arg::new("client-id").long("client-id").default_value("warren"))
+                .arg(
+                    Arg::new("user")
+                        .long("user")
+                        .required(true)
+                        .value_name("SUB,EMAIL,GROUP+GROUP,AMR+AMR"),
+                )
+                .arg(
+                    Arg::new("dir")
+                        .long("dir")
+                        .required(true)
+                        .help("Where to write ca.pem, the IdP's test CA"),
+                ),
+        )
+        .subcommand(
+            Command::new("connector")
+                .about("macOS: a connector that forwards through a utun interface with address translation (tests only; needs root)")
+                .arg(Arg::new("group").long("group").required(true))
+                .arg(
+                    Arg::new("relay")
+                        .long("relay")
+                        .required(true)
+                        .action(ArgAction::Append)
+                        .value_name("NAME@HOST:PORT"),
+                )
+                .arg(Arg::new("join-token").long("join-token").required(true))
+                .arg(Arg::new("bundle").long("bundle").required(true))
+                .arg(Arg::new("audit").long("audit"))
+                .arg(
+                    Arg::new("map")
+                        .long("map")
+                        .required(true)
+                        .action(ArgAction::Append)
+                        .value_name("APP=LOCAL")
+                        .help("An app's IPv4 address and the local address that serves it"),
+                )
+                .arg(
+                    Arg::new("peers")
+                        .long("peers")
+                        .default_value("10.88.0.0/24")
+                        .help("The range client addresses are translated into"),
+                ),
+        )
+        .subcommand(
             Command::new("serve")
                 .about("Run stand-in apps")
                 .arg(
@@ -287,6 +340,129 @@ async fn join_serve_cmd(m: &ArgMatches) -> Result<(), String> {
     Ok(())
 }
 
+async fn idp_cmd(m: &ArgMatches) -> Result<(), String> {
+    let dir = PathBuf::from(s(m, "dir"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let user = warren_harness::idp::IdpUser::parse(s(m, "user"))?;
+    let idp = warren_harness::idp::TestIdp::start(
+        sock(s(m, "listen"))?,
+        s(m, "host"),
+        s(m, "client-id"),
+        None,
+        user,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("ca.pem"), &idp.ca_pem).map_err(|e| e.to_string())?;
+    emit(json!({ "serving": "idp", "issuer": idp.issuer, "addr": idp.addr.to_string() }));
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+fn relay_args(m: &ArgMatches) -> Result<Vec<RelayAddress>, String> {
+    m.get_many::<String>("relay")
+        .expect("required")
+        .map(|r| {
+            let (name, addr) = r
+                .split_once('@')
+                .ok_or_else(|| format!("--relay {r}: expected NAME@HOST:PORT"))?;
+            let addr = sock(addr)?;
+            Ok(RelayAddress {
+                name: name.into(),
+                quic: addr,
+                tcp: addr,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+async fn connector_cmd(m: &ArgMatches) -> Result<(), String> {
+    use std::net::Ipv4Addr;
+    use warren_connector::{Connector, ConnectorConfig, SystemResolver};
+    use warren_core::audit::{AuditSink, NodeInfo};
+    use warren_core::bundle::{Bundle, NodeState};
+    use warren_core::join::{JoinToken, NodeKey};
+
+    let group = s(m, "group").to_owned();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let token = JoinToken::parse(s(m, "join-token"), now).map_err(|e| e.to_string())?;
+    let key = NodeKey::generate().map_err(|e| e.to_string())?;
+    let joined = warren_masque::join::join(&token, &key)
+        .await
+        .map_err(|e| e.to_string())?;
+    let bundle_path = PathBuf::from(s(m, "bundle"));
+    let bundle = Bundle::load(&bundle_path).map_err(|e| e.to_string())?;
+    let apps = m
+        .get_many::<String>("map")
+        .expect("required")
+        .map(|spec| {
+            let (app, local) = spec
+                .split_once('=')
+                .ok_or_else(|| format!("--map {spec}: expected APP=LOCAL"))?;
+            let parse = |a: &str| {
+                a.parse::<Ipv4Addr>()
+                    .map_err(|_| format!("--map {spec}: {a} is not an IPv4 address"))
+            };
+            Ok((parse(app)?, parse(local)?))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let peers: IpNet = s(m, "peers").parse().map_err(|e| format!("--peers: {e}"))?;
+    let backend = warren_harness::utun_nat::start(apps, peers).map_err(|e| e.to_string())?;
+    let audit = AuditSink::new(
+        NodeInfo {
+            role: "connector".into(),
+            name: format!("connector/{group}/{}", joined.identity.id),
+        },
+        m.get_one::<String>("audit").map(Path::new),
+    )
+    .map_err(|e| format!("--audit: {e}"))?;
+    let state = NodeState::new(bundle);
+    let config = ConnectorConfig {
+        group,
+        relays: relay_args(m)?,
+        transport: TransportMode::Auto,
+        credentials: joined.credentials,
+        trust: Arc::new(joined.trust),
+        policy: Arc::new(warren_core::policy::StaticPolicy::new(state.clone())),
+        state,
+        audit,
+        resolver: Arc::new(SystemResolver),
+        synthetic_pools: vec![
+            warren_core::params::SYNTHETIC_POOL_V4
+                .parse::<IpNet>()
+                .expect("valid"),
+            warren_core::params::SYNTHETIC_POOL_V6
+                .parse::<IpNet>()
+                .expect("valid"),
+        ],
+        tunnel_mtu: warren_core::params::TUNNEL_MTU,
+        tuning: TransportTuning::default(),
+    };
+    let connector = Connector::start(config, backend).map_err(|e| e.to_string())?;
+    emit(json!({ "serving": "connector", "id": joined.identity.id }));
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(|e| e.to_string())?;
+    while hup.recv().await.is_some() {
+        match Bundle::load(&bundle_path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| connector.reload(b))
+        {
+            Ok(()) => emit(json!({ "event": "reloaded" })),
+            Err(e) => emit(json!({ "event": "reload_failed", "error": e })),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn connector_cmd(_: &ArgMatches) -> Result<(), String> {
+    Err("the utun connector stand-in runs on macOS; use warren connector on Linux".into())
+}
+
 async fn serve_cmd(m: &ArgMatches) -> Result<(), String> {
     for a in m.get_many::<String>("tcp-echo").into_iter().flatten() {
         let l = warren_harness::serve::tcp_echo(sock(a)?)
@@ -318,21 +494,7 @@ async fn serve_cmd(m: &ArgMatches) -> Result<(), String> {
 }
 
 fn client_config(m: &ArgMatches) -> Result<ClientConfig, String> {
-    let relays = m
-        .get_many::<String>("relay")
-        .expect("required")
-        .map(|r| {
-            let (name, addr) = r
-                .split_once('@')
-                .ok_or_else(|| format!("--relay {r}: expected NAME@HOST:PORT"))?;
-            let addr = sock(addr)?;
-            Ok(RelayAddress {
-                name: name.into(),
-                quic: addr,
-                tcp: addr,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let relays = relay_args(m)?;
     let trust = TrustBundle::load_dir(s(m, "trust-domain"), Path::new(s(m, "trust-bundle")))
         .map_err(|e| e.to_string())?;
     Ok(ClientConfig {
@@ -343,7 +505,7 @@ fn client_config(m: &ArgMatches) -> Result<ClientConfig, String> {
             "h2" => TransportMode::Http2Only,
             _ => TransportMode::Auto,
         },
-        credentials: Credentials::load(Path::new(s(m, "cert")), Path::new(s(m, "key")))?,
+        credentials: Credentials::load(Path::new(s(m, "cert")), Path::new(s(m, "key")))?.into(),
         trust: Arc::new(trust),
         tunnel_mtu: *m.get_one::<u16>("tunnel-mtu").expect("defaulted"),
         fallback_delay: Duration::from_millis(
@@ -725,6 +887,8 @@ fn main() -> ExitCode {
         match matches.subcommand() {
             Some(("pki", m)) => pki_cmd(m),
             Some(("join-serve", m)) => join_serve_cmd(m).await,
+            Some(("idp", m)) => idp_cmd(m).await,
+            Some(("connector", m)) => connector_cmd(m).await,
             Some(("serve", m)) => serve_cmd(m).await,
             Some(("client", m)) => client_cmd(m).await,
             Some(("bench", m)) => bench_cmd(m).await,

@@ -49,9 +49,11 @@ binaries tracked today:
 
 | Name | Build | Data path |
 | --- | --- | --- |
-| `warren` | `-p warren` (all roles) | no |
+| `warren` | `-p warren` (all roles and the client) | no |
 | `warren-datapath` | `-p warren --no-default-features --features relay,connector` | yes |
 | `warren-client` | `-p warren-client` | yes |
+| `warren-client-cli` | `-p warren --no-default-features --features client` (the macOS release) | yes |
+| `warren-ffi` | `-p warren-ffi` (the static library the Swift shells link) | yes |
 
 The Kubernetes operator joins this list when it becomes a binary in M2.
 
@@ -153,6 +155,22 @@ the workspace crates that use it.
 | `warren` | 231 | Cedar (about 100, mostly its build-time parser generator) and sqlx with `url` (about 60) are the bulk; the data path's transport stack is most of the rest. |
 | `warren-datapath` | 77 | The transport stack (tokio, quinn, rustls, h2), the aws-lc-rs build (cc, cmake and friends), clap, and base64 and zeroize through warren-core. |
 | `warren-client` | 73 | The data-path set without the clap family. |
+| `warren-client-cli` | 77 | The client core and the clap family. |
+| `warren-ffi` | 73 | Exactly the client core's. |
+
+The M1 macOS client ([macos.md](macos.md)) adds no third-party crate to
+any closure. New direct edges, each allowlisted: serde, serde_json and
+zeroize for warren-client (its saved state, the control-plane calls, and
+wiping the software device key); serde_json and, on macOS, libc for the
+`warren` binary's client (status output, and privilege separation for
+`warren up`); libc for warren-core on macOS (the utun device); serde_json
+and tokio for warren-ffi; and http for warren-harness's tests, which drive
+the control plane's HTTP client. The Security framework (the Secure
+Enclave key, the login keychain, the system's certificate trust
+evaluation) is reached through about thirty C functions declared in
+`warren-client`'s `apple` module, not binding crates: security-framework is
+in the control plane's closure through rustls-native-certs, but bringing it
+into the data path would add crates for what those calls do.
 
 The control plane's crates stay out of both data-path closures:
 `scripts/check-closure.sh` checks them against

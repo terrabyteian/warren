@@ -228,6 +228,9 @@ pub enum ExpectServer {
         /// Connector group.
         group: String,
     },
+    /// The control plane at the dialled DNS name, as an enrolled client
+    /// verifies it (docs/protocol.md section 10.1).
+    ControlPlane,
 }
 
 /// Verifies server certificates through the infrastructure CA: relays by
@@ -268,11 +271,12 @@ pub fn verify_server(
     bundle.verify_chain(leaf, Issuer::Infrastructure, true, now)?;
     let id = pki::check_infra_profile(leaf, &bundle.trust_domain)?;
     match (expect, &id.role) {
-        (ExpectServer::Relay, NodeRole::Relay) => {
+        (ExpectServer::Relay, NodeRole::Relay)
+        | (ExpectServer::ControlPlane, NodeRole::ControlPlane) => {
             let ee = webpki::EndEntityCert::try_from(leaf)
                 .map_err(|e| CertError::Chain(e.to_string()))?;
             ee.verify_is_valid_for_subject_name(server_name)
-                .map_err(|e| CertError::Chain(format!("relay name: {e}")))?;
+                .map_err(|e| CertError::Chain(format!("{} name: {e}", id.role)))?;
         }
         (ExpectServer::Connector { group }, NodeRole::Connector { group: g }) if g == group => {}
         _ => {
@@ -357,6 +361,62 @@ impl Credentials {
             PrivateKeyDer::from_pem_file(key).map_err(|e| format!("{}: {e}", key.display()))?;
         Ok(Credentials { chain, key })
     }
+}
+
+/// A user+device certificate chain and the device key behind it. The key is
+/// either in memory or held by a signer that never exports it, such as the
+/// Secure Enclave (G3): TLS then asks the signer for each handshake
+/// signature.
+#[derive(Debug, Clone)]
+pub enum DeviceCredentials {
+    /// A chain and its private key in memory.
+    InMemory(Credentials),
+    /// A chain whose key signs through `signer`.
+    External {
+        /// Chain, leaf first.
+        chain: Vec<CertificateDer<'static>>,
+        /// Signs with the certificate's key.
+        signer: Arc<dyn rustls::sign::SigningKey>,
+    },
+}
+
+impl DeviceCredentials {
+    /// The certificate chain, leaf first.
+    pub fn chain(&self) -> &[CertificateDer<'static>] {
+        match self {
+            DeviceCredentials::InMemory(c) => &c.chain,
+            DeviceCredentials::External { chain, .. } => chain,
+        }
+    }
+}
+
+impl From<Credentials> for DeviceCredentials {
+    fn from(c: Credentials) -> Self {
+        DeviceCredentials::InMemory(c)
+    }
+}
+
+/// Builds a client configuration for one link, authenticating with device
+/// credentials whose key may live in hardware.
+pub fn device_client_config(
+    creds: &DeviceCredentials,
+    verifier: Arc<dyn ServerCertVerifier>,
+    alpn: &[u8],
+) -> Result<rustls::ClientConfig, Error> {
+    let (chain, signer) = match creds {
+        DeviceCredentials::InMemory(c) => return client_config(c, verifier, alpn),
+        DeviceCredentials::External { chain, signer } => (chain, signer),
+    };
+    let certified = rustls::sign::CertifiedKey::new(chain.clone(), signer.clone());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified)));
+    config.alpn_protocols = vec![alpn.to_vec()];
+    config.enable_early_data = false;
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
 }
 
 /// Builds a client configuration for one link.

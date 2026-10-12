@@ -1,0 +1,23 @@
+[package]
+name = "warren-ffi"
+description = "The C ABI the native platform shells link: sign-in, status and the tunnel engine of the client core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# A static library for the Swift shells (macos/build.sh), and an rlib for
+# this crate's own tests.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+serde_json.workspace = true
+tokio.workspace = true
+warren-client.workspace = true
+warren-core.workspace = true
+
+[lints]
+workspace = true

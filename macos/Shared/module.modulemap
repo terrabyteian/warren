@@ -1,0 +1,6 @@
+// The client core's C interface (crates/warren-ffi), as a Swift module.
+module CWarren [system] {
+    header "../../crates/warren-ffi/include/warren.h"
+    link "warren_ffi"
+    export *
+}

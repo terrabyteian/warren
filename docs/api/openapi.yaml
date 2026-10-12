@@ -440,6 +440,27 @@ paths:
       summary: Commit-to-cut latency measured from node acknowledgements
       responses:
         "200": { description: Count, median, 99th percentile, maximum and how many exceeded the deadline. }
+  /v1/admin/deployment:
+    get:
+      tags: [admin]
+      operationId: deployment
+      summary: The deployment's trust domain, organization URL and root fingerprint
+      description: >-
+        The root fingerprint is what a client pins to sign in when the
+        organization URL has no certificate its system trusts
+        (`warren login --fingerprint`), and what an MDM profile presets.
+      responses:
+        "200":
+          description: The deployment.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [trust_domain, public_url, root_fingerprint]
+                properties:
+                  trust_domain: { type: string }
+                  public_url: { type: string }
+                  root_fingerprint: { type: string, description: "`sha256:` and the lowercase hex SHA-256 of the root CA certificate, DER." }
 components:
   securitySchemes:
     session:

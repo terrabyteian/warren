@@ -407,7 +407,7 @@ impl Deployment {
             group: GROUP.into(),
             relays: self.relays.iter().map(relay_address).collect(),
             transport,
-            credentials: self.pki.client(cert),
+            credentials: self.pki.client(cert).into(),
             trust: self.trust.clone(),
             tunnel_mtu: params::TUNNEL_MTU,
             fallback_delay: params::FALLBACK_DELAY,
@@ -418,14 +418,14 @@ impl Deployment {
     /// A client configuration for given credentials.
     pub fn client_with(
         &self,
-        credentials: warren_core::tls::Credentials,
+        credentials: impl Into<warren_core::tls::DeviceCredentials>,
         transport: TransportMode,
     ) -> ClientConfig {
         ClientConfig {
             group: GROUP.into(),
             relays: self.relays.iter().map(relay_address).collect(),
             transport,
-            credentials,
+            credentials: credentials.into(),
             trust: self.trust.clone(),
             tunnel_mtu: params::TUNNEL_MTU,
             fallback_delay: params::FALLBACK_DELAY,

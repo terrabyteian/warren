@@ -1,15 +1,23 @@
-//! The `warren` binary: one executable, three roles.
+//! The `warren` binary: one executable, three roles, and the client.
 //!
 //! Each role is a Cargo feature, so a data-path build (`relay` and
 //! `connector` only) never links control-plane or console code. Builds with
 //! the control plane also carry its operator commands: `warren admin`,
 //! which talks to a running control plane over its local admin socket, and
-//! `warren policy check`, which compiles a policy directory offline.
+//! `warren policy check`, which compiles a policy directory offline. Builds
+//! with the `client` feature carry the command-line client: `warren login`,
+//! `warren up`, `warren status`, `warren down` and `warren logout`.
 
 use std::process::ExitCode;
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+#[cfg(any(feature = "control-plane", feature = "relay", feature = "connector"))]
+use clap::Arg;
+#[cfg(any(feature = "relay", feature = "connector"))]
+use clap::ArgAction;
+use clap::{ArgMatches, Command};
 
+#[cfg(feature = "client")]
+mod client;
 #[cfg(feature = "connector")]
 mod connector;
 #[cfg(any(feature = "relay", feature = "connector"))]
@@ -17,8 +25,13 @@ mod node;
 #[cfg(feature = "relay")]
 mod relay;
 
-#[cfg(not(any(feature = "control-plane", feature = "relay", feature = "connector")))]
-compile_error!("enable at least one role feature: control-plane, relay or connector");
+#[cfg(not(any(
+    feature = "control-plane",
+    feature = "relay",
+    feature = "connector",
+    feature = "client"
+)))]
+compile_error!("enable at least one role feature: control-plane, relay, connector or client");
 
 /// Arguments every data-path role shares.
 #[cfg(any(feature = "relay", feature = "connector"))]
@@ -237,12 +250,24 @@ fn admin_command() -> Command {
         .subcommand(
             Command::new("revocation-latency").about("Show the measured commit-to-cut latency"),
         )
+        .subcommand(Command::new("deployment").about(
+            "Show the trust domain, organization URL and the root fingerprint clients can pin",
+        ))
 }
 
 fn cli() -> Command {
+    let about = if cfg!(any(
+        feature = "control-plane",
+        feature = "relay",
+        feature = "connector"
+    )) {
+        "Zero-trust private access: control plane, relay, connector and client in one binary"
+    } else {
+        "Zero-trust private access to your organization's internal apps"
+    };
     let mut cmd = Command::new("warren")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Zero-trust private access: control plane, relay and connector in one binary")
+        .about(about)
         .subcommand_required(true)
         .arg_required_else_help(true);
     #[cfg(feature = "control-plane")]
@@ -390,6 +415,10 @@ fn cli() -> Command {
                 ),
         );
     }
+    #[cfg(feature = "client")]
+    {
+        cmd = cmd.subcommands(client::commands());
+    }
     cmd
 }
 
@@ -495,6 +524,7 @@ fn admin_request(m: &ArgMatches) -> Result<(&'static str, String, Option<String>
             None,
         ),
         ("revocation-latency", _) => ("GET", "/v1/admin/revocation-latency".into(), None),
+        ("deployment", _) => ("GET", "/v1/admin/deployment".into(), None),
         _ => return Err("unknown admin command".into()),
     })
 }
@@ -584,6 +614,10 @@ fn main() -> ExitCode {
     if let Some(code) = control_plane_commands(name, sub) {
         return code;
     }
+    #[cfg(feature = "client")]
+    if let Some(code) = client::run(name, sub) {
+        return code;
+    }
     match run(name, sub) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -610,8 +644,15 @@ mod tests {
         let names: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).collect();
         let roles = roles();
         assert_eq!(&names[..roles.len()], roles.as_slice());
-        // Operator commands exist exactly when the control plane is built.
-        let tools: Vec<&str> = names[roles.len()..].to_vec();
+        // Operator commands exist exactly when the control plane is built,
+        // and client commands exactly when the client is.
+        #[cfg_attr(not(feature = "client"), allow(unused_mut))]
+        let mut tools: Vec<&str> = names[roles.len()..].to_vec();
+        #[cfg(feature = "client")]
+        {
+            let client = tools.split_off(tools.len() - crate::client::NAMES.len());
+            assert_eq!(client, crate::client::NAMES);
+        }
         if cfg!(feature = "control-plane") {
             assert_eq!(tools, ["admin", "policy"]);
         } else {
@@ -710,6 +751,7 @@ mod tests {
                 "/v1/admin/revocation-latency",
                 None,
             ),
+            (&["deployment"], "GET", "/v1/admin/deployment", None),
         ];
         for (args, method, path, body) in cases {
             let argv: Vec<&str> = ["warren", "admin"]

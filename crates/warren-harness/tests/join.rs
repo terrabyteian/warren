@@ -143,7 +143,7 @@ async fn joined_nodes_carry_traffic() {
         group: "homelab".into(),
         relays: vec![relay_addr],
         transport: TransportMode::QuicOnly,
-        credentials: pki.client(&alice()),
+        credentials: pki.client(&alice()).into(),
         trust,
         tunnel_mtu: params::TUNNEL_MTU,
         fallback_delay: params::FALLBACK_DELAY,

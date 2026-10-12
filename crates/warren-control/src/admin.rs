@@ -45,6 +45,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/admin/nodes"),
     ("POST", "/v1/admin/nodes/{node}/revoke"),
     ("GET", "/v1/admin/revocation-latency"),
+    ("GET", "/v1/admin/deployment"),
 ];
 
 /// The admin API handler.
@@ -462,6 +463,14 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
                 &json!({ "deadline_ms": REVOCATION_DEADLINE.as_millis() as u64, "commit_to_cut": summary }),
             ))
         }
+        (Method::GET, ["v1", "admin", "deployment"]) => Ok(json(
+            StatusCode::OK,
+            &json!({
+                "trust_domain": app.config.trust_domain,
+                "public_url": app.config.public_url,
+                "root_fingerprint": format!("sha256:{}", sha256_hex(&app.authority.root.der)),
+            }),
+        )),
         _ => Err(ApiError::not_found(format!("no admin endpoint {path}"))),
     }
 }

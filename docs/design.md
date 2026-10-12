@@ -108,7 +108,7 @@ tunable is a named parameter in [protocol.md](protocol.md#14-named-parameters).
 | --- | --- |
 | **G1** Default deny | Nothing is reachable unless a policy rule allows it. A small set of invariants (valid certificate, approved device, destination inside the app and connector scope) hold regardless of policy and cannot be overridden by a rule. |
 | **G2** User and device | Every tunneled connection is bound to exactly one authenticated user and one approved device. Clientless sessions are bound to a user only and exist only for apps that opt in. |
-| **G3** Hardware-bound device keys | A device's private key is generated in and never leaves its hardware key store (the Secure Enclave on macOS). A certificate is useless without the device that holds the key. |
+| **G3** Hardware-bound device keys | A device's private key is generated in and never leaves its hardware key store (the Secure Enclave on macOS). A certificate is useless without the device that holds the key. A device without a hardware key store enrolls with a software key, which is recorded as such for administrators and does not meet this guarantee (section 7.2). |
 | **G4** Short-lived credentials | Client certificates live at most 4 hours and renew at half-life. Renewal re-checks the user, the device, the session, and baseline posture. |
 | **G5** End-to-end encryption | Tunneled application traffic is encrypted from client to connector inside a mutually authenticated session. Relays forward only its ciphertext and cannot impersonate either end. Clientless traffic is the stated exception: the relay sees it in clear, but cannot mint or extend a user's identity (section 6). |
 | **G6** Outbound only | Clients and connectors only dial out. A connector needs no inbound port on the network it serves. |
@@ -191,7 +191,11 @@ a separate binary so the Kubernetes client libraries never enter the data path
 - **The device.** The system extension holds the tunnel and talks to the
   Secure Enclave; the device key never leaves the enclave. Other processes on
   the device can use the tunnel exactly as the signed-in user can, which is
-  the inherent scope of device-level access.
+  the inherent scope of device-level access. Until the app is signed, the
+  command-line client ([macos.md](macos.md)) holds the tunnel instead: it
+  needs root only to create its interface and routes, keeps that in a
+  helper that does nothing else, and runs the tunnel and the key as the
+  user.
 - **Relays** are trusted for availability and for coarse admission (only valid
   certificates get through), never for confidentiality or integrity of
   tunneled application traffic. For clientless apps the relay terminates TLS,
@@ -271,6 +275,13 @@ Non-web clientless access (SSH, RDP, VNC in the browser) comes later.
   registers its public key with the control plane (G3). Where the platform can
   attest that the key is hardware-bound, the device records that as its trust
   class.
+- A Mac without a Secure Enclave (an older Intel Mac, a virtual machine)
+  enrolls with a software key instead, sealed on disk under a key in the
+  user's login keychain. Enrollment reports where the key lives, and
+  administrators see it, so approving such a device is their decision;
+  such a device does not meet G3. Without an attestation, which an unsigned
+  client cannot get, every key is recorded as device-reported; the
+  enrollment report is the client's claim.
 - Device approval is automatic when an admin-defined rule matches (for
   example, MDM confirms the serial number) or manual by an admin.
 - Access requires both a valid user and an approved device (G2). A device is
@@ -527,11 +538,12 @@ through it; clients re-establish sessions on another replica automatically.
 
 | Crate | Role | Filled in |
 | --- | --- | --- |
-| `warren` | The single binary; one subcommand per role | M1 |
+| `warren` | The single binary; one subcommand per role, and the command-line client | M1 |
 | `warren-core` | Shared data-path core | M1 |
 | `warren-masque` | CONNECT-UDP, CONNECT-IP, capsules, HTTP/2 fallback | M1 |
 | `warren-policy` | Policy schema and Cedar compilation | M1, M2 |
 | `warren-client` | Client core linked by native shells (data path) | M1 |
+| `warren-ffi` | The client core's C interface, linked by the Swift shells as a static library (data path) | M1 |
 | `warren-relay` | Relay role | M1 |
 | `warren-connector` | Connector role | M1 |
 | `warren-control` | Control plane role | M1 |

@@ -356,6 +356,19 @@ impl fmt::Display for IpNet {
     }
 }
 
+impl serde::Serialize for IpNet {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for IpNet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// An exact name or a `*.` wildcard.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DomainPattern {

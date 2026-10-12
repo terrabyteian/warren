@@ -88,14 +88,17 @@ The checks CI runs, in order:
 
 ```sh
 cargo fmt --all --check
-shellcheck scripts/*.sh
+shellcheck scripts/*.sh macos/*.sh
 scripts/test-check-dco.sh
 cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 cargo clippy -p warren --no-default-features --features relay,connector --all-targets --locked --offline -- -D warnings
+cargo clippy -p warren --no-default-features --features client --all-targets --locked --offline -- -D warnings
 cargo build --workspace --all-targets --locked --offline
 cargo test --workspace --locked --offline
 cargo test -p warren --no-default-features --features relay,connector --locked --offline
 sudo scripts/e2e-kernel.sh target/debug   # Linux, root: network namespaces
+scripts/e2e-macos.sh target/debug         # macOS, passwordless sudo (E2E_NO_SUDO=1 without)
+macos/build.sh                            # macOS: the Swift app and extension, unsigned
 scripts/check-deps.sh
 scripts/check-closure.sh
 scripts/check-vendor.sh        # needs network access to crates.io
@@ -104,7 +107,10 @@ cargo vet --locked             # needs cargo-vet
 ```
 
 [docs/dependencies.md](docs/dependencies.md#2-how-it-is-enforced) says how to
-install cargo-deny and cargo-vet. CI also runs the benchmarks
+install cargo-deny and cargo-vet. Clippy runs on macOS too, since the utun
+device, the Secure Enclave and privilege separation compile only there, and
+CI builds the universal macOS release of the client
+(`scripts/package-macos.sh`). CI also runs the benchmarks
 (`scripts/bench-inprocess.sh` and `sudo scripts/bench-kernel.sh`) and
 publishes their results in the job summary; they never gate a change
 ([docs/benchmarks.md](docs/benchmarks.md)).
@@ -113,8 +119,9 @@ Code conventions:
 
 - rustfmt defaults; clippy clean with warnings denied.
 - `unsafe` is denied workspace-wide. Code that needs it (FFI to the native
-  shells, the tunnel device) allows it locally with a comment explaining why
-  it is sound, and gets extra review.
+  shells and the Security framework, the tunnel devices, privilege
+  separation) allows it locally with a comment explaining why it is sound,
+  and gets extra review.
 - Keep the data path lean: the client core and the relay and connector roles
   must not depend on control-plane, console or Kubernetes crates
   (`scripts/check-closure.sh` enforces this).
