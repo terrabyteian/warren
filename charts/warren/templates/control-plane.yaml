@@ -1,0 +1,244 @@
+{{- if .Values.controlPlane.enabled }}
+{{- $cp := .Values.controlPlane }}
+{{- $name := printf "%s-control-plane" (include "warren.fullname" .) }}
+{{- $cfg := deepCopy (default dict $cp.config) }}
+{{- $_ := set $cfg "trustDomain" (required "controlPlane.trustDomain is required" $cp.trustDomain) }}
+{{- $_ := set $cfg "publicUrl" (required "controlPlane.publicUrl is required" $cp.publicUrl) }}
+{{- with $cp.dnsNames }}
+{{- $_ := set $cfg "dnsNames" . }}
+{{- end }}
+{{- $_ := set $cfg "listen" "[::]:8443" }}
+{{- $_ := set $cfg "dataDir" "/var/lib/warren" }}
+{{- $_ := set $cfg "policyDir" "/etc/warren/policy" }}
+{{- if $cp.tls.existingSecret }}
+{{- $_ := set $cfg "tls" (dict "certFile" "/etc/warren/tls/tls.crt" "keyFile" "/etc/warren/tls/tls.key") }}
+{{- end }}
+{{- if $cp.keyEncryptionKey.existingSecret }}
+{{- $_ := set $cfg "keyEncryptionKeyFile" (printf "/etc/warren/kek/%s" $cp.keyEncryptionKey.key) }}
+{{- end }}
+{{- if not $cp.idp }}
+{{- fail "controlPlane.idp is required: the control plane's OpenID Connect identity provider (see docs/kubernetes.md)" }}
+{{- end }}
+{{- $idp := deepCopy $cp.idp }}
+{{- if $cp.idpClientSecret.existingSecret }}
+{{- $_ := set $idp "clientSecretFile" (printf "/etc/warren/idp/%s" $cp.idpClientSecret.key) }}
+{{- end }}
+{{- $_ := set $cfg "idp" $idp }}
+{{- $config := toYaml $cfg }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+data:
+  control-plane.yaml: |
+    {{- $config | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-policy
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+{{- if $cp.policy }}
+data:
+  {{- range $file, $text := $cp.policy }}
+  {{ $file }}: |
+    {{- $text | nindent 4 }}
+  {{- end }}
+{{- else }}
+data: {}
+{{- end }}
+---
+# The StatefulSet's governing Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-headless
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "warren.selectorLabels" (dict "root" . "role" "control-plane") | nindent 4 }}
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+  {{- with $cp.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $cp.service.type }}
+  {{- if and (ne $cp.service.type "ClusterIP") $cp.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ $cp.service.externalTrafficPolicy }}
+  {{- end }}
+  {{- with $cp.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with $cp.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "warren.selectorLabels" (dict "root" . "role" "control-plane") | nindent 4 }}
+  ports:
+    - name: https
+      port: {{ $cp.service.port }}
+      targetPort: https
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  # One replica: the embedded SQLite database has one writer.
+  replicas: 1
+  serviceName: {{ $name }}-headless
+  selector:
+    matchLabels:
+      {{- include "warren.selectorLabels" (dict "root" . "role" "control-plane") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "warren.labels" . | nindent 8 }}
+        {{- include "warren.selectorLabels" (dict "root" . "role" "control-plane") | nindent 8 }}
+        {{- with $cp.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ $config | sha256sum }}
+        {{- with $cp.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        {{- include "warren.restrictedPod" . | nindent 8 }}
+      {{- include "warren.scheduling" (dict "v" $cp) | nindent 6 }}
+      containers:
+        - name: control-plane
+          image: {{ include "warren.image" (dict "image" .Values.image "root" .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [control-plane, --config, /etc/warren/control-plane.yaml]
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          # The admin socket answers once the control plane has opened its
+          # database and keys.
+          startupProbe:
+            exec:
+              command: [/usr/bin/warren, admin, --socket, /var/lib/warren/admin.sock, deployment]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: [/usr/bin/warren, admin, --socket, /var/lib/warren/admin.sock, deployment]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 20
+            failureThreshold: 6
+          securityContext:
+            {{- include "warren.restrictedContainer" . | nindent 12 }}
+          {{- with $cp.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/warren/control-plane.yaml
+              subPath: control-plane.yaml
+              readOnly: true
+            - name: policy
+              mountPath: /etc/warren/policy
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/warren
+            {{- if $cp.tls.existingSecret }}
+            - name: tls
+              mountPath: /etc/warren/tls
+              readOnly: true
+            {{- end }}
+            {{- if $cp.keyEncryptionKey.existingSecret }}
+            - name: kek
+              mountPath: /etc/warren/kek
+              readOnly: true
+            {{- end }}
+            {{- if $cp.idpClientSecret.existingSecret }}
+            - name: idp
+              mountPath: /etc/warren/idp
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: policy
+          configMap:
+            name: {{ $name }}-policy
+        {{- if not $cp.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- if $cp.tls.existingSecret }}
+        - name: tls
+          secret:
+            secretName: {{ $cp.tls.existingSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if $cp.keyEncryptionKey.existingSecret }}
+        - name: kek
+          secret:
+            secretName: {{ $cp.keyEncryptionKey.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: {{ $cp.keyEncryptionKey.key }}
+                path: {{ $cp.keyEncryptionKey.key }}
+        {{- end }}
+        {{- if $cp.idpClientSecret.existingSecret }}
+        - name: idp
+          secret:
+            secretName: {{ $cp.idpClientSecret.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: {{ $cp.idpClientSecret.key }}
+                path: {{ $cp.idpClientSecret.key }}
+        {{- end }}
+  {{- if $cp.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "warren.selectorLabels" (dict "root" . "role" "control-plane") | nindent 10 }}
+      spec:
+        {{- include "warren.claimSpec" (dict "p" $cp.persistence) | nindent 8 }}
+  {{- end }}
+{{- end }}

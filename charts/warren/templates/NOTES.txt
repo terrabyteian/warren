@@ -1,0 +1,51 @@
+{{- $full := include "warren.fullname" . -}}
+warren {{ .Chart.AppVersion }} is installed in {{ .Release.Namespace }}.
+{{- if .Values.controlPlane.enabled }}
+{{- $url := urlParse .Values.controlPlane.publicUrl }}
+
+The organization URL {{ .Values.controlPlane.publicUrl }} is served by the Service
+{{ $full }}-control-plane ({{ .Values.controlPlane.service.type }}, port {{ .Values.controlPlane.service.port }}).
+Its host name must resolve to the Service's address. From a workstation without
+one, forward the Service on the URL's own port and resolve the name locally, so
+the URL and the identity provider's redirect URI stay the same:
+
+  echo "127.0.0.1 {{ $url.hostname }}" | sudo tee -a /etc/hosts
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }}-control-plane {{ $url.host | trimPrefix $url.hostname | trimPrefix ":" | default "443" }}:{{ .Values.controlPlane.service.port }}
+
+macOS lets you bind port 443 without root. On Linux, a port below 1024 needs
+root: run the same command as
+sudo kubectl --kubeconfig "${KUBECONFIG:-$HOME/.kube/config}" -n {{ .Release.Namespace }} port-forward ...
+so it still reads your kubeconfig.
+
+Sign in and enroll a Mac with the warren client (docs/macos.md):
+
+  warren login {{ .Values.controlPlane.publicUrl }}
+{{- if not .Values.controlPlane.tls.existingSecret }}
+
+Without controlPlane.tls, add --fingerprint with the root fingerprint that
+warren admin deployment prints.
+{{- end }}
+
+There is no web console yet. Administer the control plane with warren admin:
+
+  kubectl -n {{ .Release.Namespace }} exec {{ $full }}-control-plane-0 -- warren admin deployment
+{{- if not (or .Values.relay.enabled .Values.connector.enabled) }}
+
+Next, create join tokens for a relay and a connector and enable them
+(docs/kubernetes.md):
+
+  kubectl -n {{ .Release.Namespace }} exec {{ $full }}-control-plane-0 -- \
+    warren admin join-token create --role relay --name relay-1 --dns-name relay.example.com
+{{- end }}
+{{- end }}
+{{- if .Values.relay.enabled }}
+
+The relay listens on UDP and TCP port {{ .Values.relay.service.port }} of the Service {{ $full }}-relay.
+Its DNS name must resolve to that Service's external address:
+
+  kubectl -n {{ .Release.Namespace }} get svc {{ $full }}-relay
+{{- end }}
+{{- if .Values.connector.enabled }}
+
+The connector for group {{ .Values.connector.group }} attaches to: {{ join ", " .Values.connector.relays }}
+{{- end }}

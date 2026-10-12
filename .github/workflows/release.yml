@@ -1,10 +1,23 @@
 name: Release
 
-# On a version tag, builds the macOS command-line client as one universal
-# binary (arm64 and x86_64), signed ad hoc and not notarized (the project
-# has no Apple Developer membership yet), and attaches it to the tag's
-# GitHub release with its SHA-256. Run by hand, it builds without
-# publishing.
+# On a version tag vX.Y.Z:
+# - builds the macOS command-line client as one universal binary (arm64 and
+#   x86_64), signed ad hoc and not notarized (the project has no Apple
+#   Developer membership yet), and attaches it to the tag's GitHub release
+#   with its SHA-256;
+# - builds the container images ghcr.io/terrabyteian/warren (the control
+#   plane), and ghcr.io/terrabyteian/warren-relay and
+#   ghcr.io/terrabyteian/warren-connector (the data-path build) for
+#   linux/amd64 and linux/arm64, tagged X.Y.Z, each with an SBOM of its
+#   packages and a provenance attestation, signs them with cosign (keyless,
+#   this workflow's identity) and attests to each an SPDX SBOM of the
+#   crates its binary is built from (scripts/closure-sbom.sh);
+# - packages the Helm chart as version X.Y.Z, pushes it to
+#   oci://ghcr.io/terrabyteian/charts/warren and signs it the same way.
+# Run by hand, it builds everything without publishing.
+# GHCR keeps new packages private: after the first vX.Y.Z tag, the owner
+# makes the four packages (warren, warren-relay, warren-connector and
+# charts/warren) public once, in each package's settings.
 on:
   push:
     tags: ["v*"]
@@ -16,6 +29,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  REGISTRY: ghcr.io/terrabyteian
 
 jobs:
   macos-client:
@@ -52,3 +66,160 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" --clobber \
             "dist/warren-$GITHUB_REF_NAME-macos-universal.tar.gz" \
             "dist/warren-$GITHUB_REF_NAME-macos-universal.tar.gz.sha256"
+
+  images:
+    name: container images (linux/amd64, linux/arm64), signed, with SBOMs
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: version
+        id: version
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT" ;;
+            *) echo "version=0.0.0-dev" >>"$GITHUB_OUTPUT" ;;
+          esac
+      # The arm64 connector image installs its packages under emulation; the
+      # binary itself is cross-compiled.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: warren (control plane)
+        id: warren
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: warren
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          sbom: true
+          provenance: mode=max
+          tags: ${{ env.REGISTRY }}/warren:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=warren
+            org.opencontainers.image.description=warren control plane, relay and connector in one binary
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - name: warren-relay (relay, data-path build)
+        id: relay
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: warren-relay
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          sbom: true
+          provenance: mode=max
+          tags: ${{ env.REGISTRY }}/warren-relay:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=warren-relay
+            org.opencontainers.image.description=warren's data-path build (relay and connector, no control plane) for relays
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - name: warren-connector (kernel-mode connector, data-path build)
+        id: connector
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: warren-connector
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          sbom: true
+          provenance: mode=max
+          tags: ${{ env.REGISTRY }}/warren-connector:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=warren-connector
+            org.opencontainers.image.description=warren's data-path build with iproute2 and nftables for kernel-mode connectors
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+      # The images' own SBOMs list the base image's packages. Each binary's
+      # crates are its closure in deps/closure/, which the dependency policy
+      # job keeps equal to what cargo compiles in: the full binary's for
+      # warren, the data-path build's for warren-relay and warren-connector.
+      - name: the crates each binary is built from
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          scripts/closure-sbom.sh deps/closure/warren.txt warren "$VERSION" >warren-crates.spdx.json
+          scripts/closure-sbom.sh deps/closure/warren-datapath.txt warren-datapath "$VERSION" \
+            >warren-datapath-crates.spdx.json
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: sign the images and every platform's manifest, and attest their crate SBOMs
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          WARREN_DIGEST: ${{ steps.warren.outputs.digest }}
+          RELAY_DIGEST: ${{ steps.relay.outputs.digest }}
+          CONNECTOR_DIGEST: ${{ steps.connector.outputs.digest }}
+        run: |
+          sign() {
+            cosign sign --yes --recursive "$1"
+            cosign attest --yes --type spdxjson --predicate "$2" "$1"
+          }
+          sign "$REGISTRY/warren@$WARREN_DIGEST" warren-crates.spdx.json
+          sign "$REGISTRY/warren-relay@$RELAY_DIGEST" warren-datapath-crates.spdx.json
+          sign "$REGISTRY/warren-connector@$CONNECTOR_DIGEST" warren-datapath-crates.spdx.json
+
+  chart:
+    name: Helm chart, signed
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install pinned Helm (CI-only tool, digest-verified)
+        run: |
+          scripts/install-kube-tools.sh "$RUNNER_TEMP/kube-tools"
+          echo "$RUNNER_TEMP/kube-tools" >> "$GITHUB_PATH"
+      - run: scripts/test-chart.sh
+      - name: package
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) version=${GITHUB_REF_NAME#v} ;;
+            *) version=0.0.0-dev ;;
+          esac
+          helm package charts/warren --version "$version" --app-version "$version" --destination dist
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: push and sign
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          helm push "dist/warren-${GITHUB_REF_NAME#v}.tgz" "oci://$REGISTRY/charts" 2>&1 | tee push.log
+          digest=$(awk '$1 == "Digest:" { print $2 }' push.log)
+          test -n "$digest"
+          cosign sign --yes "$REGISTRY/charts/warren@$digest"

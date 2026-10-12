@@ -1,0 +1,213 @@
+# Values for the warren chart. docs/kubernetes.md walks through an install;
+# docs/operating.md and docs/examples/control-plane.yaml describe every
+# control-plane setting.
+
+# The image for the control plane: the full warren binary on a distroless
+# base.
+image:
+  repository: ghcr.io/terrabyteian/warren
+  # Defaults to the chart's appVersion. A digest (sha256:...) pins it exactly.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# The image for the relay: the data-path build (relay and connector only),
+# which carries no control-plane or console code, on a distroless base.
+relayImage:
+  repository: ghcr.io/terrabyteian/warren-relay
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# The image for the connector: the data-path build with iproute2 and
+# nftables, which kernel-mode forwarding needs.
+connectorImage:
+  repository: ghcr.io/terrabyteian/warren-connector
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+commonLabels: {}
+
+controlPlane:
+  enabled: true
+
+  # Required. The deployment's name in every identity URI (warren://<trustDomain>/...).
+  trustDomain: ""
+  # Required. The organization URL people sign in at and clients are given,
+  # https://host[:port] with no path. Its host must reach the control plane
+  # Service (see service below).
+  publicUrl: ""
+  # More names for the control plane's own certificate. With tls set, the
+  # first name that is not publicUrl's host is the internal name relays,
+  # connectors and enrolled clients use, so it must reach the control plane
+  # from everywhere they run (docs/operating.md).
+  dnsNames: []
+
+  # Required by this release: the OpenID Connect identity provider, as the
+  # idp section of the configuration (issuer, clientId, scopes, groupsClaim,
+  # mfaAmrValues, ...). Register https://<publicUrl host>/v1/auth/callback as
+  # its redirect URI. clientSecretFile is set by idpClientSecret below.
+  idp: {}
+  #   issuer: https://accounts.google.com
+  #   clientId: 1234-abcd.apps.googleusercontent.com
+  #   scopes: [openid, email, profile]
+
+  # An existing Secret holding the IdP client secret, mounted read-only at
+  # /etc/warren/idp/client-secret. Leave empty for a public client (PKCE only).
+  idpClientSecret:
+    existingSecret: ""
+    key: client-secret
+
+  # An existing kubernetes.io/tls Secret (tls.crt, tls.key) for the
+  # organization URL, from a public CA, the organization's own CA or a
+  # certificate manager; mounted at /etc/warren/tls and picked up within 30
+  # seconds when it changes. Empty: the organization URL presents the
+  # control plane's own certificate, which browsers do not trust.
+  tls:
+    existingSecret: ""
+
+  # The key-encryption key that seals the CA and signing keys in the
+  # database: an existing Secret whose key holds 32 random bytes as base64
+  # (`head -c 32 /dev/urandom | base64`). Empty: the control plane creates
+  # one on its data volume. Keep it in a Secret and back it up; without it
+  # the database cannot be opened.
+  keyEncryptionKey:
+    existingSecret: ""
+    key: kek
+
+  # More configuration, merged into the generated file (signIn, devices,
+  # certificates, connections, audit, reservedNames, ...). The chart owns
+  # listen, dataDir, policyDir, tls and keyEncryptionKeyFile.
+  config: {}
+  #   devices:
+  #     approval: manual
+  #   signIn:
+  #     sessionMaxLifetime: 7d
+
+  # Policy files (docs/policy.md), by file name, mounted at
+  # /etc/warren/policy. Reload with `warren admin policy reload`.
+  policy: {}
+  #   homelab.yaml: |
+  #     apiVersion: warren.dev/v1alpha1
+  #     kind: ConnectorGroup
+  #     ...
+
+  # The SQLite database, the admin socket and, without keyEncryptionKey,
+  # the key-encryption key.
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 1Gi
+
+  # How browsers, clients, relays and connectors reach the control plane.
+  # TLS passes straight through: never terminate it in front of warren.
+  service:
+    type: ClusterIP
+    port: 443
+    annotations: {}
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: ""
+
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podLabels: {}
+
+# Values relays and connectors share.
+nodes:
+  # The node bundle relays and connectors enforce: connector groups, apps,
+  # users, devices, rules and revocations, with the deployment's
+  # trustDomain. Required when a relay or connector is enabled. Pods restart
+  # when it changes. See docs/kubernetes.md.
+  bundle: {}
+  # Log level: error, warn, info, debug or trace.
+  logLevel: info
+
+relay:
+  enabled: false
+
+  # Required. An existing Secret with a relay join token
+  # (`warren admin join-token create --role relay --name ... --dns-name ...`).
+  # The token is used once; the relay keeps its credentials on its volume.
+  joinToken:
+    existingSecret: ""
+    key: token
+
+  # QUIC on UDP and the HTTP/2 fallback on TCP, on one port.
+  service:
+    type: LoadBalancer
+    port: 443
+    annotations: {}
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: Local
+
+  maxSplicesPerClient: 64
+  extraArgs: []
+
+  # The credentials from the join. Without a volume, a new pod needs a new
+  # join token.
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 64Mi
+
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podLabels: {}
+
+connector:
+  enabled: false
+
+  # Required. The connector group, which must match the join token.
+  group: ""
+  # Required. The relays to attach to, each NAME[@HOST:PORT]: NAME is a DNS
+  # name in the relay's certificate (its token's --dns-name) and HOST:PORT
+  # where to dial it. For a relay from this release, use its Service:
+  #   relays: ["relay.warren.example.com@warren-relay:443"]
+  relays: []
+
+  # Required. An existing Secret with a connector join token
+  # (`warren admin join-token create --role connector --group ... --name ...`).
+  joinToken:
+    existingSecret: ""
+    key: token
+
+  # auto, quic or h2.
+  transport: auto
+  # masquerade (warren installs its NAT table) or none (NAT is left to you).
+  nat: masquerade
+  tunnelMtu: 1280
+  drainTimeoutSeconds: 300
+  extraArgs: []
+
+  # Kernel forwarding needs IP forwarding on in the pod's network namespace,
+  # which a container cannot set itself (/proc/sys is read-only). This
+  # privileged init container turns it on. Turn it off where forwarding is
+  # set another way (allowed unsafe sysctls, for example).
+  forwardingInit: true
+
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 64Mi
+
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podLabels: {}
