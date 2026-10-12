@@ -130,26 +130,62 @@ fn csrf_field(viewer: &Viewer) -> Html {
     )
 }
 
-/// The sign-in page. `message` explains why the viewer is here, if there
-/// is more to say than "sign in".
-pub fn sign_in(next: &str, message: Option<&str>, reauth: bool) -> Html {
-    let notice = match message {
-        Some(m) => html!("<div class=\"flash bad\" role=\"alert\">{}</div>", m),
+/// The sign-in page: a button for the IdP, a username and password form
+/// for built-in accounts, or both.
+pub fn sign_in(page: &SignIn) -> Html {
+    let notice = match &page.message {
+        Some(m) => html!(
+            "<div class=\"flash bad\" role=\"alert\">{}</div>",
+            m.as_str()
+        ),
         None => Html::new(),
     };
-    let href = start_url(next, reauth);
+    let start = start_url(&page.next, page.reauth);
+    let body = match (&page.idp, &page.local) {
+        (Some(_), None) => html!(
+            "<p class=\"muted\">Use your organization's account. You return here once your identity provider has signed you in.</p>{}<a class=\"btn primary wide\" href=\"{}\">Continue to sign in</a>",
+            notice,
+            start
+        ),
+        (idp, Some(form)) => {
+            let idp = match idp {
+                Some(name) => html!(
+                    "<a class=\"btn primary wide\" href=\"{}\">Sign in with {}</a><p class=\"or\">or with a warren account</p>",
+                    start,
+                    name.as_str()
+                ),
+                None => Html::new(),
+            };
+            let (focus, kind) = if page.idp.is_none() {
+                (html!(" autofocus"), html!(" primary"))
+            } else {
+                (Html::new(), Html::new())
+            };
+            html!(
+                "{}{}<form method=\"post\" action=\"/console/login\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><input type=\"hidden\" name=\"next\" value=\"{}\"><label for=\"username\">Username</label><input id=\"username\" name=\"username\" value=\"{}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" required{}><label for=\"password\">Password</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required><button class=\"btn wide{}\" type=\"submit\">Continue</button></form><p class=\"muted small\">Next, you enter the code from your authenticator app.</p>",
+                notice,
+                idp,
+                form.csrf.as_str(),
+                page.next.as_str(),
+                form.username.as_str(),
+                focus,
+                kind
+            )
+        }
+        (None, None) => notice,
+    };
     html!(
-        "{}<body class=\"center\"><main class=\"signin card\">{}<h1>Sign in to warren</h1><p class=\"muted\">Use your organization's account. You return here once your identity provider has signed you in.</p>{}<a class=\"btn primary wide\" href=\"{}\">Continue to sign in</a></main></body></html>",
+        "{}<body class=\"center\"><main class=\"signin card\">{}<h1>Sign in to warren</h1>{}</main></body></html>",
         head("Sign in"),
         Html::__from_template(LOGO.to_owned()),
-        notice,
-        href
+        body
     )
 }
 
-/// Where the sign-in button points.
-pub fn start_url(next: &str, reauth: bool) -> String {
-    let mut q = String::from("/console/login/start?next=");
+/// `next` for a query string, keeping only characters that need no
+/// escaping.
+fn next_param(next: &str) -> String {
+    let mut q = String::new();
     for b in next.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.') {
             q.push(char::from(b));
@@ -157,10 +193,26 @@ pub fn start_url(next: &str, reauth: bool) -> String {
             q.push_str(&format!("%{b:02X}"));
         }
     }
+    q
+}
+
+/// Where the IdP sign-in button points.
+pub fn start_url(next: &str, reauth: bool) -> String {
+    let mut q = format!("/console/login/start?next={}", next_param(next));
     if reauth {
         q.push_str("&reauth=1");
     }
     q
+}
+
+/// Where **Sign in again** points for `viewer`: the IdP for an IdP sign-in,
+/// the sign-in page's form for a built-in account.
+pub fn again_url(viewer: &Viewer, next: &str) -> String {
+    if viewer.local {
+        format!("/console/login?next={}&reauth=1", next_param(next))
+    } else {
+        start_url(next, true)
+    }
 }
 
 /// A page that only says something went wrong, or was refused.
@@ -337,11 +389,11 @@ fn reauth_note(viewer: &Viewer, here: &str) -> Html {
         Changes::NeedMfa => html!(
             "<div class=\"flash warn\" role=\"note\">{} <a href=\"{}\">Sign in again</a> with a second factor to approve, revoke, disable or enable.</div>",
             NEED_MFA,
-            start_url(here, true)
+            again_url(viewer, here)
         ),
         Changes::NeedRecentSignIn => html!(
             "<div class=\"flash warn\" role=\"note\">Changes need a recent sign-in. <a href=\"{}\">Sign in again</a> to approve, revoke, disable or enable.</div>",
-            start_url(here, true)
+            again_url(viewer, here)
         ),
     }
 }
@@ -1217,5 +1269,55 @@ mod tests {
             start_url("/console/devices?status=pending", true),
             "/console/login/start?next=/console/devices%3Fstatus%3Dpending&reauth=1"
         );
+        let mut viewer = Viewer::default();
+        assert_eq!(
+            again_url(&viewer, "/console/users"),
+            "/console/login/start?next=/console/users&reauth=1"
+        );
+        viewer.local = true;
+        assert_eq!(
+            again_url(&viewer, "/console/users"),
+            "/console/login?next=/console/users&reauth=1"
+        );
+    }
+
+    #[test]
+    fn the_sign_in_page_offers_what_the_deployment_has() {
+        let idp_only = sign_in(&SignIn {
+            next: "/console/".into(),
+            idp: Some("Google".into()),
+            ..SignIn::default()
+        });
+        assert!(idp_only.as_str().contains("Continue to sign in"));
+        assert!(!idp_only.as_str().contains("<form"));
+        let local_only = sign_in(&SignIn {
+            next: "/console/users".into(),
+            local: Some(LocalSignIn {
+                csrf: "tok".into(),
+                username: "<ada>".into(),
+            }),
+            message: Some("Wrong".into()),
+            ..SignIn::default()
+        });
+        let page = local_only.as_str();
+        assert!(page.contains("action=\"/console/login\""));
+        assert!(page.contains("name=\"csrf\" value=\"tok\""));
+        assert!(page.contains("name=\"next\" value=\"/console/users\""));
+        assert!(page.contains("value=\"&lt;ada&gt;\""));
+        assert!(page.contains("role=\"alert\">Wrong<"));
+        assert!(!page.contains("/console/login/start"));
+        let both = sign_in(&SignIn {
+            next: "/console/".into(),
+            idp: Some("Google".into()),
+            reauth: true,
+            local: Some(LocalSignIn::default()),
+            ..SignIn::default()
+        });
+        assert!(both.as_str().contains("Sign in with Google"));
+        assert!(
+            both.as_str()
+                .contains("/console/login/start?next=/console/&amp;reauth=1")
+        );
+        assert!(both.as_str().contains("<form"));
     }
 }

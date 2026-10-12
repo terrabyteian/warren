@@ -40,7 +40,7 @@ use crate::web::{
 };
 
 /// How long a sign-in may take at the IdP.
-const AUTH_REQUEST_LIFETIME: i64 = 600;
+pub(crate) const AUTH_REQUEST_LIFETIME: i64 = 600;
 /// How long the one-time code handed to the client is valid.
 pub(crate) const AUTH_CODE_LIFETIME: i64 = 120;
 /// The largest body read before the caller is authenticated.
@@ -93,7 +93,7 @@ async fn route(
     check_protocol(&req)?;
     let path = req.uri().path().to_owned();
     if crate::console::is_console_path(&path) {
-        return Ok(crate::console::route(&app, req).await);
+        return Ok(crate::console::route(&app, req, &peer).await);
     }
     let method = req.method().clone();
     // Besides the console, the operator's certificate serves sign-in and

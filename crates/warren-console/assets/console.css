@@ -319,6 +319,13 @@ body.center { display: grid; place-items: center; min-height: 100vh; padding: 1.
 .signin { width: 100%; max-width: 25rem; padding: 2rem 2rem 1.6rem; text-align: left; }
 .signin .logo { width: 40px; height: 40px; margin-bottom: 1rem; }
 .signin h1 { margin-bottom: 0.4rem; }
+.signin form { margin-top: 0.8rem; }
+.signin label { display: block; font-weight: 600; font-size: 0.85rem; margin: 0.8rem 0 0.3rem; }
+.signin input:not([type="hidden"]) { width: 100%; font: inherit; padding: 0.55rem 0.7rem; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); }
+.signin input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.signin form .btn { margin-top: 1.1rem; }
+.signin .or { display: flex; align-items: center; gap: 0.6rem; color: var(--muted); font-size: 0.85rem; margin: 1.2rem 0 0; }
+.signin .or::before, .signin .or::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
 
 /* Narrow screens */
 

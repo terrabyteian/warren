@@ -200,8 +200,8 @@ password is never read again. Read it back once:
 kubectl -n warren get secret warren-admin -o jsonpath='{.data.password}' | base64 -d
 ```
 
-The admin signs in from the warren app with it and enrolls an authenticator
-app (any TOTP app) at once. Then delete the Secret and drop
+The admin signs in from the warren app or the web console with it and
+enrolls an authenticator app (any TOTP app) at once. Then delete the Secret and drop
 `bootstrapAdmin` from the values.
 
 ## 2. Reach the control plane and sign in
@@ -238,9 +238,11 @@ without `controlPlane.tls`, add `--fingerprint` with the root fingerprint:
 warren login https://warren.home.example
 ```
 
-This release has no web console yet. Administer the deployment with
-`warren admin` inside the control plane's pod, which talks to its local admin
-socket:
+The web console at `https://warren.home.example/console/`
+([console.md](console.md)) shows the deployment and approves and revokes
+devices and disables and enables users, for the admins `console.admins`
+names. For everything else, administer the deployment with `warren admin`
+inside the control plane's pod, which talks to its local admin socket:
 
 ```sh
 kubectl -n warren exec warren-control-plane-0 -- warren admin deployment

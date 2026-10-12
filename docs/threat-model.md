@@ -183,11 +183,14 @@ make it hard, visible and recoverable.
   grants nothing an operator of that host does not already hold. The web
   console is the only remote admin surface: its admin pages may be read by
   the admins the configuration names, and it makes only device approval and
-  revocation and user disable and enable, each needing a sign-in the IdP
-  reported as MFA and an IdP authentication within the last hour by default
-  (console sign-in with built-in accounts, and a step-up with their TOTP for
-  IdPs that do not report MFA, come later), behind form tokens, origin checks and a strict
-  content security policy ([console.md](console.md#security)). Policy from Git or CRDs is reviewed
+  revocation and user disable and enable, each needing a multi-factor
+  sign-in that authenticated the admin within the last hour by default:
+  through the IdP when it reports MFA and `auth_time`, or with a built-in
+  account's password and authenticator or recovery code, checked exactly
+  as for the warren app (T18). A step-up with TOTP for IdP sign-ins that do
+  not report MFA comes later. Every console form, the sign-in form included,
+  sits behind form tokens, origin checks and a strict content security
+  policy ([console.md](console.md#security)). Policy from Git or CRDs is reviewed
   outside warren before it applies (G19).
 - **Visible.** Every change and every decision is audited and can be streamed
   off-box as it happens to sinks the control plane cannot rewrite (G13).
@@ -430,7 +433,11 @@ extend access past the other's view (G4, G9).
   by a host-only, HttpOnly, SameSite=Strict cookie, its forms are refused from
   other origins and its pages cannot be framed; each step moves it forward
   once. The code at the end goes only to the redirect URI the client
-  registered with PKCE, exactly as after an IdP sign-in.
+  registered with PKCE, exactly as after an IdP sign-in; a sign-in started
+  on the web console's sign-in page, whose form carries a token bound to
+  its own cookie, ends instead in a console session in the browser that
+  started it. The console and the warren app share one password check, so
+  the lockout and the per-source limit count both.
 - **Setup links and resets.** A setup link is single use, expires after 72
   hours and only sets a password; the authenticator is enrolled at the first
   sign-in. Whoever intercepts an unused link can set the password and enroll
@@ -444,7 +451,10 @@ extend access past the other's view (G4, G9).
   only there (G19), and leaving it deletes them the same way.
 
 Residual risk: TOTP can be phished by a page that relays the user's password
-and code in real time; passkeys, which bind to the origin, arrive later.
+and code in real time; passkeys, which bind to the origin, arrive later. The
+web console's sign-in takes the same password and code, so a relayed
+sign-in can open a console session too, and for an admin that session can
+make console changes until `console.changeMaxAge` passes.
 
 ## 6. Accepted risks
 

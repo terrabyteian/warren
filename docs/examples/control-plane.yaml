@@ -110,7 +110,7 @@ reservedNames: []
 # pages are for the users and groups named here.
 console:
   admins:
-    users: [ada@example.com]   # by email, IdP subject or warren user ID
-    groups: [warren-admins]    # by IdP group
+    users: [ada@example.com]   # by email, IdP subject, built-in username or warren user ID
+    groups: [warren-admins]    # by IdP group, or "local:<group>" for warren's own
   sessionLifetime: 12h         # at most 24h
-  changeMaxAge: 1h             # changes need an IdP sign-in this recent
+  changeMaxAge: 1h             # changes need a multi-factor sign-in this recent

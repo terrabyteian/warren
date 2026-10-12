@@ -15,29 +15,51 @@ The console needs nothing beyond a running control plane, plus:
 1. **A certificate browsers trust** for the organization URL (`tls.certFile`
    and `tls.keyFile`, see [operating.md](operating.md#tls-certificates)).
    Without one, the browser shows a certificate warning.
-2. **The IdP redirect URI** `https://<publicUrl>/v1/auth/callback`, already
-   registered for the warren app. The console signs in through the same
-   callback.
+2. **The IdP redirect URI** `https://<publicUrl>/v1/auth/callback`, if an
+   IdP is configured: already registered for the warren app. The console
+   signs in through the same callback.
 3. **Admins**, named in the control-plane configuration. Nobody is an admin
-   by default.
+   by default, not even the bootstrap admin: name its group,
+   `local:admins` by default.
 
 ```yaml
 console:
   admins:
-    users: [ada@example.com]      # by email (any case), IdP subject or warren user ID
-    groups: [warren-admins]       # by IdP group
+    users: [ada@example.com]      # by email (any case), IdP subject, built-in username or warren user ID
+    groups: [warren-admins, "local:admins"]  # by IdP group, or local:<group> for warren's own groups
   sessionLifetime: 12h            # default 12h, at most 24h
   changeMaxAge: 1h                # default 1h: how recent a sign-in changes need
 ```
 
-Open `https://<publicUrl>/` in a browser and choose **Continue to sign in**.
+Open `https://<publicUrl>/` in a browser and sign in.
+
+### Signing in
+
+The sign-in page offers what the deployment has:
+
+- **An IdP only:** **Continue to sign in** goes to the IdP.
+- **Built-in accounts only:** a username and password form.
+- **Both,** once a built-in account exists: **Sign in with** the IdP, or the
+  form.
+
+A built-in account signs in to the console exactly as it does in the warren
+app ([protocol.md](protocol.md#111-client-to-control-plane-link-d)): its password, then a code from
+its authenticator app or a single-use recovery code, enrolling the
+authenticator first if the account has none, so the bootstrap admin can
+start in the console. The same checks apply: the same answer for an unknown
+username, a locked account, a wrong password and a disabled account's right
+password; the lockout after five failures in a row; and
+`localAccounts.maxFailuresPerSource`, which counts console and warren app
+sign-ins together. Such a sign-in is multi-factor and authenticated when it
+finishes, so it may make changes for `console.changeMaxAge`.
 
 ### MFA and your identity provider
 
-Every admin may read the admin pages. Changes need a sign-in the IdP
-reported as multi-factor (threat model [T5](threat-model.md)): the ID
-token's `amr` must hold a value from `idp.mfaAmrValues` (default `mfa`), or
-its `acr` one from `idp.mfaAcrValues`. An admin whose sign-in does not
+Every admin may read the admin pages. Changes need a multi-factor sign-in
+(threat model [T5](threat-model.md)). A built-in account's always is. One
+through the IdP is when the IdP reports it: the ID token's `amr` must hold
+a value from `idp.mfaAmrValues` (default `mfa`), or its `acr` one from
+`idp.mfaAcrValues`. An admin whose sign-in does not
 qualify sees disabled buttons, a notice and a **Sign in again** button that
 asks the IdP for a fresh sign-in; a change they post is refused with a page
 saying why.
@@ -45,14 +67,15 @@ saying why.
 Some IdPs, Google among them, do not report MFA in the ID token at all. If
 yours reports a second factor under other `amr` or `acr` values, list them
 in `idp.mfaAmrValues` or `idp.mfaAcrValues`. If it reports none, its admins
-can read the admin pages but make no changes for now: a step-up with
-warren's own authenticator-app (TOTP) code, enrolled to the admin, comes
-with built-in accounts. MFA is never optional for changes.
+can read the admin pages but make no changes when signed in through it; an
+admin with a built-in account can sign in with that instead. MFA is never
+optional for changes.
 
 ### How recent a sign-in is
 
-Changes also need the admin to have authenticated at the IdP within
-`console.changeMaxAge`, which warren reads from the ID token's `auth_time`.
+Changes also need the admin to have authenticated within
+`console.changeMaxAge`: a built-in account when its sign-in finished, an IdP
+sign-in when the ID token's `auth_time` says.
 **Sign in again** asks the IdP for `prompt=login` and a `max_age` of
 `console.changeMaxAge` (or the policy's shortest `auth.maxAge`, if shorter),
 which ask it to authenticate the admin afresh and to report `auth_time`.
@@ -110,10 +133,11 @@ in Git (the policy directory, or CRDs later) and are marked so: change them
 there and reload with `warren admin policy reload` or SIGHUP.
 
 Changes need a multi-factor sign-in within `console.changeMaxAge` (default
-one hour) of the admin authenticating at the IdP (see
+one hour) of the admin authenticating (see
 [MFA and your identity provider](#mfa-and-your-identity-provider)). Other
 admin sign-ins can still look around; their buttons are disabled and a
-notice offers **Sign in again**. If the console session ended before a
+notice offers **Sign in again**: at the IdP for an IdP sign-in, on the
+sign-in page's form for a built-in account. If the console session ended before a
 change, signing in again returns to the page the change was made from.
 
 ## Security
@@ -123,15 +147,22 @@ change, signing in again returns to the page the change was made from.
   `__Host-warren-login` cookie, so a sign-in someone else started cannot
   finish in your browser. After sign-in the browser only returns to a
   `/console` path.
+- **Built-in account sign-in** posts the sign-in page's form with a token
+  derived from that same cookie, refused from another origin like every
+  console form, so no other site can sign a browser in. The password goes
+  through the one check the warren app's sign-in uses; the code and
+  enrollment steps are the warren app's own pages, bound to the browser by
+  their `__Host-warren-signin` cookie (`SameSite=Strict`) and refused from
+  another origin ([threat model T18](threat-model.md#t18-attacks-on-built-in-accounts)).
 - **Sessions** are a random 256-bit token in a `__Host-warren-console`
   cookie: `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, host-only, lasting
   `console.sessionLifetime`. The database keeps only its hash. The session
   and the user are checked on every request, so signing out or disabling the
   user ends it at once. Console sessions are separate from the warren app's
   device-bound sessions.
-- **Forms** carry a token derived from the session token, compared in
-  constant time, and are refused if the browser reports another origin
-  (`Origin` or `Sec-Fetch-Site`).
+- **Forms** carry a token derived from the session token (before sign-in,
+  from the sign-in cookie), compared in constant time, and are refused if
+  the browser reports another origin (`Origin` or `Sec-Fetch-Site`).
 - **Pages** are rendered on the server, escaping every value (users, groups,
   device names, connector records) on the way into the markup. They send a
   strict content security policy (`default-src 'none'`, scripts, styles and
@@ -175,8 +206,9 @@ The console is served on the HTTPS listener, beside the API:
 | `POST /console/users/{user}/enable` | Enables a user. |
 | `POST /console/devices/{device}/approve` | Approves a pending device. |
 | `POST /console/devices/{device}/revoke` | Revokes a device. |
-| `GET /console/login` | The sign-in page. |
-| `GET /console/login/start` | Starts sign-in at the IdP; `next` is where to return, `reauth=1` asks the IdP to sign in afresh (`prompt=login`, `max_age`). |
+| `GET /console/login` | The sign-in page; `next` is where to return, `reauth=1` shows it even to a signed-in browser, to sign in again. |
+| `POST /console/login` | A built-in account's username and password, from the sign-in page's form; answers with its authenticator code step. |
+| `GET /console/login/start` | Starts sign-in at the IdP; `next` is where to return, `reauth=1` asks the IdP to sign in afresh (`prompt=login`, `max_age`). Without an IdP, goes to the sign-in page. |
 | `POST /console/logout` | Signs out. |
 | `GET /console/assets/console.css` | The stylesheet. |
 | `GET /console/assets/console.js` | The script. |
@@ -188,7 +220,10 @@ admin API and `warren admin` stay the interface for automation.
 ## Tests
 
 `crates/warren-control/tests/console.rs` drives the console as a browser
-against a control plane and a test IdP: sign-in, every page, each permission
+against a control plane and a test IdP: sign-in through the IdP and with
+built-in accounts (with and without an IdP: enrollment, wrong passwords and
+codes, disabled accounts, the per-source limit, the sign-in form's token and
+origin), every page, each permission
 case (signed out, user, admin without MFA, admin with an old sign-in,
 admin, an IdP that leaves out `auth_time`), form tokens and origins, sign-ins finished in another browser,
 redirects after sign-in, sign-out, disabling a signed-in user, device and

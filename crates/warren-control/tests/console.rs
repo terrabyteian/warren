@@ -1,7 +1,8 @@
-//! The web console end to end: browser sign-in through the OIDC provider,
-//! every page, and every permission case (signed out, user, admin without
-//! MFA, admin with a stale sign-in, an IdP that leaves out `auth_time`,
-//! admin), form tokens and origins, admin
+//! The web console end to end: browser sign-in through the OIDC provider
+//! and with built-in accounts (with and without an IdP), every page, and
+//! every permission case (signed out, user, admin without MFA, admin with a
+//! stale sign-in, an IdP that leaves out `auth_time`, admin), form tokens
+//! and origins, admin
 //! actions through the same code as the admin API, decisions reported by a
 //! connector and their explanation, and escaping of what users, devices and
 //! connectors control.
@@ -16,11 +17,13 @@ use bytes::Bytes;
 use http::{Method, StatusCode};
 use serde_json::{Value, json};
 use support::{IdpUser, RunningIdp, StubNode, TempDir, TestClient, free_port, query_of, write};
+use warren_control::accounts::{totp_code, totp_step};
 use warren_control::config::Config;
 use warren_control::console::{LOGIN_COOKIE, ROUTES, SESSION_COOKIE};
 use warren_control::web::{Client, Reply};
 use warren_control::{ControlPlane, admin_request, audit};
 use warren_core::audit::{DecisionRecord, NodeInfo, Subject};
+use warren_core::clock;
 
 const GROUP: &str = r#"
 apiVersion: warren.dev/v1alpha1
@@ -100,8 +103,30 @@ struct Deployment {
     bundle: String,
 }
 
+/// The bootstrap admin's password in deployments with built-in accounts.
+const PASSWORD: &str = "correct horse battery staple";
+
 impl Deployment {
     async fn start() -> Deployment {
+        Deployment::start_with(true, "").await
+    }
+
+    /// A deployment with built-in accounts: the bootstrap admin `admin`, in
+    /// `local:admins`, which the console names as admins. `extra` goes
+    /// under `localAccounts`.
+    async fn with_accounts(with_idp: bool, extra: &str) -> Deployment {
+        Deployment::start_with(
+            with_idp,
+            &format!(
+                "localAccounts:\n  bootstrapAdmin:\n    passwordFile: {{dir}}/admin-password\n{extra}"
+            ),
+        )
+        .await
+    }
+
+    /// A deployment, with the IdP configured or not; `extra` is more
+    /// configuration, where `{dir}` names the deployment's directory.
+    async fn start_with(with_idp: bool, extra: &str) -> Deployment {
         let dir = TempDir::new("console");
         let idp = RunningIdp::start(admin_user()).await;
         write(&dir.path().join("policy/groups.yaml"), GROUP);
@@ -109,19 +134,30 @@ impl Deployment {
         write(&dir.path().join("policy/base.yaml"), POLICY);
         write(&dir.path().join("idp-ca.pem"), &idp.pki.ca_pem);
         write(&dir.path().join("idp-secret"), "s3cret\n");
+        write(&dir.path().join("admin-password"), &format!("{PASSWORD}\n"));
         let port = free_port();
+        let idp_config = if with_idp {
+            format!(
+                "idp:\n  issuer: {issuer}\n  clientId: warren\n  clientSecretFile: {dir}/idp-secret\n  caFile: {dir}/idp-ca.pem\n",
+                dir = dir.path().display(),
+                issuer = idp.idp.issuer,
+            )
+        } else {
+            String::new()
+        };
         let config_text = format!(
             "trustDomain: example.test\n\
              publicUrl: https://localhost:{port}\n\
              listen: 127.0.0.1:{port}\n\
              dataDir: {data}\n\
              policyDir: {dir}/policy\n\
-             idp:\n  issuer: {issuer}\n  clientId: warren\n  clientSecretFile: {dir}/idp-secret\n  caFile: {dir}/idp-ca.pem\n\
+             {idp_config}\
              devices:\n  approval: manual\n\
-             console:\n  admins:\n    groups: [warren-admins]\n    users: [Grace@Example.com]\n",
+             console:\n  admins:\n    groups: [warren-admins, \"local:admins\"]\n    users: [Grace@Example.com]\n\
+             {extra}",
             data = dir.path().join("data").display(),
             dir = dir.path().display(),
-            issuer = idp.idp.issuer,
+            extra = extra.replace("{dir}", &dir.path().display().to_string()),
         );
         let config = Config::parse(&config_text).unwrap();
         let audit = Arc::new(Mutex::new(Vec::new()));
@@ -361,6 +397,127 @@ impl Browser {
         self.sign_in_with(&format!("/console/login/start?next={next}"))
             .await
     }
+
+    /// Posts the built-in account form of the sign-in page at `page`.
+    async fn password(&mut self, page: &str, username: &str, password: &str) -> Reply {
+        let form = text(&self.get(page).await);
+        let token = csrf(&form);
+        let next = field(&form, "next");
+        let base = self.base.clone();
+        self.post_with(
+            "/console/login",
+            &[
+                ("csrf", &token),
+                ("next", &next),
+                ("username", username),
+                ("password", password),
+            ],
+            &base,
+        )
+        .await
+    }
+
+    /// Signs in to the console with a built-in account from the sign-in
+    /// page at `page`: with the authenticator `secret` and the code for
+    /// `step`, or enrolling an authenticator when there is none yet.
+    /// Returns the secret and where the browser landed.
+    async fn local_sign_in(
+        &mut self,
+        page: &str,
+        username: &str,
+        secret: Option<(&[u8], i64)>,
+    ) -> (Vec<u8>, String) {
+        let reply = self.password(page, username, PASSWORD).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", text(&reply));
+        let page = text(&reply);
+        let flow = field(&page, "flow");
+        let base = self.base.clone();
+        match secret {
+            Some((secret, step)) => {
+                assert!(page.contains("Enter your authenticator code"), "{page}");
+                let reply = self
+                    .post_with(
+                        "/v1/auth/code",
+                        &[("flow", &flow), ("code", &code_at(secret, step))],
+                        &base,
+                    )
+                    .await;
+                (secret.to_vec(), location(&reply))
+            }
+            None => {
+                let secret = enrollment_secret(&page);
+                let step = totp_step(clock::now_secs());
+                let reply = self
+                    .post_with(
+                        "/v1/auth/code",
+                        &[("flow", &flow), ("code", &code_at(&secret, step))],
+                        &base,
+                    )
+                    .await;
+                assert!(text(&reply).contains("Save your recovery codes"));
+                let reply = self
+                    .post_with("/v1/auth/continue", &[("flow", &flow)], &base)
+                    .await;
+                (secret, location(&reply))
+            }
+        }
+    }
+}
+
+/// The value of a hidden form field on a page.
+fn field(page: &str, name: &str) -> String {
+    let marker = format!("name=\"{name}\" value=\"");
+    let start = page
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no {name} in {page}"))
+        + marker.len();
+    page[start..]
+        .split('"')
+        .next()
+        .unwrap()
+        .replace("&amp;", "&")
+}
+
+/// The authenticator key on the enrollment page, decoded.
+fn enrollment_secret(page: &str) -> Vec<u8> {
+    let start = page
+        .find("<code class=\"key\">")
+        .expect("an enrollment page")
+        + 18;
+    let mut out = Vec::new();
+    let (mut buffer, mut bits) = (0u32, 0u32);
+    for c in page[start..]
+        .split('<')
+        .next()
+        .unwrap()
+        .bytes()
+        .filter(|c| !c.is_ascii_whitespace())
+    {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => panic!("not base32"),
+        };
+        buffer = (buffer << 5) | u32::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
+}
+
+fn code_at(secret: &[u8], step: i64) -> String {
+    format!("{:06}", totp_code(secret, step))
+}
+
+/// The audit record with `message`.
+fn audited(d: &Deployment, message: &str) -> Value {
+    d.audit_records()
+        .into_iter()
+        .rfind(|r| r["message"] == message)
+        .unwrap_or_else(|| panic!("no audit record {message:?}"))
 }
 
 const ADMIN_PAGES: &[&str] = &[
@@ -414,6 +571,13 @@ async fn signed_out_browsers_are_sent_to_sign_in() {
     let r = b.get("/console/login?next=/console/devices").await;
     assert_eq!(r.status, StatusCode::OK);
     assert!(text(&r).contains("/console/login/start?next=/console/devices"));
+    // With an IdP and no built-in accounts, there is no form to post.
+    assert!(!text(&r).contains("<form"));
+    let base = b.base.clone();
+    let r = b
+        .post_with("/console/login", &[("username", "admin")], &base)
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
     for (path, kind) in [
         ("/console/assets/console.css", "text/css"),
         ("/console/assets/console.js", "text/javascript"),
@@ -1109,6 +1273,245 @@ async fn names_users_and_devices_control_are_escaped() {
     }
     let users = text(&b.get("/console/users").await);
     assert!(users.contains("&lt;i&gt;group&lt;/i&gt;"));
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn built_in_accounts_sign_in_without_an_idp() {
+    let d = Deployment::with_accounts(false, "").await;
+    let mut b = d.browser();
+    let to = location(&b.get("/console/users").await);
+    assert_eq!(query_of(&to)["next"], "/console/users");
+    // The sign-in page is the built-in account form, and nothing else.
+    let r = b.get(&to).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let page = text(&r);
+    assert!(page.contains("action=\"/console/login\""), "{page}");
+    assert!(!page.contains("/console/login/start"), "{page}");
+    assert!(b.cookies.contains_key(LOGIN_COOKIE));
+    // The IdP button's address, from an old link, leads back to it.
+    let r = b.get("/console/login/start?next=/console/users").await;
+    assert!(location(&r).starts_with("/console/login?next="));
+
+    // A wrong password gets the one answer every failure gets.
+    let r = b
+        .password(
+            "/console/login?next=/console/users",
+            "admin",
+            "wrong password!",
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert!(text(&r).contains("The username or password is incorrect"));
+    assert!(text(&r).contains("value=\"admin\""));
+    assert!(!b.cookies.contains_key(SESSION_COOKIE));
+
+    // The first sign-in enrolls an authenticator, then lands where it was
+    // going, signed in with MFA just now: changes are allowed.
+    let (secret, landed) = b
+        .local_sign_in("/console/login?next=/console/users", "admin", None)
+        .await;
+    assert_eq!(landed, "/console/users");
+    assert!(b.cookies.contains_key(SESSION_COOKIE));
+    let page = text(&b.get("/console/users").await);
+    assert!(page.contains("admin"), "{page}");
+    assert!(!page.contains("Changes need"), "{page}");
+    let r = audited(&d, "signed in to the console with a built-in account");
+    assert_eq!(r["auth_protocol"], "password+TOTP");
+    assert_eq!(r["is_mfa"], true);
+    assert_eq!(r["status_id"], 1);
+
+    // Changes work.
+    let (status, ada) = d
+        .admin(
+            "POST",
+            "/v1/admin/users",
+            Some(json!({ "username": "ada" })),
+        )
+        .await;
+    assert_eq!(status, 201, "{ada}");
+    let ada_id = ada["user"]["id"].as_str().unwrap().to_owned();
+    let r = b
+        .post_from(
+            "/console/users",
+            &format!("/console/users/{ada_id}/disable"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", text(&r));
+    let (_, users) = d.admin("GET", "/v1/admin/users", None).await;
+    let ada = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == ada_id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(ada["disabled"], true);
+
+    // Signing in again is the same form, even while signed in.
+    let r = b.get("/console/login?next=/console/users&reauth=1").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(text(&r).contains("action=\"/console/login\""));
+
+    // A wrong authenticator code is refused and signs nobody in; the next
+    // code works.
+    let mut other = d.browser();
+    let reply = other
+        .password("/console/login?next=/console/devices", "admin", PASSWORD)
+        .await;
+    let flow = field(&text(&reply), "flow");
+    let step = totp_step(clock::now_secs());
+    let base = other.base.clone();
+    let r = other
+        .post_with(
+            "/v1/auth/code",
+            &[("flow", &flow), ("code", &code_at(&secret, step - 5))],
+            &base,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert!(text(&r).contains("That code is not right"));
+    assert!(!other.cookies.contains_key(SESSION_COOKIE));
+    let r = other
+        .post_with(
+            "/v1/auth/code",
+            &[("flow", &flow), ("code", &code_at(&secret, step + 1))],
+            &base,
+        )
+        .await;
+    assert_eq!(location(&r), "/console/devices");
+    assert_eq!(other.get("/console/devices").await.status, StatusCode::OK);
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabled_built_in_accounts_cannot_sign_in_to_the_console() {
+    let d = Deployment::with_accounts(false, "").await;
+    let mut b = d.browser();
+    let (status, _) = d.admin("POST", "/v1/admin/users/admin/disable", None).await;
+    assert_eq!(status, 200);
+    // The right password reads like a wrong one.
+    let r = b.password("/console/login", "admin", PASSWORD).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert!(text(&r).contains("The username or password is incorrect"));
+    audited(&d, "sign-in refused: the user is disabled");
+
+    // Disabled between the password and the end of the sign-in.
+    let (status, _) = d.admin("POST", "/v1/admin/users/admin/enable", None).await;
+    assert_eq!(status, 200);
+    let reply = b.password("/console/login", "admin", PASSWORD).await;
+    let page = text(&reply);
+    let flow = field(&page, "flow");
+    let secret = enrollment_secret(&page);
+    let base = b.base.clone();
+    let r = b
+        .post_with(
+            "/v1/auth/code",
+            &[
+                ("flow", &flow),
+                ("code", &code_at(&secret, totp_step(clock::now_secs()))),
+            ],
+            &base,
+        )
+        .await;
+    assert!(text(&r).contains("Save your recovery codes"));
+    d.admin("POST", "/v1/admin/users/admin/disable", None).await;
+    let r = b
+        .post_with("/v1/auth/continue", &[("flow", &flow)], &base)
+        .await;
+    assert!(location(&r).contains("why=disabled"), "{}", location(&r));
+    assert!(!b.cookies.contains_key(SESSION_COOKIE));
+    audited(&d, "console sign-in refused: the user is disabled");
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn console_sign_in_failures_count_against_the_source() {
+    let d = Deployment::with_accounts(false, "  maxFailuresPerSource: 3\n").await;
+    let mut b = d.browser();
+    for i in 0..3 {
+        let r = b
+            .password("/console/login", &format!("nobody-{i}"), "wrong password!")
+            .await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "attempt {i}");
+    }
+    // Even the right password is refused for the rest of the window, as
+    // at the warren app's sign-in.
+    let r = b.password("/console/login", "admin", PASSWORD).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(text(&r).contains("too many failed sign-ins"));
+    assert!(!b.cookies.contains_key(SESSION_COOKIE));
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn built_in_accounts_and_the_idp_share_the_sign_in_page() {
+    let d = Deployment::with_accounts(true, "").await;
+    let mut b = d.browser();
+    let page = text(&b.get("/console/login?next=/console/devices").await);
+    assert!(
+        page.contains("/console/login/start?next=/console/devices"),
+        "{page}"
+    );
+    assert!(
+        page.contains("Sign in with your identity provider"),
+        "{page}"
+    );
+    assert!(page.contains("action=\"/console/login\""), "{page}");
+
+    // The form needs its token, bound to this browser, from this origin.
+    let token = csrf(&page);
+    let base = b.base.clone();
+    fn form(token: &str) -> [(&str, &str); 3] {
+        [
+            ("csrf", token),
+            ("username", "admin"),
+            ("password", PASSWORD),
+        ]
+    }
+    let r = b.post_with("/console/login", &form("forged"), &base).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "a wrong token");
+    let r = b
+        .post_with("/console/login", &form(&token), "https://evil.example")
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "another origin");
+    let r = b.post_with("/console/login", &form(&token), "null").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "an opaque origin");
+    let mut stranger = d.browser();
+    let r = stranger
+        .post_with("/console/login", &form(&token), &base)
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "another browser");
+    assert!(text(&r).contains("The sign-in form expired"));
+    let r = b
+        .request(
+            Method::POST,
+            "/console/login",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            Some(format!("csrf={token}&username=admin&password=x")),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "a cross-site fetch");
+    assert!(!b.cookies.contains_key(SESSION_COOKIE));
+    // None of those reached the password check.
+    assert!(
+        !d.audit_records()
+            .iter()
+            .any(|r| r["message"] == "sign-in refused: wrong password")
+    );
+
+    // Both ways in work.
+    let (_, landed) = b
+        .local_sign_in("/console/login?next=/console/devices", "admin", None)
+        .await;
+    assert_eq!(landed, "/console/devices");
+    let page = text(&b.get("/console/devices").await);
+    assert!(!page.contains("Changes need"), "{page}");
+    let idp_admin = d.signed_in(admin_user()).await;
+    assert!(idp_admin.cookies.contains_key(SESSION_COOKIE));
     d.cp.shutdown().await;
 }
 

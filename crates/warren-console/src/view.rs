@@ -10,6 +10,9 @@ pub struct Viewer {
     pub name: String,
     /// Whether the admin pages are open to them.
     pub admin: bool,
+    /// Whether they signed in with a built-in account rather than the IdP,
+    /// which decides where signing in again goes.
+    pub local: bool,
     /// Whether they may make admin changes, and if not, why not.
     pub changes: Changes,
     /// The form token every POST must carry.
@@ -31,6 +34,30 @@ pub enum Changes {
     NeedMfa,
     /// Their sign-in is older than changes allow.
     NeedRecentSignIn,
+}
+
+/// The sign-in page: the IdP, built-in accounts, or both.
+#[derive(Debug, Clone, Default)]
+pub struct SignIn {
+    /// Where to go once signed in.
+    pub next: String,
+    /// Why the viewer is here, if there is more to say than "sign in".
+    pub message: Option<String>,
+    /// The IdP's display name, when one is configured.
+    pub idp: Option<String>,
+    /// Whether this is a sign-in again for changes.
+    pub reauth: bool,
+    /// The built-in account form, when built-in accounts can sign in.
+    pub local: Option<LocalSignIn>,
+}
+
+/// The built-in account form on the sign-in page.
+#[derive(Debug, Clone, Default)]
+pub struct LocalSignIn {
+    /// The form token, bound to the browser's sign-in cookie.
+    pub csrf: String,
+    /// The username to fill in again after a failed attempt.
+    pub username: String,
 }
 
 /// A notice shown at the top of a page after an action.
