@@ -240,6 +240,10 @@ async fn serve(
                             stop_tx.send_replace(true);
                             "ok".into()
                         }
+                        "renew" => {
+                            engine.renew_now();
+                            "ok".into()
+                        }
                         _ => "error unknown command".into(),
                     };
                     let _ = w.write_all(format!("{reply}\n").as_bytes()).await;

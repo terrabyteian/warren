@@ -19,8 +19,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use warren_client::control::{Account, OrgTrust};
-use warren_client::device::KeyStorage;
+use warren_client::control::{self, Account, OrgTrust};
 use warren_client::engine::Status;
 use warren_client::signin::{self, SignInOptions};
 use warren_client::state::Store;
@@ -61,14 +60,6 @@ pub fn commands() -> Vec<Command> {
                     .long("fresh")
                     .action(ArgAction::SetTrue)
                     .help("Ask the identity provider to authenticate you afresh"),
-            )
-            .arg(
-                Arg::new("key-storage")
-                    .long("key-storage")
-                    .value_name("WHERE")
-                    .default_value("auto")
-                    .value_parser(["auto", "secure-enclave", "keychain", "file"])
-                    .help("Where a new device key lives; auto uses the Secure Enclave when there is one"),
             )
             .arg(
                 Arg::new("timeout")
@@ -213,15 +204,23 @@ fn login(m: &ArgMatches) -> Result<(), String> {
             "run warren login without sudo: it signs you in as yourself, and only warren up needs sudo".into(),
         );
     }
-    let store = Store::open(&home(m)?)?;
+    let dir = home(m)?;
+    let store = Store::open(&dir)?;
+    let org_url = m.get_one::<String>("org").expect("required").clone();
+    let org = control::org_url(&org_url)?;
+    if ask_up(&dir, "status").is_some()
+        && store.profile().ok().flatten().is_some_and(|p| p.org_url != org)
+    {
+        return Err("warren is up for another organization; run `warren down` first".into());
+    }
     let trust = match m.get_one::<String>("fingerprint") {
         Some(f) => OrgTrust::pinned(f)?,
         None => OrgTrust::System,
     };
     let opts = SignInOptions {
-        org_url: m.get_one::<String>("org").expect("required").clone(),
+        org_url,
         trust,
-        key_storage: KeyStorage::parse(m.get_one::<String>("key-storage").expect("defaulted"))?,
+        key_storage: None,
         fresh: m.get_flag("fresh"),
         timeout: Duration::from_secs(*m.get_one::<u64>("timeout").expect("defaulted")),
     };
@@ -282,6 +281,9 @@ fn login(m: &ArgMatches) -> Result<(), String> {
             "This device is {}: device {}.",
             done.device.status, done.device.id
         ),
+    }
+    if ask_up(&dir, "renew").is_some_and(|r| r.trim() == "ok") {
+        println!("The running warren up now uses this sign-in.");
     }
     Ok(())
 }

@@ -557,6 +557,27 @@ impl Account {
         &self.store
     }
 
+    /// Adopts the session a later sign-in saved for the same organization
+    /// and device, so a running client uses it without restarting; returns
+    /// whether it did.
+    pub fn reload_session(&mut self) -> bool {
+        let Ok(Some(saved)) = self.store.profile() else {
+            return false;
+        };
+        let device = |p: &Profile| p.device.as_ref().map(|d| d.id.clone());
+        if saved.org_url != self.profile.org_url
+            || saved.trust_domain != self.profile.trust_domain
+            || device(&saved) != device(&self.profile)
+            || saved.session.id == self.profile.session.id
+        {
+            return false;
+        }
+        self.profile.user = saved.user;
+        self.profile.session = saved.session;
+        self.profile.device = saved.device;
+        true
+    }
+
     fn token(&self) -> &str {
         &self.profile.session.token
     }

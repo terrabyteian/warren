@@ -628,6 +628,18 @@ impl Shared {
         }
     }
 
+    /// Picks up a session a later sign-in saved; returns whether it did.
+    fn reload_session(&self, account: &mut Account) -> bool {
+        if !account.reload_session() {
+            return false;
+        }
+        let p = &account.profile;
+        let mut s = self.static_status.lock().expect("status lock");
+        s.user = p.user.email.clone().unwrap_or_else(|| p.user.id.clone());
+        s.session_expires_at = p.session.expires_at;
+        true
+    }
+
     fn stopping(&self) -> bool {
         *self.shutdown.borrow()
     }
@@ -875,9 +887,9 @@ impl Engine {
         }
     }
 
-    /// Renews the certificate now instead of at half-life, as after a
-    /// fresh sign-in; the tunnels move to the new certificate without
-    /// reconnecting.
+    /// Renews the certificate now instead of at half-life, with the
+    /// latest saved sign-in, as after a fresh one; the tunnels move to the
+    /// new certificate without reconnecting.
     pub fn renew_now(&self) {
         self.shared.renew_now.notify_one();
     }
@@ -1244,6 +1256,7 @@ fn renewal_problem(e: &ApiError, not_after: i64) -> Event {
 async fn renew_loop(shared: Arc<Shared>) {
     let mut failures: u32 = 0;
     let mut last_renewal: Option<Instant> = None;
+    let mut renewed_session = shared.account.lock().await.profile.session.id.clone();
     let mut shutdown = shared.shutdown.subscribe();
     loop {
         let times = shared.cert.borrow().times;
@@ -1252,21 +1265,29 @@ async fn renew_loop(shared: Arc<Shared>) {
         } else {
             Duration::from_secs(30 * 2u64.pow(failures.min(4)))
         };
-        tokio::select! {
-            () = tokio::time::sleep(wait) => {}
-            () = shared.renew_now.notified() => {
-                // Something was refused: renew, but not over and over.
-                if last_renewal.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
-                    continue;
-                }
-            }
+        let notified = tokio::select! {
+            () = tokio::time::sleep(wait) => false,
+            () = shared.renew_now.notified() => true,
             _ = shutdown.changed() => return,
+        };
+        let mut account = shared.account.lock().await;
+        shared.reload_session(&mut account);
+        let session = account.profile.session.id.clone();
+        // Something was refused: renew, but not over and over, unless a
+        // new sign-in is there to renew with.
+        if notified
+            && session == renewed_session
+            && last_renewal.is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+        {
+            continue;
         }
-        let result = shared.account.lock().await.issue_certificate().await;
+        let result = account.issue_certificate().await;
+        drop(account);
         match result {
             Ok(c) => {
                 failures = 0;
                 last_renewal = Some(Instant::now());
+                renewed_session = session;
                 let not_after = c.times.not_after;
                 shared
                     .static_status
@@ -1292,7 +1313,12 @@ async fn entitlements_loop(shared: Arc<Shared>) {
             () = tokio::time::sleep(shared.options.entitlements_interval) => {}
             _ = shutdown.changed() => return,
         }
-        let result = shared.account.lock().await.entitlements().await;
+        let mut account = shared.account.lock().await;
+        if shared.reload_session(&mut account) {
+            shared.renew_now.notify_one();
+        }
+        let result = account.entitlements().await;
+        drop(account);
         match result {
             Ok(e) => {
                 told_sign_in = false;

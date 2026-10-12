@@ -468,6 +468,29 @@ async fn sign_in_enroll_and_reach_an_app_through_the_engine() {
     assert_eq!(packet::udp_payload(&reply, &p).unwrap(), b"again");
     assert_eq!(engine.status().groups[0].state, "connected");
 
+    // Signing in again while the engine runs: its next renewal, even one
+    // right after the last, uses the new session.
+    let again = sign_in(&store, opts.clone(), |url| {
+        tokio::spawn(browse(url.to_owned(), roots.clone()));
+    })
+    .await
+    .unwrap();
+    assert!(again.reused_key);
+    let session = again.account.profile.session.clone();
+    assert_ne!(session.id, signed.account.profile.session.id);
+    engine.renew_now();
+    loop {
+        match next_event(&mut events).await {
+            Event::Renewed { .. } => break,
+            Event::Problem { message, .. } => panic!("renewal failed: {message}"),
+            _ => continue,
+        }
+    }
+    let renewed = store.certificate().unwrap().unwrap();
+    let id = warren_core::pki::check_client_profile(&renewed.chain[0], "lab.test").unwrap();
+    assert_eq!(id.identity.session_id, session.id);
+    assert_eq!(engine.status().session_expires_at, session.expires_at);
+
     // A requestable app is blocked by the connector, with its reason.
     engine.send(&packet::udp(src, "10.77.0.30:7".parse().unwrap(), b"pay"));
     loop {

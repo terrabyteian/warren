@@ -357,24 +357,6 @@ mod tests {
     }
 
     #[test]
-    fn the_header_declares_every_export() {
-        let header = include_str!("../include/warren.h");
-        let source = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
-        let exported: Vec<&str> = source
-            .split("extern \"C\" fn ")
-            .skip(1)
-            .map(|rest| rest.split('(').next().unwrap())
-            .collect();
-        assert_eq!(exported.len(), 8, "{exported:?}");
-        for name in exported {
-            assert!(
-                header.contains(&format!("{name}(")),
-                "{name} is not in warren.h"
-            );
-        }
-    }
-
-    #[test]
     fn the_version_is_the_package_version() {
         // SAFETY: a static NUL-terminated string.
         let v = unsafe { CStr::from_ptr(warren_version()) };

@@ -63,7 +63,8 @@ An administrator approves the device (`warren admin devices approve
 - **Sign in again.** Run `warren login` again whenever warren says so, for
   example when a rule needs a more recent sign-in (`--fresh` asks the
   identity provider to authenticate you afresh). The same device and key are
-  kept.
+  kept, and a running `warren up` moves to the new sign-in without
+  restarting. Signing in to another organization needs `warren down` first.
 
 Everything the client keeps is in `~/Library/Application Support/warren`,
 readable only by you: the organization and its trust bundle, the session,
@@ -147,9 +148,6 @@ administrators can decide whether to approve such devices. A software key
 does not meet G3: malware running as you could read it. After an upgrade
 replaces the binary, macOS may ask once whether warren may use its item in
 the login keychain.
-
-`--key-storage` chooses explicitly: `secure-enclave` (fail rather than fall
-back), `keychain` or `file`.
 
 **Trust class.** Without an Apple Developer signature, nothing can attest to
 the control plane that a key is in the Secure Enclave, so both kinds are

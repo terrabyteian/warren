@@ -56,19 +56,6 @@ impl KeyStorage {
             KeyStorage::File => "software key in a file",
         }
     }
-
-    /// Parses a `--key-storage` value; `auto` is `None`.
-    pub fn parse(text: &str) -> Result<Option<KeyStorage>, String> {
-        match text {
-            "auto" => Ok(None),
-            "secure-enclave" => Ok(Some(KeyStorage::SecureEnclave)),
-            "keychain" => Ok(Some(KeyStorage::Keychain)),
-            "file" => Ok(Some(KeyStorage::File)),
-            other => Err(format!(
-                "unknown key storage {other:?}: use auto, secure-enclave, keychain or file"
-            )),
-        }
-    }
 }
 
 /// What the client records about its key next to the key material.
@@ -497,12 +484,6 @@ mod tests {
 
     #[test]
     fn storage_names() {
-        assert_eq!(KeyStorage::parse("auto").unwrap(), None);
-        assert_eq!(
-            KeyStorage::parse("secure-enclave").unwrap(),
-            Some(KeyStorage::SecureEnclave)
-        );
-        assert!(KeyStorage::parse("tpm").is_err());
         assert_eq!(KeyStorage::SecureEnclave.wire(), "secure-enclave");
         assert_eq!(KeyStorage::Keychain.wire(), "software");
     }
