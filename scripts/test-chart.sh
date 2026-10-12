@@ -94,6 +94,8 @@ config cp '.policyDir == "/etc/warren/policy" and .dataDir == "/var/lib/warren"'
   "the policy and data directories are the mounted ones"
 check cp 'mounts(cp) | .policy == "/etc/warren/policy" and .data == "/var/lib/warren"' \
   "the policy ConfigMap and the data volume are mounted there"
+check cp '([pod("StatefulSet"; "control-plane").volumes[] | select(.name == "policy") | .configMap.name] == ["t-warren-control-plane-policy"])
+  and obj("ConfigMap"; "control-plane-policy").data == {}' "without policy files the policy ConfigMap is empty"
 check cp 'obj("StatefulSet"; "control-plane") | .spec.volumeClaimTemplates
   | map({name: .metadata.name, storage: .spec.resources.requests.storage}) == [{name: "data", storage: "1Gi"}]' \
   "the database gets a 1Gi volume"

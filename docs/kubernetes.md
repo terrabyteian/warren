@@ -152,6 +152,12 @@ helm install warren oci://ghcr.io/terrabyteian/charts/warren --version X.Y.Z \
 kubectl -n warren get svc warren-control-plane
 ```
 
+The chart and images install without credentials once they are public:
+GHCR keeps new packages private, so after the first `vX.Y.Z` tag the
+repository owner makes the four packages (`warren`, `warren-relay`,
+`warren-connector` and `charts/warren`) public once, in each package's
+settings.
+
 The control plane is a one-replica StatefulSet: its SQLite database, admin
 socket and (without `keyEncryptionKey`) key-encryption key live on a 1 GiB
 volume. It listens on port 8443 in the pod, behind the Service's port 443.
@@ -204,9 +210,8 @@ kubectl -n warren exec warren-control-plane-0 -- warren admin devices list
 kubectl -n warren exec warren-control-plane-0 -- warren admin devices approve <device>
 ```
 
-Policy files come from `controlPlane.policy` (or an existing ConfigMap in
-`controlPlane.policyConfigMap`), mounted at `/etc/warren/policy`. After a
-`helm upgrade` that changes them, Kubernetes updates the mounted files
+Policy files come from `controlPlane.policy`, mounted at
+`/etc/warren/policy`. After a `helm upgrade` that changes them, Kubernetes updates the mounted files
 within a minute or so; then load them:
 
 ```sh
@@ -327,10 +332,10 @@ value. The ones most installs set:
 | `controlPlane.tls.existingSecret` | `""` | `kubernetes.io/tls` Secret for the organization URL. |
 | `controlPlane.keyEncryptionKey.existingSecret` | `""` | Secret with the key-encryption key (key `kek`); empty keeps it on the data volume. |
 | `controlPlane.config` | `{}` | More configuration merged into the control plane's file. |
-| `controlPlane.policy` / `policyConfigMap` | `{}` / `""` | Policy files by name, or an existing ConfigMap of them. |
+| `controlPlane.policy` | `{}` | Policy files by name. |
 | `controlPlane.persistence.size` | `1Gi` | The database volume. |
 | `controlPlane.service.type` | `ClusterIP` | `LoadBalancer` to reach it from outside the cluster. |
-| `nodes.bundle` / `bundleConfigMap` | `{}` / `""` | The node bundle for relays and connectors, or an existing ConfigMap with `bundle.json`. |
+| `nodes.bundle` | `{}` | The node bundle for relays and connectors; they restart when it changes. |
 | `relay.enabled` | `false` | Run a relay. |
 | `relay.joinToken.existingSecret` | `""` | Secret with the relay's join token (key `token`). |
 | `relay.service.type` | `LoadBalancer` | The relay's Service, UDP and TCP on `relay.service.port` (443). |

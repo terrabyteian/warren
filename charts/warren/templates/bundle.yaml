@@ -1,4 +1,4 @@
-{{- if and (or .Values.relay.enabled .Values.connector.enabled) (not .Values.nodes.bundleConfigMap) }}
+{{- if or .Values.relay.enabled .Values.connector.enabled }}
 {{- include "warren.requireBundle" . }}
 apiVersion: v1
 kind: ConfigMap

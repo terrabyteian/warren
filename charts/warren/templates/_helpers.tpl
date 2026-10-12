@@ -43,13 +43,13 @@ app.kubernetes.io/component: {{ .role }}
 {{- end }}
 
 {{- define "warren.bundleConfigMap" -}}
-{{- default (printf "%s-bundle" (include "warren.fullname" .)) .Values.nodes.bundleConfigMap }}
+{{- printf "%s-bundle" (include "warren.fullname" .) }}
 {{- end }}
 
 {{/* Fails the render unless what relays and connectors need is set. */}}
 {{- define "warren.requireBundle" -}}
-{{- if and (not .Values.nodes.bundleConfigMap) (not .Values.nodes.bundle) }}
-{{- fail "nodes.bundle (or nodes.bundleConfigMap) is required when a relay or connector is enabled" }}
+{{- if not .Values.nodes.bundle }}
+{{- fail "nodes.bundle is required when a relay or connector is enabled" }}
 {{- end }}
 {{- end }}
 

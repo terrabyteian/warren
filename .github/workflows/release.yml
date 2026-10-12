@@ -15,6 +15,9 @@ name: Release
 # - packages the Helm chart as version X.Y.Z, pushes it to
 #   oci://ghcr.io/terrabyteian/charts/warren and signs it the same way.
 # Run by hand, it builds everything without publishing.
+# GHCR keeps new packages private: after the first vX.Y.Z tag, the owner
+# makes the four packages (warren, warren-relay, warren-connector and
+# charts/warren) public once, in each package's settings.
 on:
   push:
     tags: ["v*"]

@@ -95,8 +95,6 @@ controlPlane:
   #     apiVersion: warren.dev/v1alpha1
   #     kind: ConnectorGroup
   #     ...
-  # Or an existing ConfigMap of policy files, used instead of policy.
-  policyConfigMap: ""
 
   # The SQLite database, the admin socket and, without keyEncryptionKey,
   # the key-encryption key.
@@ -130,8 +128,6 @@ nodes:
   # trustDomain. Required when a relay or connector is enabled. Pods restart
   # when it changes. See docs/kubernetes.md.
   bundle: {}
-  # Or an existing ConfigMap with the bundle under bundle.json.
-  bundleConfigMap: ""
   # Log level: error, warn, info, debug or trace.
   logLevel: info
 

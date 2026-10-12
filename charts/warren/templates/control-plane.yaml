@@ -35,7 +35,6 @@ metadata:
 data:
   control-plane.yaml: |
     {{- $config | nindent 4 }}
-{{- if not $cp.policyConfigMap }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -52,7 +51,6 @@ data:
   {{- end }}
 {{- else }}
 data: {}
-{{- end }}
 {{- end }}
 ---
 # The StatefulSet's governing Service.
@@ -205,7 +203,7 @@ spec:
             name: {{ $name }}
         - name: policy
           configMap:
-            name: {{ default (printf "%s-policy" $name) $cp.policyConfigMap }}
+            name: {{ $name }}-policy
         {{- if not $cp.persistence.enabled }}
         - name: data
           emptyDir: {}
