@@ -972,8 +972,8 @@ async fn overview(app: &App, viewer: &Viewer) -> Result<Overview, ApiError> {
     Ok(Overview {
         trust_domain: app.config.trust_domain.clone(),
         public_url: app.config.public_url.clone(),
-        users: users.len(),
-        users_disabled: users.iter().filter(|u| u.disabled).count(),
+        users: users.iter().filter(|u| !u.deleted).count(),
+        users_disabled: users.iter().filter(|u| u.disabled && !u.deleted).count(),
         devices: DeviceCounts {
             approved: count("approved"),
             pending: count("pending"),
@@ -1021,7 +1021,8 @@ fn rules_by_group(app: &App) -> BTreeMap<String, Vec<String>> {
 }
 
 async fn users(app: &App) -> Result<(Vec<UserRow>, Vec<GroupRow>), ApiError> {
-    let users = app.store.users().await?;
+    let mut users = app.store.users().await?;
+    users.retain(|u| !u.deleted);
     let devices = app.store.devices().await?;
     let rows = users
         .iter()
