@@ -63,8 +63,10 @@ An administrator approves the device (`warren admin devices approve
 - **Sign in again.** Run `warren login` again whenever warren says so, for
   example when a rule needs a more recent sign-in (`--fresh` asks the
   identity provider to authenticate you afresh). The same device and key are
-  kept, and a running `warren up` moves to the new sign-in without
-  restarting. Signing in to another organization needs `warren down` first.
+  kept, and a running `warren up` is asked to move to the new sign-in
+  without restarting; its output shows the renewal. A sign-in that would
+  replace the one `warren up` uses (another organization, or a redeployed
+  one with a new trust domain) needs `warren down` first.
 
 Everything the client keeps is in `~/Library/Application Support/warren`,
 readable only by you: the organization and its trust bundle, the session,

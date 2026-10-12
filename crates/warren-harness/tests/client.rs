@@ -221,6 +221,7 @@ async fn sign_in_enroll_and_reach_an_app_through_the_engine() {
         trust: OrgTrust::Pinned(fingerprint.clone()),
         key_storage: Some(KeyStorage::File),
         fresh: false,
+        keep_existing: false,
         timeout: Duration::from_secs(30),
     };
     let signed = sign_in(&store, opts.clone(), |url| {
@@ -249,6 +250,20 @@ async fn sign_in_enroll_and_reach_an_app_through_the_engine() {
         .await
         .unwrap_err();
     assert!(err.contains("pinned"), "{err}");
+
+    // While warren up runs on a sign-in, one that would replace it is
+    // refused before anything is cleared.
+    let busy = Store::open(&dir.join("busy")).unwrap();
+    let mut elsewhere = signed.account.profile.clone();
+    elsewhere.trust_domain = "old.test".into();
+    busy.save_profile(&elsewhere).unwrap();
+    let mut keep = opts.clone();
+    keep.keep_existing = true;
+    let err = sign_in(&busy, keep, |_| panic!("no browser"))
+        .await
+        .unwrap_err();
+    assert!(err.contains("warren down"), "{err}");
+    assert_eq!(busy.profile().unwrap(), Some(elsewhere));
 
     // The engine says why it cannot start while the device waits.
     let recorder = Arc::new(Recorder {

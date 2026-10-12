@@ -157,6 +157,7 @@ pub unsafe extern "C" fn warren_login(
                     trust,
                     key_storage: None,
                     fresh: false,
+                    keep_existing: false,
                     timeout: Duration::from_secs(u64::from(timeout_secs.max(1))),
                 };
                 let done = runtime()?.block_on(signin::sign_in(&store, opts, move |url| {

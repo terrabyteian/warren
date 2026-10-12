@@ -37,6 +37,9 @@ pub struct SignInOptions {
     /// Ask the IdP to authenticate afresh (`prompt=login`), as a policy
     /// that needs a recent sign-in requires.
     pub fresh: bool,
+    /// Refuse to replace the saved sign-in or device key, as while a
+    /// running tunnel uses them.
+    pub keep_existing: bool,
     /// How long to wait for the browser.
     pub timeout: Duration,
 }
@@ -334,21 +337,30 @@ pub async fn sign_in(
     // Another organization's sign-in, or a key from a different trust
     // domain, is replaced; the same organization keeps its device key.
     let previous = store.profile().ok().flatten();
-    let mut replaced = None;
     let same = previous
         .as_ref()
         .is_some_and(|p| p.org_url == org && p.trust_domain == discovery.trust_domain);
+    let reuse = DeviceKey::exists(store.dir())
+        && (same || previous.is_none())
+        && opts
+            .key_storage
+            .is_none_or(|want| DeviceKey::load(store.dir()).is_ok_and(|k| k.storage() == want));
+    if let Some(p) = &previous
+        && opts.keep_existing
+        && !reuse
+    {
+        return Err(format!(
+            "signing in to {org} would replace the sign-in to {} that warren up is using; run `warren down` first",
+            p.org_url
+        ));
+    }
+    let mut replaced = None;
     if let Some(p) = &previous
         && !same
     {
         store.clear()?;
         replaced = Some(p.org_url.clone());
     }
-    let reuse = DeviceKey::exists(store.dir())
-        && (same || previous.is_none())
-        && opts
-            .key_storage
-            .is_none_or(|want| DeviceKey::load(store.dir()).is_ok_and(|k| k.storage() == want));
     let (key, key_note) = if reuse {
         (DeviceKey::load(store.dir())?, None)
     } else {

@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use warren_client::control::{self, Account, OrgTrust};
+use warren_client::control::{Account, OrgTrust};
 use warren_client::engine::Status;
 use warren_client::signin::{self, SignInOptions};
 use warren_client::state::Store;
@@ -206,22 +206,16 @@ fn login(m: &ArgMatches) -> Result<(), String> {
     }
     let dir = home(m)?;
     let store = Store::open(&dir)?;
-    let org_url = m.get_one::<String>("org").expect("required").clone();
-    let org = control::org_url(&org_url)?;
-    if ask_up(&dir, "status").is_some()
-        && store.profile().ok().flatten().is_some_and(|p| p.org_url != org)
-    {
-        return Err("warren is up for another organization; run `warren down` first".into());
-    }
     let trust = match m.get_one::<String>("fingerprint") {
         Some(f) => OrgTrust::pinned(f)?,
         None => OrgTrust::System,
     };
     let opts = SignInOptions {
-        org_url,
+        org_url: m.get_one::<String>("org").expect("required").clone(),
         trust,
         key_storage: None,
         fresh: m.get_flag("fresh"),
+        keep_existing: ask_up(&dir, "status").is_some(),
         timeout: Duration::from_secs(*m.get_one::<u64>("timeout").expect("defaulted")),
     };
     let print_only = m.get_flag("no-browser");
@@ -283,7 +277,9 @@ fn login(m: &ArgMatches) -> Result<(), String> {
         ),
     }
     if ask_up(&dir, "renew").is_some_and(|r| r.trim() == "ok") {
-        println!("The running warren up now uses this sign-in.");
+        println!(
+            "Asked the running warren up to switch to this sign-in; its output shows whether the renewal succeeded."
+        );
     }
     Ok(())
 }
