@@ -39,11 +39,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "warren.labels" . | nindent 8 }}
-        {{- include "warren.selectorLabels" (dict "root" . "role" "connector") | nindent 8 }}
-        {{- with $c.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- include "warren.podLabels" (dict "root" . "role" "connector" "podLabels" $c.podLabels) | nindent 8 }}
       annotations:
         checksum/bundle: {{ .Values.nodes.bundle | toJson | sha256sum }}
         {{- with $c.podAnnotations }}

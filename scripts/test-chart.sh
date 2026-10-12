@@ -2,7 +2,8 @@
 # Template tests for the chart in charts/warren: `helm lint --strict` over
 # the values in charts/warren/ci/, then renders of chosen values, parsed into
 # objects and checked field by field for what each role must and must not
-# get, and the values the chart refuses. Needs helm
+# get, and the values the chart refuses. Every render is also checked for a
+# mapping that repeats a key. Needs helm
 # (scripts/install-kube-tools.sh), jq, and Ruby for its standard YAML
 # library.
 #
@@ -25,6 +26,36 @@ fail() {
 # shellcheck disable=SC2016 # $stdin is Ruby's, not the shell's
 yaml2json() { ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load_stream($stdin.read).compact)'; }
 
+# YAML documents on stdin: each mapping key repeated within its mapping, one
+# per line on stdout. helm and yaml2json keep the last of them, but
+# kustomize (and so Flux's post-renderer) and kubeconform -strict refuse the
+# document.
+# shellcheck disable=SC2016 # the #{} interpolations are Ruby's
+repeated_keys() {
+  ruby -ryaml -e '
+    def walk(node)
+      if node.is_a?(Psych::Nodes::Mapping)
+        keys = node.children.each_slice(2).map(&:first).grep(Psych::Nodes::Scalar)
+        keys.group_by(&:value).each_value do |same|
+          same.drop(1).each { |k| puts "line #{k.start_line + 1}: #{k.value}" }
+        end
+      end
+      node.children&.each { |c| walk(c) }
+    end
+    walk(Psych.parse_stream($stdin.read))'
+}
+# unique_keys DESCRIPTION FILE: no mapping in the YAML documents in FILE
+# repeats a key.
+unique_keys() {
+  repeated_keys <"$2" >"$work/repeated"
+  if [ -s "$work/repeated" ]; then
+    cat "$work/repeated" >&2
+    fail "$1"
+  else
+    ok "$1"
+  fi
+}
+
 # The release is "t", so every object is named t-warren-<role>.
 # shellcheck disable=SC2016 # the $ parameters are jq's
 defs='
@@ -39,11 +70,13 @@ def mounts($c): [$c | .volumeMounts[] | {(.name): .mountPath}] | add;
 
 # render NAME [helm template args...]: renders into $work/NAME.json, an
 # array of the objects, and the control plane's configuration file into
-# $work/NAME.config.json.
+# $work/NAME.config.json, and checks that no mapping in it repeats a key.
 render() {
   local name=$1
   shift
-  helm template t "$chart" --namespace warren "$@" | yaml2json >"$work/$name.json"
+  helm template t "$chart" --namespace warren "$@" >"$work/$name.yaml"
+  unique_keys "render $name repeats no mapping key" "$work/$name.yaml"
+  yaml2json <"$work/$name.yaml" >"$work/$name.json"
   jq -r "$defs"' obj("ConfigMap"; "control-plane") | .data["control-plane.yaml"]' "$work/$name.json" |
     yaml2json | jq '.[0]' >"$work/$name.config.json"
 }
@@ -78,6 +111,8 @@ for values in "$chart"/ci/*.yaml; do
     cat "$work/lint" >&2
     fail "helm lint --strict with $(basename "$values")"
   fi
+  helm template t "$chart" -f "$values" >"$work/ci.yaml"
+  unique_keys "the render with $(basename "$values") repeats no mapping key" "$work/ci.yaml"
 done
 
 base=(--set controlPlane.trustDomain=lab.test

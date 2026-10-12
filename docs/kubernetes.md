@@ -412,8 +412,9 @@ value. The ones most installs set:
 ## How it is tested
 
 [scripts/test-chart.sh](../scripts/test-chart.sh) lints the chart, parses
-renders of chosen values and checks each object's fields, and checks
-refusals of incomplete values, on every pull request. CI checks that the
+renders of chosen values and checks each object's fields, checks that no
+render repeats a mapping key (which kustomize, and so Flux, refuses), and
+checks refusals of incomplete values, on every pull request. CI checks that the
 relay and connector images offer no control-plane role.
 [scripts/e2e-kind.sh](../scripts/e2e-kind.sh) installs the images CI just
 built on a kind cluster: the control plane, join tokens created with

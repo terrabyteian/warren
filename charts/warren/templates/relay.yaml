@@ -70,11 +70,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "warren.labels" . | nindent 8 }}
-        {{- include "warren.selectorLabels" (dict "root" . "role" "relay") | nindent 8 }}
-        {{- with $r.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- include "warren.podLabels" (dict "root" . "role" "relay" "podLabels" $r.podLabels) | nindent 8 }}
       annotations:
         checksum/bundle: {{ .Values.nodes.bundle | toJson | sha256sum }}
         {{- with $r.podAnnotations }}
