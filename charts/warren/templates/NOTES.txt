@@ -10,7 +10,12 @@ one, forward the Service on the URL's own port and resolve the name locally, so
 the URL and the identity provider's redirect URI stay the same:
 
   echo "127.0.0.1 {{ $url.hostname }}" | sudo tee -a /etc/hosts
-  sudo kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }}-control-plane {{ $url.host | trimPrefix $url.hostname | trimPrefix ":" | default "443" }}:{{ .Values.controlPlane.service.port }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }}-control-plane {{ $url.host | trimPrefix $url.hostname | trimPrefix ":" | default "443" }}:{{ .Values.controlPlane.service.port }}
+
+macOS lets you bind port 443 without root. On Linux, a port below 1024 needs
+root: run the same command as
+sudo kubectl --kubeconfig "${KUBECONFIG:-$HOME/.kube/config}" -n {{ .Release.Namespace }} port-forward ...
+so it still reads your kubeconfig.
 
 Sign in and enroll a Mac with the warren client (docs/macos.md):
 

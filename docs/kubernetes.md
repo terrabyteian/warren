@@ -166,7 +166,16 @@ the name locally:
 
 ```sh
 echo "127.0.0.1 warren.home.example" | sudo tee -a /etc/hosts
-sudo kubectl -n warren port-forward svc/warren-control-plane 443:443
+kubectl -n warren port-forward svc/warren-control-plane 443:443
+```
+
+macOS lets you bind port 443 without root. On Linux, a port below 1024 needs
+root; run kubectl under sudo with your kubeconfig named explicitly, since
+sudo usually resets `HOME`:
+
+```sh
+sudo kubectl --kubeconfig "${KUBECONFIG:-$HOME/.kube/config}" \
+  -n warren port-forward svc/warren-control-plane 443:443
 ```
 
 Sign in from a Mac with the warren client ([macos.md](macos.md#sign-in)),
