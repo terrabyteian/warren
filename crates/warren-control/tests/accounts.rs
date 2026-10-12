@@ -1004,6 +1004,24 @@ async fn unknown_and_locked_usernames_look_the_same() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disabled_account_looks_like_a_wrong_password() {
+    let d = Deployment::local(None).await;
+    d.create("ada", &[]).await;
+    let wrong = attempt(&d, "ada", "wrong password!").await;
+    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+    let (status, _) = d.admin("POST", "/v1/admin/users/ada/disable", None).await;
+    assert_eq!(status, 200);
+    // The right password is not confirmed for a disabled account.
+    assert_eq!(attempt(&d, "ada", PASSWORD).await, wrong);
+    assert!(
+        d.audit_messages()
+            .iter()
+            .any(|m| m == "sign-in refused: the user is disabled")
+    );
+    d.cp.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_guesses_cannot_outrun_the_lockout() {
     let d = Deployment::local(None).await;
     d.create("ada", &[]).await;

@@ -542,12 +542,18 @@ pub(crate) async fn password(
         );
         return Ok(retry());
     };
-    if !ok {
-        let why = if has_password {
-            "sign-in refused: wrong password"
-        } else {
-            "sign-in refused: no password is set yet; the account needs its setup link"
-        };
+    // A disabled account fails like a wrong password, so the page never
+    // confirms its password; only the audit log says why.
+    let refused = if !ok && has_password {
+        Some("sign-in refused: wrong password")
+    } else if !ok {
+        Some("sign-in refused: no password is set yet; the account needs its setup link")
+    } else if user.disabled {
+        Some("sign-in refused: the user is disabled")
+    } else {
+        None
+    };
+    if let Some(why) = refused {
         failed(
             app,
             peer,
@@ -562,20 +568,6 @@ pub(crate) async fn password(
     app.store
         .refund_local_attempt(&account.user_id, lock)
         .await?;
-    if user.disabled {
-        app.audit(logon_record(
-            false,
-            &actor(&user),
-            "sign-in refused: the user is disabled",
-            "password",
-            peer,
-        ));
-        return Ok(notice(
-            StatusCode::FORBIDDEN,
-            "Your account is disabled",
-            "Your warren account is disabled. Contact your administrator.",
-        ));
-    }
     let mut verified = hash.unwrap_or_default();
     if accounts::needs_rehash(&verified) {
         let rehashed = app.hash_password(password.clone()).await?;

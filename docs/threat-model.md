@@ -413,9 +413,10 @@ extend access past the other's view (G4, G9).
   it, so concurrent attempts cannot exceed either bound. Usernames that are not
   accounts are counted and locked the same way, and an unknown username, a
   locked account and a wrong password get the same answer after the same work,
-  so neither the response nor its timing tells which usernames exist; only the
-  audit log, where every failure is recorded (G13), says why. Passwords must be at least 12 characters and not the
-  username.
+  so neither the response nor its timing tells which usernames exist; a
+  disabled account gets that answer too, even for the right password, which it
+  never confirms. Only the audit log, where every failure is recorded (G13),
+  says why. Passwords must be at least 12 characters and not the username.
 - **Database theft.** Passwords are PBKDF2-HMAC-SHA256 hashes with 600,000
   iterations and a per-password salt, and each records its iteration count so
   it can be raised; authenticator secrets are sealed under the key-encryption

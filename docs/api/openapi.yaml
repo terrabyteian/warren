@@ -95,8 +95,8 @@ paths:
       responses:
         "200": { description: The authenticator code page, or the authenticator enrollment page (with its QR code) for an account without one. }
         "400": { description: The sign-in expired or belongs to another browser. }
-        "401": { description: "The username or password is incorrect, or the username is locked after failed sign-ins: the same page and status for an unknown username, a locked account and a wrong password." }
-        "403": { description: The password is correct but the account is disabled, or the form came from another origin. }
+        "401": { description: "The username or password is incorrect, the username is locked after failed sign-ins, or the account is disabled: the same page and status for an unknown username, a locked account, a wrong password and a disabled account's right password." }
+        "403": { description: The form came from another origin. }
         "429": { description: Too many failed sign-ins from this source. }
   /v1/auth/code:
     post:
