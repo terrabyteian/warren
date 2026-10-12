@@ -28,8 +28,8 @@ servers:
   - url: http://localhost
     description: >-
       The admin API, served on the control plane's local Unix socket
-      (default /var/lib/warren/admin.sock, mode 0600). Remote admin access
-      arrives with the console in M3.
+      (default /var/lib/warren/admin.sock, mode 0600). The web console
+      offers a few of its changes remotely (docs/console.md).
 tags:
   - name: client
     description: Link D, used by the warren app.

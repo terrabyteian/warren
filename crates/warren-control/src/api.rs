@@ -88,8 +88,9 @@ async fn route(
         return Ok(crate::console::route(&app, req).await);
     }
     let method = req.method().clone();
-    // The operator's certificate serves sign-in and enrollment only; every
-    // other call goes where the trust bundle verifies the control plane.
+    // Besides the console, the operator's certificate serves sign-in and
+    // enrollment only; every other call goes where the trust bundle verifies
+    // the control plane.
     let pinned_only = !matches!(
         path.as_str(),
         "/.well-known/warren"
