@@ -307,12 +307,15 @@ tcp_echo() {
   [ "$reply" = "hello warren" ]
 }
 udp_echo() {
-  local reply
-  exec 6<>"/dev/udp/$1/7" || return 1
-  printf 'hi' >&6
-  read -r -t 5 -n 2 reply <&6 || true
-  exec 6>&-
-  [ "$reply" = "hi" ]
+  # udp_echo HOST: sends a datagram and expects it back. bash's `read`
+  # takes a socket one byte at a time, which drops the rest of a datagram,
+  # so one recv takes the whole echo.
+  perl -MIO::Socket::INET -MIO::Select -e '
+    my $s = IO::Socket::INET->new(PeerAddr => "$ARGV[0]:7", Proto => "udp") or exit 1;
+    $s->send("hi") or exit 1;
+    IO::Select->new($s)->can_read(5) or exit 1;
+    defined $s->recv(my $reply, 64) or exit 1;
+    exit($reply eq "hi" ? 0 : 1);' "$1"
 }
 if start_up; then ok "sudo warren up connects through the relay"; else
   fail "sudo warren up connects through the relay"
@@ -375,10 +378,12 @@ check "TCP app over HTTP/2" tcp_echo 10.77.0.10
 check "UDP app over HTTP/2" udp_echo 10.77.0.10
 
 # 8. Revocation: the connector cuts the session and the client says why.
+# The relay reloads only once the client has said so: over HTTP/2 its cut
+# is a bare TCP close, which would drop the connector's notice in flight.
 write_bundle 2 "$user" "$device" "\"$device\""
 sudo kill -HUP "$CONNECTOR_PID"
-kill -HUP "$RELAY_PID"
 check "a revoked device is cut and told why" wait_for 15 grep -Eq "revoked|not connected" "$WORK/up.log"
+kill -HUP "$RELAY_PID"
 check "the revoked device reaches nothing" sh -c "! (exec 8<>/dev/tcp/10.77.0.10/7; printf x >&8; read -r -t 3 r <&8; [ -n \"\$r\" ]) 2>/dev/null"
 "$WARREN" down --home "$HOME_DIR" >/dev/null || true
 wait "$UP_PID" 2>/dev/null || true
