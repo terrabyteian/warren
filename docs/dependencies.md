@@ -67,6 +67,12 @@ published through crates.io trusted publishing, which several crates in the
 M1 graph are. Locally, `cargo install --locked cargo-deny@0.20.2
 cargo-vet@0.10.2`.
 
+The chart's CI uses Helm 3.22.0 and kind 0.33.0, pinned and digest-verified
+the same way in [`scripts/install-kube-tools.sh`](../scripts/install-kube-tools.sh).
+The container images' base images (the Rust build image, distroless and
+Debian slim) are pinned by digest in the [Dockerfile](../Dockerfile), and the
+image build reads crates only from `vendor/`.
+
 ## 3. Adding or updating a crate
 
 1. **Justify it.** In the pull request, say what the crate does for warren,

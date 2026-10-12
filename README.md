@@ -51,7 +51,8 @@ Secure Enclave key and pushes revocations. See [docs/design.md](docs/design.md).
 Start with the [docs index](docs/README.md):
 [design](docs/design.md), [protocol](docs/protocol.md),
 [threat model](docs/threat-model.md), [policy](docs/policy.md),
-[dependencies](docs/dependencies.md), [API](docs/api/openapi.yaml).
+[dependencies](docs/dependencies.md), [Kubernetes](docs/kubernetes.md),
+[API](docs/api/openapi.yaml).
 
 ## Building
 
@@ -104,6 +105,21 @@ warren admin policy reload
 ```
 
 The APIs are described in [docs/api/openapi.yaml](docs/api/openapi.yaml).
+
+## Running warren on Kubernetes
+
+Each release publishes multi-architecture images
+(`ghcr.io/terrabyteian/warren` and `ghcr.io/terrabyteian/warren-connector`)
+and a Helm chart for the control plane, a relay and a kernel-mode connector,
+all signed with cosign:
+
+```sh
+helm install warren oci://ghcr.io/terrabyteian/charts/warren --version X.Y.Z \
+  -n warren -f values.yaml
+```
+
+[docs/kubernetes.md](docs/kubernetes.md) walks through the install, reaching
+the console, joining a relay and a connector, and every value.
 
 ## Contributing and security
 

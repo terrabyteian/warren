@@ -1,0 +1,165 @@
+{{- if .Values.connector.enabled }}
+{{- include "warren.requireBundle" . }}
+{{- $c := .Values.connector }}
+{{- $name := printf "%s-connector" (include "warren.fullname" .) }}
+{{- $token := required "connector.joinToken.existingSecret is required: a Secret with a connector join token" $c.joinToken.existingSecret }}
+{{- $group := required "connector.group is required: the connector group in its join token" $c.group }}
+{{- if not $c.relays }}
+{{- fail "connector.relays is required: the relays to attach to, each NAME[@HOST:PORT]" }}
+{{- end }}
+{{- $image := include "warren.image" (dict "image" .Values.connectorImage "root" .) }}
+{{- if $c.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: connector
+spec:
+  {{- include "warren.claimSpec" (dict "p" $c.persistence) | nindent 2 }}
+---
+{{- end }}
+# Kernel mode: the connector forwards admitted packets through a TUN device
+# and masquerades them. It dials out to its relays and serves nothing.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: connector
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "warren.selectorLabels" (dict "root" . "role" "connector") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "warren.labels" . | nindent 8 }}
+        {{- include "warren.selectorLabels" (dict "root" . "role" "connector") | nindent 8 }}
+        {{- with $c.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/bundle: {{ .Values.nodes.bundle | toJson | sha256sum }}
+        {{- with $c.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # Stopping drains existing sessions for up to the drain timeout.
+      terminationGracePeriodSeconds: {{ add $c.drainTimeoutSeconds 10 }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      {{- include "warren.scheduling" (dict "v" $c) | nindent 6 }}
+      {{- if $c.forwardingInit }}
+      initContainers:
+        # IP forwarding in the pod's own network namespace; the node's is
+        # untouched.
+        - name: forwarding
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.connectorImage.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              echo 1 >/proc/sys/net/ipv4/ip_forward
+              if [ -e /proc/sys/net/ipv6/conf/all/forwarding ]; then
+                echo 1 >/proc/sys/net/ipv6/conf/all/forwarding
+              fi
+          securityContext:
+            privileged: true
+            runAsUser: 0
+      {{- end }}
+      containers:
+        - name: connector
+          image: {{ $image }}
+          imagePullPolicy: {{ .Values.connectorImage.pullPolicy }}
+          args:
+            - connector
+            - --group={{ $group }}
+            {{- range $c.relays }}
+            - --relay={{ . }}
+            {{- end }}
+            - --join-token=$(WARREN_JOIN_TOKEN)
+            - --state-dir=/var/lib/warren
+            - --bundle=/etc/warren/bundle/bundle.json
+            - --transport={{ $c.transport }}
+            - --nat={{ $c.nat }}
+            - --tunnel-mtu={{ $c.tunnelMtu }}
+            - --drain-timeout={{ $c.drainTimeoutSeconds }}
+            - --metrics=[::]:9090
+            - --log-level={{ .Values.nodes.logLevel }}
+            {{- range $c.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: WARREN_JOIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $token }}
+                  key: {{ $c.joinToken.key }}
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          # Root with CAP_NET_ADMIN only: the TUN device, its routes and the
+          # NAT table.
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_ADMIN]
+          {{- with $c.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: bundle
+              mountPath: /etc/warren/bundle
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/warren
+            - name: tun
+              mountPath: /dev/net/tun
+      volumes:
+        - name: bundle
+          configMap:
+            name: {{ include "warren.bundleConfigMap" . }}
+        - name: state
+          {{- if $c.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $name }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+{{- end }}

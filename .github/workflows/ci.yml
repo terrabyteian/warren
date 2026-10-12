@@ -139,6 +139,50 @@ jobs:
       - name: kernel-mode benchmarks
         run: sudo scripts/bench-kernel.sh target/release 10 --summary "$GITHUB_STEP_SUMMARY"
 
+  chart:
+    name: Helm chart (lint and template tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install pinned Helm and kind (CI-only tools, digest-verified)
+        run: |
+          scripts/install-kube-tools.sh "$RUNNER_TEMP/kube-tools"
+          echo "$RUNNER_TEMP/kube-tools" >> "$GITHUB_PATH"
+      - run: scripts/test-chart.sh
+
+  images:
+    name: container images (dry run) and the chart on kind
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The arm64 connector image installs its packages under emulation; the
+      # binary itself is cross-compiled.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: both images for linux/amd64 and linux/arm64, not pushed
+        run: |
+          for target in warren warren-connector; do
+            docker buildx build --platform linux/amd64,linux/arm64 --target "$target" .
+          done
+      - name: load the linux/amd64 images for kind
+        run: |
+          docker buildx build --load --target warren -t warren:ci .
+          docker buildx build --load --target warren-connector -t warren-connector:ci .
+      - name: install pinned Helm and kind (CI-only tools, digest-verified)
+        run: |
+          scripts/install-kube-tools.sh "$RUNNER_TEMP/kube-tools"
+          echo "$RUNNER_TEMP/kube-tools" >> "$GITHUB_PATH"
+      - name: control plane, relay and kernel-mode connector from the chart on kind
+        run: scripts/e2e-kind.sh warren:ci warren-connector:ci
+
   deps:
     name: dependency policy
     runs-on: ubuntu-latest

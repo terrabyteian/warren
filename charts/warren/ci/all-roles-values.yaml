@@ -1,0 +1,29 @@
+# Every role, with every Secret the chart can use.
+controlPlane:
+  trustDomain: lab.test
+  publicUrl: https://warren.lab.test
+  dnsNames: [nodes.warren.lab.test]
+  idp:
+    issuer: https://accounts.google.com
+    clientId: warren.apps.googleusercontent.com
+    scopes: [openid, email, profile]
+  idpClientSecret: { existingSecret: warren-idp }
+  tls: { existingSecret: warren-tls }
+  keyEncryptionKey: { existingSecret: warren-kek }
+  bootstrapAdmin: { existingSecret: warren-admin }
+  service: { type: LoadBalancer }
+nodes:
+  bundle:
+    version: 1
+    trustDomain: lab.test
+    connectorGroups:
+      - name: homelab
+        destinations: { cidrs: ["192.168.1.0/24"] }
+relay:
+  enabled: true
+  joinToken: { existingSecret: relay-join }
+connector:
+  enabled: true
+  group: homelab
+  relays: ["relay.lab.test@warren-relay:443"]
+  joinToken: { existingSecret: connector-join }

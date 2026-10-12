@@ -1,0 +1,160 @@
+{{- if .Values.relay.enabled }}
+{{- include "warren.requireBundle" . }}
+{{- $r := .Values.relay }}
+{{- $name := printf "%s-relay" (include "warren.fullname" .) }}
+{{- $token := required "relay.joinToken.existingSecret is required: a Secret with a relay join token" $r.joinToken.existingSecret }}
+{{- if $r.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+spec:
+  {{- include "warren.claimSpec" (dict "p" $r.persistence) | nindent 2 }}
+---
+{{- end }}
+# QUIC on UDP and the HTTP/2 fallback on TCP, on the same port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+  {{- with $r.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $r.service.type }}
+  {{- if and (ne $r.service.type "ClusterIP") $r.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ $r.service.externalTrafficPolicy }}
+  {{- end }}
+  {{- with $r.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with $r.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "warren.selectorLabels" (dict "root" . "role" "relay") | nindent 4 }}
+  ports:
+    - name: quic
+      port: {{ $r.service.port }}
+      targetPort: quic
+      protocol: UDP
+    - name: https
+      port: {{ $r.service.port }}
+      targetPort: https
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+spec:
+  # A join token makes one relay; more relays are more releases or more
+  # tokens (docs/kubernetes.md).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "warren.selectorLabels" (dict "root" . "role" "relay") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "warren.labels" . | nindent 8 }}
+        {{- include "warren.selectorLabels" (dict "root" . "role" "relay") | nindent 8 }}
+        {{- with $r.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/bundle: {{ .Values.nodes.bundle | toJson | sha256sum }}
+        {{- with $r.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        {{- include "warren.restrictedPod" . | nindent 8 }}
+      {{- include "warren.scheduling" (dict "v" $r) | nindent 6 }}
+      containers:
+        - name: relay
+          image: {{ include "warren.image" (dict "image" .Values.image "root" .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - relay
+            - --listen=[::]:8443
+            - --join-token=$(WARREN_JOIN_TOKEN)
+            - --state-dir=/var/lib/warren
+            - --bundle=/etc/warren/bundle/bundle.json
+            - --metrics=[::]:9090
+            - --log-level={{ .Values.nodes.logLevel }}
+            - --max-splices-per-client={{ $r.maxSplicesPerClient }}
+            {{- range $r.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: WARREN_JOIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $token }}
+                  key: {{ $r.joinToken.key }}
+          ports:
+            - name: quic
+              containerPort: 8443
+              protocol: UDP
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          securityContext:
+            {{- include "warren.restrictedContainer" . | nindent 12 }}
+          {{- with $r.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: bundle
+              mountPath: /etc/warren/bundle
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/warren
+      volumes:
+        - name: bundle
+          configMap:
+            name: {{ include "warren.bundleConfigMap" . }}
+        - name: state
+          {{- if $r.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $name }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- end }}

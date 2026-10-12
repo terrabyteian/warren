@@ -1,0 +1,34 @@
+{{- $full := include "warren.fullname" . -}}
+warren {{ .Chart.AppVersion }} is installed in {{ .Release.Namespace }}.
+{{- if .Values.controlPlane.enabled }}
+
+The console and sign-in are at {{ .Values.controlPlane.publicUrl }}, served by the
+Service {{ $full }}-control-plane ({{ .Values.controlPlane.service.type }}, port {{ .Values.controlPlane.service.port }}).
+That host name must resolve to the Service's address; from a workstation without
+one, forward it:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }}-control-plane 8443:{{ .Values.controlPlane.service.port }}
+
+Administer the control plane:
+
+  kubectl -n {{ .Release.Namespace }} exec {{ $full }}-control-plane-0 -- warren admin deployment
+{{- if not (or .Values.relay.enabled .Values.connector.enabled) }}
+
+Next, create join tokens for a relay and a connector and enable them
+(docs/kubernetes.md):
+
+  kubectl -n {{ .Release.Namespace }} exec {{ $full }}-control-plane-0 -- \
+    warren admin join-token create --role relay --name relay-1 --dns-name relay.example.com
+{{- end }}
+{{- end }}
+{{- if .Values.relay.enabled }}
+
+The relay listens on UDP and TCP port {{ .Values.relay.service.port }} of the Service {{ $full }}-relay.
+Its DNS name must resolve to that Service's external address:
+
+  kubectl -n {{ .Release.Namespace }} get svc {{ $full }}-relay
+{{- end }}
+{{- if .Values.connector.enabled }}
+
+The connector for group {{ .Values.connector.group }} attaches to: {{ join ", " .Values.connector.relays }}
+{{- end }}

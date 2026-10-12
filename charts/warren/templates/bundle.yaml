@@ -1,0 +1,12 @@
+{{- if and (or .Values.relay.enabled .Values.connector.enabled) (not .Values.nodes.bundleConfigMap) }}
+{{- include "warren.requireBundle" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "warren.bundleConfigMap" . }}
+  labels:
+    {{- include "warren.labels" . | nindent 4 }}
+data:
+  bundle.json: |
+    {{- toPrettyJson .Values.nodes.bundle | nindent 4 }}
+{{- end }}

@@ -1,0 +1,7 @@
+# The control plane alone, as installed first (docs/kubernetes.md).
+controlPlane:
+  trustDomain: lab.test
+  publicUrl: https://warren.lab.test
+  idp:
+    issuer: https://accounts.google.com
+    clientId: warren.apps.googleusercontent.com
