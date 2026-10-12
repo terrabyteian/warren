@@ -4,7 +4,7 @@ Status: v1 threat model, recorded at M0. It is revisited at every milestone
 and is the starting brief for the external security audit in M4.
 
 Every mitigation here points at a guarantee in
-[design.md](design.md#4-guarantees) (G1 to G19). A threat whose mitigation
+[design.md](design.md#4-guarantees) (G1 to G20). A threat whose mitigation
 cannot be tied to a guarantee is a gap in the design and is listed in
 [section 7](#7-open-items).
 
@@ -28,6 +28,8 @@ features it relies on.
 | Policy-signing, posture-signing and session-assertion-signing keys | Forge policy bundles, posture statements or clientless identities. |
 | Device private keys | Act as a device; bound to hardware (G3). |
 | Client certificates and sessions | Act as a user on a device, for at most 4 hours (G4). |
+| Built-in account credentials | Password hashes, authenticator secrets (sealed under the key-encryption key), recovery codes and setup links: sign in as that account, which still needs an approved device (G2, G20). |
+| The bootstrap admin password file | Signs in as the first admin until it is used and removed. |
 | Policy, entity data, grants | Decide who reaches what. |
 | Audit records | Detection, investigation, compliance. |
 | Kubernetes broker service-account credentials | Can impersonate any user or group toward the API server, potentially a cluster administrator; RBAC cannot limit impersonation to a name prefix (G15, T13). |
@@ -49,6 +51,7 @@ features it relies on.
 | Compromised connector | Full control of a connector host and its keys. |
 | Compromised control plane | Full control of the control plane, its keys and database. |
 | Compromised or lagging IdP | Asserts false identities, or reports changes late. |
+| Password guesser and phisher | Tries passwords against built-in accounts from many addresses, replays leaked passwords, or proxies a user's sign-in pages in real time. |
 | Cluster insider | Can create or edit warren CRDs and Service annotations in some namespaces of a cluster. |
 | Supply-chain attacker | Publishes or compromises a crate, a build tool, or a CI action. |
 
@@ -64,6 +67,7 @@ features it relies on.
 | TB6 | Connector to private network | Plain traffic to destinations in scope. |
 | TB7 | Nodes and clients to the control plane | HTTPS, mutual TLS after enrollment; signed bundles. |
 | TB8 | Control plane to the IdP | OIDC, SCIM, shared signals. |
+| TB12 | A user's browser to the control plane's sign-in pages | Passwords, authenticator and recovery codes, setup links, over HTTPS. |
 | TB9 | Admins to the control plane | Console, API, CLI, Git, CRDs. |
 | TB10 | Kubernetes broker to the API server | Impersonation with the broker's service account. |
 | TB11 | Source and dependencies to binaries | Build and CI pipeline. |
@@ -122,7 +126,7 @@ control.
 - **Unlocked, with a live session.** The thief can use whatever the user can
   reach until the device is disabled. Mitigations: screen-lock posture checks
   (G11); rules that require recent authentication or MFA for sensitive apps,
-  which force an IdP sign-in the thief cannot complete; revocation within
+  which force a fresh sign-in the thief cannot complete; revocation within
   10 seconds once reported (G9).
 
 Residual risk: the window between theft and report on an unlocked device.
@@ -181,8 +185,8 @@ make it hard, visible and recoverable.
   the admins the configuration names, and it makes only device approval and
   revocation and user disable and enable, each needing a sign-in the IdP
   reported as MFA and an IdP authentication within the last hour by default
-  (for IdPs that do not report MFA, a step-up with warren's own TOTP once
-  built-in accounts land), behind form tokens, origin checks and a strict
+  (console sign-in with built-in accounts, and a step-up with their TOTP for
+  IdPs that do not report MFA, come later), behind form tokens, origin checks and a strict
   content security policy ([console.md](console.md#security)). Policy from Git or CRDs is reviewed
   outside warren before it applies (G19).
 - **Visible.** Every change and every decision is audited and can be streamed
@@ -210,11 +214,26 @@ reason the control plane is small, separately deployable and audited.
 - The latency from an IdP-side change to warren is documented per IdP, so
   operators know their real exposure.
 
+**Google.** Anyone can hold a Google account, so the Google preset admits only
+accounts whose email Google has verified, and, when configured, only accounts
+of one Workspace domain, judged by the `hd` claim (an address at the domain is
+not enough: a personal Google account can carry a company address) or on an
+allowed list. Without either restriction any Google account can sign in and
+enroll a device, but reaches nothing unless policy names it (G1). Google
+carries no groups, so its users get warren's own; an invite to a verified
+email binds to the first account that signs in with it, by issuer and
+subject, so an address later recycled to another account inherits nothing.
+Google reports neither MFA nor the time of authentication, so `auth.mfa` and
+`auth.maxAge` rules are never met by Google sign-ins; such apps need a
+built-in account or an IdP that reports both.
+
 **Compromise.** A compromised IdP can assert any identity. warren still
 requires an approved device whose key is in hardware (G2, G3), so an IdP
 compromise alone does not grant access from an unknown device; device approval
 rules that need a server-verified signal (for example MDM enrollment) make that
-step independent of the IdP.
+step independent of the IdP. It cannot pass for a built-in account or claim
+membership in warren's own groups: subjects and groups with the `local:`
+prefix are refused or dropped at sign-in.
 
 ### T7. DNS bypass and DNS manipulation on the client
 
@@ -385,6 +404,43 @@ skew (`CLOCK_SKEW_ALLOWANCE`, fixed bound: at most 2 minutes); expiry is
 enforced by both the control plane and the connector, so one wrong clock cannot
 extend access past the other's view (G4, G9).
 
+### T18. Attacks on built-in accounts
+
+- **Guessing and stuffing.** A password alone never signs in (G20), so a
+  guessed or leaked password is not enough. Five failures in a row (passwords
+  or codes) lock the account for 15 minutes, failures from one source address
+  are limited across all accounts, an unknown username and a wrong password
+  get the same answer after the same password-hashing work, and every failure
+  is audited (G13). Passwords must be at least 12 characters and not the
+  username.
+- **Database theft.** Passwords are PBKDF2-HMAC-SHA256 hashes with 600,000
+  iterations and a per-password salt, and each records its iteration count so
+  it can be raised; authenticator secrets are sealed under the key-encryption
+  key, which belongs on separate storage; recovery codes and setup links are
+  stored only as digests. A stolen database without the key-encryption key
+  yields no authenticator secret.
+- **Code replay.** Each authenticator time step is accepted once per account,
+  atomically; recovery codes are single use.
+- **Sign-in tampering.** Each sign-in is bound to the browser that started it
+  by a host-only, HttpOnly, SameSite=Strict cookie, its forms are refused from
+  other origins and its pages cannot be framed; each step moves it forward
+  once. The code at the end goes only to the redirect URI the client
+  registered with PKCE, exactly as after an IdP sign-in.
+- **Setup links and resets.** A setup link is single use, expires after 72
+  hours and only sets a password; the authenticator is enrolled at the first
+  sign-in. Whoever intercepts an unused link can set the password and enroll
+  their own authenticator, so admins deliver links over a channel they trust.
+  A reset clears the password, authenticator and recovery codes and revokes
+  every session (G9). The bootstrap admin's password file is read once, on the
+  first start that finds no built-in account, and never again.
+- **Offboarding.** Disabling or deleting an account, or removing it from a
+  group, takes effect through the revocation path within 10 seconds (G9).
+  Accounts declared in the policy directory are created, changed and deleted
+  only there (G19), and leaving it deletes them the same way.
+
+Residual risk: TOTP can be phished by a page that relays the user's password
+and code in real time; passkeys, which bind to the origin, arrive later.
+
 ## 6. Accepted risks
 
 - Relays see connection metadata (T1).
@@ -403,6 +459,12 @@ extend access past the other's view (G4, G9).
   T10).
 - An IdP without shared signals or SCIM leaves a lag bounded by the
   certificate lifetime until polling arrives in v1.x (T6).
+- Authenticator codes can be phished in real time until passkeys arrive, and
+  anyone who knows a username can lock its account for 15 minutes by failing
+  on purpose; an admin can unlock it (T18).
+- The per-source limit on failed sign-ins is kept in memory, so a restart
+  clears it; the per-account lockout is stored and survives (T18).
+- Google sign-ins report neither MFA nor when the user authenticated (T6).
 
 ## 7. Open items
 
@@ -418,3 +480,5 @@ extend access past the other's view (G4, G9).
 | Replace the M1 cargo-vet exemptions with audits, imported audits or reviewed publisher trust ([dependencies.md](dependencies.md#4-audit-sources-and-trust-decisions)) | M4 |
 | Release signing, provenance and reproducible-build checks | M4 |
 | External security audit of the design and implementation | M4 |
+| Passkeys (WebAuthn) for built-in accounts, as a phishing-resistant second factor and later instead of passwords | after M1 |
+| Share the per-source sign-in limit across control-plane replicas once PostgreSQL brings high availability | with PostgreSQL |

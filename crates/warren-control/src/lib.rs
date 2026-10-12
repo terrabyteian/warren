@@ -1,12 +1,14 @@
 //! The control plane role.
 //!
-//! Identity brokering with the organization's IdP, device registration and
-//! approval, certificate issuance, policy compilation and distribution,
-//! revocation push, audit, and the admin API that serves the console.
+//! Identity: built-in accounts with mandatory MFA and brokering with the
+//! organization's IdP; device registration and approval, certificate
+//! issuance, policy compilation and distribution, revocation push, audit,
+//! and the admin API that serves the console.
 //!
 //! [`ControlPlane::start`] runs everything on the current tokio runtime;
 //! [`run`] is the blocking entry point behind `warren control-plane`.
 
+pub mod accounts;
 pub mod admin;
 pub mod api;
 pub mod app;
@@ -16,6 +18,7 @@ pub mod config;
 pub mod console;
 pub mod log;
 pub mod oidc;
+mod signin;
 pub mod store;
 mod stream;
 pub mod web;
@@ -35,8 +38,9 @@ use warren_core::keys::{SigningKey, sha256};
 use warren_core::params::INFRA_CERT_LIFETIME;
 
 use crate::app::App;
-use crate::audit::Actor;
+use crate::audit::{Activity, Actor};
 use crate::authority::{Authority, Kek};
+use crate::config::IdpKind;
 use crate::config::{Config, TlsFiles};
 use crate::store::Store;
 use crate::web::ServerCert;
@@ -200,8 +204,12 @@ impl ControlPlane {
         let kek = Kek::load_or_create(&config.kek_file)?;
         let store = Store::open(&config.database).await?;
         let authority = Authority::load_or_create(&store, &kek, &config.trust_domain).await?;
-        drop(kek);
-        let idp = oidc::Provider::new(&config.idp, config.clock_skew)?;
+        let idp = config
+            .idp
+            .as_ref()
+            .map(|i| oidc::Provider::new(i, config.clock_skew))
+            .transpose()?;
+        warn_about_idp(&config);
         let sink = match (sink, &config.audit_file) {
             (Some(sink), _) => sink,
             (None, Some(path)) => audit::Sink::file(path)?,
@@ -211,7 +219,10 @@ impl ControlPlane {
             .init_setting("control_plane_id", &store::new_id("cp")?)
             .await?;
         let (latest, _) = store.event_bounds().await?;
-        let app = Arc::new(App::new(config, store, authority, idp, sink, id, latest));
+        let app = Arc::new(App::new(
+            config, store, authority, kek, idp, sink, id, latest,
+        ));
+        bootstrap_admin(&app).await?;
         ControlPlane::serve(app).await
     }
 
@@ -384,6 +395,99 @@ impl ControlPlane {
         }
         self.app.store.close().await;
     }
+}
+
+/// Points out IdP setups that work but are probably not what was meant.
+fn warn_about_idp(config: &Config) {
+    let Some(idp) = config.idp.as_ref().filter(|i| i.kind == IdpKind::Google) else {
+        return;
+    };
+    if idp.hosted_domain.is_none() && idp.allowed_emails.is_empty() {
+        log::warn(
+            "idp",
+            "idp type google has no hostedDomain or allowedEmails, so any Google account with a verified email can sign in and enroll devices; such users reach nothing unless policy names them",
+        );
+    }
+    let host = &config.public_host;
+    if [
+        ".local",
+        ".lan",
+        ".internal",
+        ".home.arpa",
+        ".localdomain",
+        ".test",
+    ]
+    .iter()
+    .any(|suffix| host.ends_with(suffix))
+    {
+        log::warn(
+            "idp",
+            &format!(
+                "Google accepts redirect URIs only on a public top-level domain or localhost, so {host} will be refused; give publicUrl a name under a public domain (it need not be reachable from the internet)"
+            ),
+        );
+    }
+}
+
+/// Creates the first admin from the mounted password file, once: on the
+/// first start that finds no built-in account. Later starts never read the
+/// file again, so deleting the admin never brings it back.
+async fn bootstrap_admin(app: &App) -> Result<(), Error> {
+    let Some(admin) = &app.config.local_accounts.bootstrap_admin else {
+        return Ok(());
+    };
+    if app.store.setting("bootstrap_admin").await?.is_some() {
+        return Ok(());
+    }
+    if app.store.has_local_accounts().await? {
+        app.store.init_setting("bootstrap_admin", "skipped").await?;
+        log::info(
+            "accounts",
+            "built-in accounts already exist, so no bootstrap admin was created; the password file is not read",
+        );
+        return Ok(());
+    }
+    let path = &admin.password_file;
+    let text =
+        zeroize::Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+            Error::Config(format!("bootstrap admin password {}: {e}", path.display()))
+        })?);
+    let password = zeroize::Zeroizing::new(text.trim_end_matches(['\n', '\r']).to_owned());
+    accounts::check_new_password(&password, &admin.username)
+        .map_err(|e| Error::Config(format!("bootstrap admin password {}: {e}", path.display())))?;
+    let hash = app.hash_password(password).await?;
+    let user = app
+        .store
+        .create_local_user(
+            &admin.username,
+            admin.email.as_deref(),
+            None,
+            &admin.groups,
+            Some(&hash),
+            None,
+        )
+        .await?;
+    app.store.init_setting("bootstrap_admin", &user.id).await?;
+    let mut r = audit::record(
+        Activity::AccountCreate,
+        true,
+        &Actor::System,
+        "bootstrap admin created from the mounted password file",
+    );
+    r.insert(
+        "user".into(),
+        serde_json::json!({ "uid": user.id, "name": admin.username, "groups": admin.groups }),
+    );
+    app.audit(r);
+    log::info_with(
+        "accounts",
+        "created the bootstrap admin; it sets up an authenticator app at first sign-in, and the password file is no longer read",
+        &[
+            ("username", &admin.username),
+            ("password_file", &path.display().to_string()),
+        ],
+    );
+    Ok(())
 }
 
 fn log_reload(result: Result<bool, Error>) {

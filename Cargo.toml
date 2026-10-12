@@ -27,6 +27,7 @@ http-body-util = { version = "=0.1.5", default-features = false }
 hyper = { version = "=1.11.1", default-features = false, features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio", "server", "server-auto", "http1", "http2"] }
 libc = { version = "=0.2.190", default-features = false, features = ["std"] }
+qrcode = { version = "=0.14.1", default-features = false }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
 rustls-native-certs = { version = "=0.8.4", default-features = false }

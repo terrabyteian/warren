@@ -96,8 +96,17 @@ pub fn stream(content_type: &'static str, rx: mpsc::Receiver<Bytes>) -> Response
 
 /// A 302 redirect.
 pub fn redirect(location: &str) -> Response<Body> {
+    redirect_with(StatusCode::FOUND, location)
+}
+
+/// A 303 redirect, after a form is posted.
+pub fn see_other(location: &str) -> Response<Body> {
+    redirect_with(StatusCode::SEE_OTHER, location)
+}
+
+fn redirect_with(status: StatusCode, location: &str) -> Response<Body> {
     let mut resp = Response::new(full(Bytes::new()));
-    *resp.status_mut() = StatusCode::FOUND;
+    *resp.status_mut() = status;
     match HeaderValue::from_str(location) {
         Ok(v) => {
             resp.headers_mut().insert(LOCATION, v);

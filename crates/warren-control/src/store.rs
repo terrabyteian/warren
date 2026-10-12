@@ -6,6 +6,7 @@
 //! that reduce access commit together with the revocation event that
 //! announces them, so an event exists exactly when the change does.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -19,13 +20,28 @@ use warren_core::events::{Event, EventBody};
 use warren_core::join::JoinToken;
 use warren_core::keys::{hex, random_bytes};
 use warren_core::policy_bundle::{Revocations, RevokedCertificate};
+use warren_policy::model::LOCAL_PREFIX;
 
 use crate::Error;
+use crate::accounts::{LOCAL_ISSUER, LOCKOUT_SECONDS, MAX_FAILED_ATTEMPTS};
 
 type Tx<'a> = Transaction<'a, Sqlite>;
 
 fn db(e: sqlx::Error) -> Error {
     Error::Store(e.to_string())
+}
+
+/// A built-in account's row with its username and unused recovery codes,
+/// followed by `$rest`.
+macro_rules! local_account_select {
+    ($rest:literal) => {
+        concat!(
+            "SELECT a.*, u.subject AS username, \
+             (SELECT COUNT(*) FROM recovery_codes r WHERE r.user_id = a.user_id) AS recovery_codes \
+             FROM local_accounts a JOIN users u ON u.id = a.user_id ",
+            $rest
+        )
+    };
 }
 
 /// A new random ID with a type prefix, for example `u-3f9c0d2a71b4e8a6c5d1`.
@@ -34,23 +50,114 @@ pub fn new_id(prefix: &str) -> Result<String, Error> {
     Ok(format!("{prefix}-{}", hex(&bytes)))
 }
 
-/// A user, as the IdP last described them.
+/// A user: as the IdP last described them, or a built-in account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
     /// The warren user ID.
     pub id: String,
-    /// The IdP's issuer.
+    /// The IdP's issuer, or `local` for a built-in account.
     pub issuer: String,
-    /// The IdP's subject identifier.
+    /// The IdP's subject identifier, or a built-in account's username.
     pub subject: String,
-    /// The verified email, or empty.
+    /// The verified email (for a built-in account, the one an admin set),
+    /// or empty.
     pub email: String,
-    /// IdP groups.
+    /// The groups policy sees: the IdP's, then warren's own as
+    /// `local:<group>`.
     pub groups: Vec<String>,
     /// Disabled users can do nothing.
     pub disabled: bool,
     /// When the user last signed in, Unix seconds.
     pub last_auth_at: i64,
+    /// Whether this built-in account was deleted; it stays disabled.
+    pub deleted: bool,
+}
+
+impl User {
+    /// Whether this is a built-in account.
+    pub fn is_local(&self) -> bool {
+        self.issuer == LOCAL_ISSUER
+    }
+}
+
+/// Who manages a built-in account, a membership or an invite.
+pub const MANAGED_BY_API: &str = "api";
+/// Declared in the policy directory, and changed only there.
+pub const MANAGED_BY_CONFIG: &str = "config";
+
+/// A built-in account's credentials and state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAccount {
+    /// The user.
+    pub user_id: String,
+    /// The username.
+    pub username: String,
+    /// A name to show.
+    pub display_name: String,
+    /// The password hash, once a password is set.
+    pub password_hash: Option<String>,
+    /// The authenticator secret, sealed, once one is enrolled.
+    pub totp_secret: Option<String>,
+    /// The last authenticator time step accepted.
+    pub totp_last_step: i64,
+    /// Consecutive failed sign-ins.
+    pub failed_attempts: i64,
+    /// Locked until this time, Unix seconds (0 when not locked).
+    pub locked_until: i64,
+    /// `api` or `config`.
+    pub managed_by: String,
+    /// Unused recovery codes.
+    pub recovery_codes: i64,
+}
+
+/// A membership in one of warren's own groups.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Membership {
+    /// The group, without the `local:` prefix.
+    pub group: String,
+    /// The member.
+    pub user_id: String,
+    /// `api` or `config`.
+    pub managed_by: String,
+    /// The invite it came from, if any.
+    pub invited_email: Option<String>,
+}
+
+/// An invite to one of warren's own groups, waiting for its email.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Invite {
+    /// The group.
+    pub group: String,
+    /// The verified email it binds to.
+    pub email: String,
+    /// `api` or `config`.
+    pub managed_by: String,
+}
+
+/// Built-in accounts and groups as the policy directory declares them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DesiredAccounts {
+    /// `LocalUser` objects: username, email, display name.
+    pub users: Vec<(String, Option<String>, Option<String>)>,
+    /// `LocalGroup` objects: name, member usernames, member emails.
+    pub groups: Vec<(String, Vec<String>, Vec<String>)>,
+}
+
+/// What bringing the store in line with the policy directory did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Events committed (deleted users).
+    pub events: Vec<Event>,
+    /// Built-in accounts created.
+    pub created: Vec<String>,
+    /// Built-in accounts deleted.
+    pub deleted: Vec<String>,
+    /// Built-in accounts the policy directory took over from the API.
+    pub adopted: Vec<String>,
+    /// Whether anything a bundle carries changed.
+    pub changed: bool,
+    /// Problems worth an operator's attention.
+    pub warnings: Vec<String>,
 }
 
 /// An admin's change to a device.
@@ -178,8 +285,9 @@ pub struct Node {
     pub revoked_at: Option<i64>,
 }
 
-/// A sign-in waiting for the IdP's callback.
-#[derive(Debug, Clone)]
+/// A sign-in waiting for the IdP's callback, or going through the
+/// built-in account pages.
+#[derive(Debug, Clone, Default)]
 pub struct AuthRequest {
     /// Where the client wants the code.
     pub client_redirect_uri: String,
@@ -196,6 +304,15 @@ pub struct AuthRequest {
     /// Whether the IdP was asked to authenticate the user afresh
     /// (`prompt=login`).
     pub login: bool,
+    /// A hash of the cookie binding a built-in account sign-in to its
+    /// browser.
+    pub browser_hash: Option<String>,
+    /// The built-in account, once its password checked out.
+    pub local_user_id: Option<String>,
+    /// How far the built-in account sign-in got.
+    pub local_stage: Option<String>,
+    /// An authenticator secret being enrolled, sealed.
+    pub pending_secret: Option<String>,
 }
 
 /// A one-time sign-in code.
@@ -304,6 +421,13 @@ fn migrator() -> Migrator {
             "console".into(),
             MigrationType::Simple,
             include_str!("../migrations/0002_console.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            3,
+            "accounts".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0003_accounts.sql").into_sql_str(),
             false,
         ),
     ])
@@ -563,13 +687,45 @@ impl Store {
             groups: serde_json::from_str(&groups).unwrap_or_default(),
             disabled: row.try_get("disabled").map_err(db)?,
             last_auth_at: row.try_get("last_auth_at").map_err(db)?,
+            deleted: row
+                .try_get::<Option<i64>, _>("deleted_at")
+                .map_err(db)?
+                .is_some(),
         })
+    }
+
+    /// Adds warren's own groups to a user's IdP groups.
+    fn add_local_groups(user: &mut User, local: impl IntoIterator<Item = String>) {
+        user.groups
+            .extend(local.into_iter().map(|g| format!("{LOCAL_PREFIX}{g}")));
+    }
+
+    async fn read_user(conn: &mut SqliteConnection, id: &str) -> Result<Option<User>, Error> {
+        let row = sqlx::query("SELECT * FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(db)?;
+        let Some(row) = row else { return Ok(None) };
+        let mut user = Self::user_from_row(&row)?;
+        let local: Vec<String> = sqlx::query_scalar(
+            "SELECT group_name FROM group_members WHERE user_id = ? ORDER BY group_name",
+        )
+        .bind(id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db)?;
+        Self::add_local_groups(&mut user, local);
+        Ok(Some(user))
     }
 
     /// Records a sign-in: creates the user or updates their email and
     /// groups. Returns the user and whether anything policy depends on
     /// changed. A sign-in that removes groups also emits `bundle_updated`
     /// later, through the publisher.
+    ///
+    /// Invites for the sign-in's verified email are claimed in the same
+    /// transaction: their groups bind to this user's issuer and subject.
     pub async fn record_sign_in(
         &self,
         issuer: &str,
@@ -623,46 +779,100 @@ impl Store {
                 (id, true)
             }
         };
+        let claimed = if issuer != LOCAL_ISSUER && !email.is_empty() {
+            Self::claim_invites(&mut tx, &id, email).await?
+        } else {
+            false
+        };
         tx.commit().await.map_err(db)?;
         let user = self
             .user(&id)
             .await?
             .ok_or_else(|| Error::Internal("user vanished".into()))?;
-        Ok((user, changed))
+        Ok((user, changed || claimed))
+    }
+
+    /// Turns the invites for `email` into memberships of `user_id`.
+    async fn claim_invites(tx: &mut Tx<'_>, user_id: &str, email: &str) -> Result<bool, Error> {
+        let invites: Vec<(String, String)> = sqlx::query_as(
+            "DELETE FROM group_invites WHERE email = ? RETURNING group_name, managed_by",
+        )
+        .bind(email)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db)?;
+        let mut changed = false;
+        for (group, managed_by) in invites {
+            changed |= sqlx::query(
+                "INSERT INTO group_members (group_name, user_id, managed_by, invited_email, created_at) \
+                 VALUES (?, ?, ?, ?, ?) ON CONFLICT (group_name, user_id) DO NOTHING",
+            )
+            .bind(&group)
+            .bind(user_id)
+            .bind(&managed_by)
+            .bind(email)
+            .bind(clock::now_secs())
+            .execute(&mut **tx)
+            .await
+            .map_err(db)?
+            .rows_affected()
+                > 0;
+        }
+        Ok(changed)
     }
 
     /// A user by ID.
     pub async fn user(&self, id: &str) -> Result<Option<User>, Error> {
-        let row = sqlx::query("SELECT * FROM users WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db)?;
-        row.as_ref().map(Self::user_from_row).transpose()
+        Self::read_user(&mut *self.pool.acquire().await.map_err(db)?, id).await
     }
 
-    /// A user by ID, else by email, else by IdP subject. An email or subject
-    /// shared by several users matches none of them.
+    /// A user by ID, else by email, else by IdP subject or username;
+    /// `local:<username>` names a built-in account. An email or subject
+    /// shared by several users matches none of them. Deleted accounts are
+    /// found by ID only.
     pub async fn find_user(&self, key: &str) -> Result<Option<User>, Error> {
         if let Some(user) = self.user(key).await? {
             return Ok(Some(user));
         }
-        let by_email = sqlx::query("SELECT * FROM users WHERE email = ? AND email <> '' LIMIT 2")
+        let unique = |ids: Vec<String>| match ids.as_slice() {
+            [id] => Some(id.clone()),
+            _ => None,
+        };
+        let id = if let Some(username) = key.strip_prefix(LOCAL_PREFIX) {
+            unique(
+                sqlx::query_scalar(
+                    "SELECT id FROM users WHERE issuer = ? AND subject = ? AND deleted_at IS NULL",
+                )
+                .bind(LOCAL_ISSUER)
+                .bind(username)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db)?,
+            )
+        } else {
+            let by_email = sqlx::query_scalar(
+                "SELECT id FROM users WHERE email = ? AND email <> '' AND deleted_at IS NULL LIMIT 2",
+            )
             .bind(key.to_ascii_lowercase())
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
-        if let [row] = by_email.as_slice() {
-            return Self::user_from_row(row).map(Some);
-        }
-        let by_subject = sqlx::query("SELECT * FROM users WHERE subject = ? LIMIT 2")
-            .bind(key)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db)?;
-        match by_subject.as_slice() {
-            [row] => Self::user_from_row(row).map(Some),
-            _ => Ok(None),
+            match unique(by_email) {
+                Some(id) => Some(id),
+                None => unique(
+                    sqlx::query_scalar(
+                        "SELECT id FROM users WHERE subject = ? AND deleted_at IS NULL LIMIT 2",
+                    )
+                    .bind(key)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(db)?,
+                ),
+            }
+        };
+        match id {
+            Some(id) => self.user(&id).await,
+            None => Ok(None),
         }
     }
 
@@ -673,6 +883,7 @@ impl Store {
             "DELETE FROM auth_requests WHERE expires_at <= ?",
             "DELETE FROM auth_codes WHERE expires_at <= ?",
             "DELETE FROM console_sessions WHERE expires_at <= ?",
+            "DELETE FROM setup_tokens WHERE expires_at <= ?",
         ] {
             sqlx::query(sql)
                 .bind(now)
@@ -693,7 +904,25 @@ impl Store {
             .fetch_all(&mut *conn)
             .await
             .map_err(db)?;
-        rows.iter().map(Self::user_from_row).collect()
+        let links: Vec<(String, String)> = sqlx::query_as(
+            "SELECT user_id, group_name FROM group_members ORDER BY user_id, group_name",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db)?;
+        let mut local: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (user_id, group) in links {
+            local.entry(user_id).or_default().push(group);
+        }
+        rows.iter()
+            .map(|row| {
+                let mut user = Self::user_from_row(row)?;
+                if let Some(groups) = local.remove(&user.id) {
+                    Self::add_local_groups(&mut user, groups);
+                }
+                Ok(user)
+            })
+            .collect()
     }
 
     /// Disables or enables a user. Disabling commits a `user_disabled`
@@ -725,6 +954,870 @@ impl Store {
         Ok((changed, event))
     }
 
+    // Built-in accounts.
+
+    fn local_account_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<LocalAccount, Error> {
+        Ok(LocalAccount {
+            user_id: row.try_get("user_id").map_err(db)?,
+            username: row.try_get("username").map_err(db)?,
+            display_name: row.try_get("display_name").map_err(db)?,
+            password_hash: row.try_get("password_hash").map_err(db)?,
+            totp_secret: row.try_get("totp_secret").map_err(db)?,
+            totp_last_step: row.try_get("totp_last_step").map_err(db)?,
+            failed_attempts: row.try_get("failed_attempts").map_err(db)?,
+            locked_until: row.try_get("locked_until").map_err(db)?,
+            managed_by: row.try_get("managed_by").map_err(db)?,
+            recovery_codes: row.try_get("recovery_codes").map_err(db)?,
+        })
+    }
+
+    /// A built-in account by user ID.
+    pub async fn local_account(&self, user_id: &str) -> Result<Option<LocalAccount>, Error> {
+        let row = sqlx::query(local_account_select!("WHERE a.user_id = ?"))
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        row.as_ref().map(Self::local_account_from_row).transpose()
+    }
+
+    /// A built-in account by username.
+    pub async fn local_account_named(&self, username: &str) -> Result<Option<LocalAccount>, Error> {
+        let row = sqlx::query(local_account_select!(
+            "WHERE u.issuer = ? AND u.subject = ? AND u.deleted_at IS NULL"
+        ))
+        .bind(LOCAL_ISSUER)
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        row.as_ref().map(Self::local_account_from_row).transpose()
+    }
+
+    /// Every built-in account.
+    pub async fn local_accounts(&self) -> Result<Vec<LocalAccount>, Error> {
+        let rows = sqlx::query(local_account_select!("ORDER BY u.subject"))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        rows.iter().map(Self::local_account_from_row).collect()
+    }
+
+    /// Whether any built-in account exists.
+    pub async fn has_local_accounts(&self) -> Result<bool, Error> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_accounts")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(n > 0)
+    }
+
+    async fn insert_local_user(
+        tx: &mut Tx<'_>,
+        username: &str,
+        email: Option<&str>,
+        display_name: Option<&str>,
+        managed_by: &str,
+        password_hash: Option<&str>,
+    ) -> Result<String, Error> {
+        let taken: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE issuer = ? AND subject = ? AND deleted_at IS NULL",
+        )
+        .bind(LOCAL_ISSUER)
+        .bind(username)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?;
+        if taken.is_some() {
+            return Err(Error::Conflict(format!(
+                "a built-in account named {username} already exists"
+            )));
+        }
+        let id = new_id("u")?;
+        let now = clock::now_secs();
+        sqlx::query(
+            "INSERT INTO users (id, issuer, subject, email, groups_json, disabled, created_at, updated_at, last_auth_at) \
+             VALUES (?, ?, ?, ?, '[]', FALSE, ?, ?, 0)",
+        )
+        .bind(&id)
+        .bind(LOCAL_ISSUER)
+        .bind(username)
+        .bind(email.unwrap_or(""))
+        .bind(now)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?;
+        sqlx::query(
+            "INSERT INTO local_accounts (user_id, display_name, password_hash, totp_secret, totp_last_step, failed_attempts, locked_until, managed_by, created_at, updated_at) \
+             VALUES (?, ?, ?, NULL, 0, 0, 0, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(display_name.unwrap_or(""))
+        .bind(password_hash)
+        .bind(managed_by)
+        .bind(now)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?;
+        Ok(id)
+    }
+
+    async fn insert_setup_token(
+        tx: &mut Tx<'_>,
+        user_id: &str,
+        token_hash: &str,
+        expires_at: i64,
+    ) -> Result<(), Error> {
+        sqlx::query("INSERT INTO setup_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)")
+            .bind(token_hash)
+            .bind(user_id)
+            .bind(expires_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+
+    /// Creates a built-in account managed through the API, in warren's own
+    /// groups `groups`, with either a password (the bootstrap admin) or a
+    /// setup link's token hash and expiry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_local_user(
+        &self,
+        username: &str,
+        email: Option<&str>,
+        display_name: Option<&str>,
+        groups: &[String],
+        password_hash: Option<&str>,
+        setup: Option<(&str, i64)>,
+    ) -> Result<User, Error> {
+        let mut tx = self.begin().await?;
+        let id = Self::insert_local_user(
+            &mut tx,
+            username,
+            email,
+            display_name,
+            MANAGED_BY_API,
+            password_hash,
+        )
+        .await?;
+        for group in groups {
+            Self::insert_membership(&mut tx, group, &id, MANAGED_BY_API, None).await?;
+        }
+        if let Some((hash, expires_at)) = setup {
+            Self::insert_setup_token(&mut tx, &id, hash, expires_at).await?;
+        }
+        tx.commit().await.map_err(db)?;
+        self.user(&id)
+            .await?
+            .ok_or_else(|| Error::Internal("user vanished".into()))
+    }
+
+    /// Deletes a built-in account inside `tx`: it stays as a disabled row,
+    /// so its revocation stays in every bundle, with its username freed
+    /// and its credentials, memberships and pending codes gone. Commits a
+    /// `user_disabled` event if it was enabled. Returns `None` if there is
+    /// no such live account.
+    async fn delete_local_user_tx(
+        tx: &mut Tx<'_>,
+        user_id: &str,
+    ) -> Result<Option<Option<Event>>, Error> {
+        let was_disabled: Option<bool> = sqlx::query_scalar(
+            "SELECT disabled FROM users WHERE id = ? AND issuer = ? AND deleted_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(LOCAL_ISSUER)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?;
+        let Some(was_disabled) = was_disabled else {
+            return Ok(None);
+        };
+        let now = clock::now_secs();
+        sqlx::query(
+            "UPDATE users SET disabled = TRUE, deleted_at = ?, updated_at = ?, \
+             subject = 'deleted:' || id, email = '', groups_json = '[]' WHERE id = ?",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?;
+        for sql in [
+            "DELETE FROM local_accounts WHERE user_id = ?",
+            "DELETE FROM recovery_codes WHERE user_id = ?",
+            "DELETE FROM setup_tokens WHERE user_id = ?",
+            "DELETE FROM group_members WHERE user_id = ?",
+            "DELETE FROM auth_codes WHERE user_id = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(user_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(db)?;
+        }
+        let event = if was_disabled {
+            None
+        } else {
+            Some(
+                Self::append_event(
+                    tx,
+                    EventBody::UserDisabled {
+                        user_id: user_id.into(),
+                    },
+                )
+                .await?,
+            )
+        };
+        Ok(Some(event))
+    }
+
+    /// Deletes a built-in account (see [`Store::delete_local_user_tx`]).
+    /// Returns whether it existed, and the event committed with it.
+    pub async fn delete_local_user(&self, user_id: &str) -> Result<(bool, Option<Event>), Error> {
+        let mut tx = self.begin().await?;
+        let outcome = Self::delete_local_user_tx(&mut tx, user_id).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(match outcome {
+            Some(event) => (true, event),
+            None => (false, None),
+        })
+    }
+
+    /// Resets a built-in account's credentials: clears the password, the
+    /// authenticator, recovery codes, setup links and the lockout, revokes
+    /// every live session with a `session_revoked` event each, and stores a
+    /// new setup link. Returns `None` if there is no such account.
+    pub async fn reset_local_credentials(
+        &self,
+        user_id: &str,
+        token_hash: &str,
+        expires_at: i64,
+    ) -> Result<Option<Vec<Event>>, Error> {
+        let mut tx = self.begin().await?;
+        let now = clock::now_secs();
+        let r = sqlx::query(
+            "UPDATE local_accounts SET password_hash = NULL, totp_secret = NULL, totp_last_step = 0, \
+             failed_attempts = 0, locked_until = 0, updated_at = ? WHERE user_id = ?",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        if r.rows_affected() != 1 {
+            return Ok(None);
+        }
+        for sql in [
+            "DELETE FROM recovery_codes WHERE user_id = ?",
+            "DELETE FROM setup_tokens WHERE user_id = ?",
+            "DELETE FROM auth_codes WHERE user_id = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        Self::insert_setup_token(&mut tx, user_id, token_hash, expires_at).await?;
+        let sessions: Vec<String> = sqlx::query_scalar(
+            "UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ? RETURNING id",
+        )
+        .bind(now)
+        .bind(user_id)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        let mut events = Vec::new();
+        for session_id in sessions {
+            events
+                .push(Self::append_event(&mut tx, EventBody::SessionRevoked { session_id }).await?);
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(Some(events))
+    }
+
+    /// Lifts a built-in account's lockout. Returns whether it was locked.
+    pub async fn unlock_local_account(&self, user_id: &str) -> Result<bool, Error> {
+        let r = sqlx::query(
+            "UPDATE local_accounts SET failed_attempts = 0, locked_until = 0, updated_at = ? \
+             WHERE user_id = ? AND (locked_until > ? OR failed_attempts > 0)",
+        )
+        .bind(clock::now_secs())
+        .bind(user_id)
+        .bind(clock::now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// Counts a failed sign-in against a built-in account, locking it for
+    /// `LOCKOUT_SECONDS` once `MAX_FAILED_ATTEMPTS` failures in a row
+    /// accumulate. Returns whether this failure locked it.
+    pub async fn record_local_failure(&self, user_id: &str) -> Result<bool, Error> {
+        let mut tx = self.begin().await?;
+        let now = clock::now_secs();
+        let failures: Option<i64> = sqlx::query_scalar(
+            "UPDATE local_accounts SET failed_attempts = failed_attempts + 1, updated_at = ? \
+             WHERE user_id = ? RETURNING failed_attempts",
+        )
+        .bind(now)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let locked = failures.is_some_and(|n| n >= MAX_FAILED_ATTEMPTS);
+        if locked {
+            sqlx::query(
+                "UPDATE local_accounts SET failed_attempts = 0, locked_until = ? WHERE user_id = ?",
+            )
+            .bind(now + LOCKOUT_SECONDS)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(locked)
+    }
+
+    /// Records a completed sign-in with a built-in account: clears the
+    /// failure count, records when, and, for an authenticator code, its
+    /// time step, which must be later than the last one accepted. Returns
+    /// false if it was not (the code was replayed).
+    pub async fn record_local_success(
+        &self,
+        user_id: &str,
+        totp_step: Option<i64>,
+        now: i64,
+    ) -> Result<bool, Error> {
+        let mut tx = self.begin().await?;
+        let r = match totp_step {
+            Some(step) => sqlx::query(
+                "UPDATE local_accounts SET totp_last_step = ?, failed_attempts = 0, updated_at = ? \
+                 WHERE user_id = ? AND totp_last_step < ?",
+            )
+            .bind(step)
+            .bind(now)
+            .bind(user_id)
+            .bind(step),
+            None => sqlx::query(
+                "UPDATE local_accounts SET failed_attempts = 0, updated_at = ? WHERE user_id = ?",
+            )
+            .bind(now)
+            .bind(user_id),
+        }
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        if r.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE users SET last_auth_at = ?, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
+    /// Replaces a built-in account's password hash.
+    pub async fn set_password_hash(&self, user_id: &str, hash: &str) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE local_accounts SET password_hash = ?, updated_at = ? WHERE user_id = ?",
+        )
+        .bind(hash)
+        .bind(clock::now_secs())
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// Enrolls an authenticator (its sealed secret, and the time step of
+    /// the code that proved it) with new recovery codes, replacing any
+    /// left. Refuses, returning false, if one was enrolled meanwhile.
+    pub async fn enroll_totp(
+        &self,
+        user_id: &str,
+        sealed_secret: &str,
+        step: i64,
+        recovery_hashes: &[String],
+    ) -> Result<bool, Error> {
+        let mut tx = self.begin().await?;
+        let now = clock::now_secs();
+        let r = sqlx::query(
+            "UPDATE local_accounts SET totp_secret = ?, totp_last_step = ?, failed_attempts = 0, updated_at = ? \
+             WHERE user_id = ? AND totp_secret IS NULL",
+        )
+        .bind(sealed_secret)
+        .bind(step)
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        if r.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM recovery_codes WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        for hash in recovery_hashes {
+            sqlx::query("INSERT INTO recovery_codes (user_id, code_hash) VALUES (?, ?)")
+                .bind(user_id)
+                .bind(hash)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        sqlx::query("UPDATE users SET last_auth_at = ?, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
+    /// Spends a recovery code. Returns how many are left, or `None` if the
+    /// code is not one of the account's unused codes.
+    pub async fn use_recovery_code(&self, user_id: &str, hash: &str) -> Result<Option<i64>, Error> {
+        let mut tx = self.begin().await?;
+        let used = sqlx::query("DELETE FROM recovery_codes WHERE user_id = ? AND code_hash = ?")
+            .bind(user_id)
+            .bind(hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected()
+            == 1;
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM recovery_codes WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(used.then_some(left))
+    }
+
+    /// The account an unexpired setup link is for: (user ID, username).
+    pub async fn setup_link_account(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(String, String)>, Error> {
+        sqlx::query_as(
+            "SELECT t.user_id, u.subject FROM setup_tokens t JOIN users u ON u.id = t.user_id \
+             JOIN local_accounts a ON a.user_id = t.user_id \
+             WHERE t.token_hash = ? AND t.expires_at > ?",
+        )
+        .bind(token_hash)
+        .bind(clock::now_secs())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// Spends a setup link to set the account's password, and drops any
+    /// other link for it. Returns the user ID, or `None` if the link is
+    /// unknown, used or expired.
+    pub async fn complete_setup(
+        &self,
+        token_hash: &str,
+        password_hash: &str,
+    ) -> Result<Option<String>, Error> {
+        let mut tx = self.begin().await?;
+        let now = clock::now_secs();
+        let user_id: Option<String> = sqlx::query_scalar(
+            "DELETE FROM setup_tokens WHERE token_hash = ? AND expires_at > ? RETURNING user_id",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let Some(user_id) = user_id else {
+            return Ok(None);
+        };
+        sqlx::query("DELETE FROM setup_tokens WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let r = sqlx::query(
+            "UPDATE local_accounts SET password_hash = ?, failed_attempts = 0, locked_until = 0, updated_at = ? \
+             WHERE user_id = ?",
+        )
+        .bind(password_hash)
+        .bind(now)
+        .bind(&user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        if r.rows_affected() != 1 {
+            return Ok(None);
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(Some(user_id))
+    }
+
+    // Warren's own groups.
+
+    async fn insert_membership(
+        tx: &mut Tx<'_>,
+        group: &str,
+        user_id: &str,
+        managed_by: &str,
+        invited_email: Option<&str>,
+    ) -> Result<bool, Error> {
+        Ok(sqlx::query(
+            "INSERT INTO group_members (group_name, user_id, managed_by, invited_email, created_at) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT (group_name, user_id) DO NOTHING",
+        )
+        .bind(group)
+        .bind(user_id)
+        .bind(managed_by)
+        .bind(invited_email)
+        .bind(clock::now_secs())
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?
+        .rows_affected()
+            > 0)
+    }
+
+    /// Every membership in warren's own groups.
+    pub async fn memberships(&self) -> Result<Vec<Membership>, Error> {
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT group_name, user_id, managed_by, invited_email FROM group_members ORDER BY group_name, user_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|(group, user_id, managed_by, invited_email)| Membership {
+                group,
+                user_id,
+                managed_by,
+                invited_email,
+            })
+            .collect())
+    }
+
+    /// Every pending invite.
+    pub async fn invites(&self) -> Result<Vec<Invite>, Error> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT group_name, email, managed_by FROM group_invites ORDER BY email, group_name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|(group, email, managed_by)| Invite {
+                group,
+                email,
+                managed_by,
+            })
+            .collect())
+    }
+
+    /// Sets the groups a user is in through the API to exactly `groups`;
+    /// memberships the policy directory manages are left alone. Returns
+    /// whether anything changed.
+    pub async fn set_user_groups(&self, user_id: &str, groups: &[String]) -> Result<bool, Error> {
+        let mut tx = self.begin().await?;
+        let current: Vec<String> = sqlx::query_scalar(
+            "SELECT group_name FROM group_members WHERE user_id = ? AND managed_by = ?",
+        )
+        .bind(user_id)
+        .bind(MANAGED_BY_API)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        let mut changed = false;
+        for group in current.iter().filter(|g| !groups.contains(g)) {
+            sqlx::query("DELETE FROM group_members WHERE group_name = ? AND user_id = ?")
+                .bind(group)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            changed = true;
+        }
+        for group in groups {
+            changed |=
+                Self::insert_membership(&mut tx, group, user_id, MANAGED_BY_API, None).await?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(changed)
+    }
+
+    /// Sets the API's invites for `email` to exactly `groups`.
+    pub async fn set_invites(&self, email: &str, groups: &[String]) -> Result<(), Error> {
+        let mut tx = self.begin().await?;
+        let current: Vec<String> = sqlx::query_scalar(
+            "SELECT group_name FROM group_invites WHERE email = ? AND managed_by = ?",
+        )
+        .bind(email)
+        .bind(MANAGED_BY_API)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        for group in current.iter().filter(|g| !groups.contains(g)) {
+            sqlx::query("DELETE FROM group_invites WHERE group_name = ? AND email = ?")
+                .bind(group)
+                .bind(email)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        for group in groups {
+            sqlx::query(
+                "INSERT INTO group_invites (group_name, email, managed_by, created_at) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (group_name, email) DO NOTHING",
+            )
+            .bind(group)
+            .bind(email)
+            .bind(MANAGED_BY_API)
+            .bind(clock::now_secs())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
+
+    /// Brings built-in accounts and warren's own groups in line with the
+    /// policy directory, in one transaction. Accounts it declares are
+    /// created (without credentials: an admin issues each a setup link) or
+    /// taken over from the API and updated; accounts it declared before and
+    /// no longer does are deleted, with their revocation. Groups it
+    /// declares are its alone: their members are exactly its usernames and
+    /// the IdP users its emails have bound to, the rest of its emails wait
+    /// as invites, and API memberships of those groups are removed.
+    pub async fn reconcile_accounts(&self, desired: &DesiredAccounts) -> Result<Reconciled, Error> {
+        let mut tx = self.begin().await?;
+        let mut out = Reconciled::default();
+        let existing: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT a.user_id, u.subject, a.managed_by FROM local_accounts a JOIN users u ON u.id = a.user_id",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        let now = clock::now_secs();
+        let mut ids: BTreeMap<String, String> = BTreeMap::new();
+        for (username, email, display_name) in &desired.users {
+            match existing.iter().find(|(_, name, _)| name == username) {
+                Some((id, _, managed_by)) => {
+                    if managed_by != MANAGED_BY_CONFIG {
+                        out.adopted.push(username.clone());
+                    }
+                    sqlx::query(
+                        "UPDATE local_accounts SET managed_by = ?, display_name = ?, updated_at = ? WHERE user_id = ?",
+                    )
+                    .bind(MANAGED_BY_CONFIG)
+                    .bind(display_name.as_deref().unwrap_or(""))
+                    .bind(now)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                    out.changed |= sqlx::query(
+                        "UPDATE users SET email = ?, updated_at = ? WHERE id = ? AND email <> ?",
+                    )
+                    .bind(email.as_deref().unwrap_or(""))
+                    .bind(now)
+                    .bind(id)
+                    .bind(email.as_deref().unwrap_or(""))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?
+                    .rows_affected()
+                        > 0;
+                    ids.insert(username.clone(), id.clone());
+                }
+                None => {
+                    let id = Self::insert_local_user(
+                        &mut tx,
+                        username,
+                        email.as_deref(),
+                        display_name.as_deref(),
+                        MANAGED_BY_CONFIG,
+                        None,
+                    )
+                    .await?;
+                    out.created.push(username.clone());
+                    out.changed = true;
+                    ids.insert(username.clone(), id);
+                }
+            }
+        }
+        for (id, username, managed_by) in &existing {
+            if managed_by == MANAGED_BY_CONFIG && !ids.contains_key(username) {
+                if let Some(event) = Self::delete_local_user_tx(&mut tx, id).await? {
+                    out.events.extend(event);
+                    out.deleted.push(username.clone());
+                    out.changed = true;
+                }
+            } else if !ids.contains_key(username) {
+                ids.insert(username.clone(), id.clone());
+            }
+        }
+
+        let declared: BTreeSet<&str> = desired.groups.iter().map(|(g, _, _)| g.as_str()).collect();
+        let memberships: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT group_name, user_id, managed_by, invited_email FROM group_members",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        let invites: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT group_name, email, managed_by FROM group_invites")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db)?;
+        let mut keep: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut keep_invites: BTreeSet<(String, String)> = BTreeSet::new();
+        for (group, usernames, emails) in &desired.groups {
+            for username in usernames {
+                match ids.get(username) {
+                    Some(id) => {
+                        keep.insert((group.clone(), id.clone()));
+                    }
+                    None => out.warnings.push(format!(
+                        "LocalGroup {group} lists {username}, which is not a built-in account"
+                    )),
+                }
+            }
+            for email in emails {
+                let bound = memberships.iter().find(|(g, _, m, e)| {
+                    g == group && m == MANAGED_BY_CONFIG && e.as_deref() == Some(email.as_str())
+                });
+                if let Some((_, user_id, _, _)) = bound {
+                    keep.insert((group.clone(), user_id.clone()));
+                    continue;
+                }
+                let users: Vec<String> = sqlx::query_scalar(
+                    "SELECT id FROM users WHERE email = ? AND issuer <> ? AND deleted_at IS NULL LIMIT 2",
+                )
+                .bind(email)
+                .bind(LOCAL_ISSUER)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db)?;
+                match users.as_slice() {
+                    [user_id] => {
+                        // An API membership of a declared group gives way.
+                        sqlx::query(
+                            "DELETE FROM group_members WHERE group_name = ? AND user_id = ? AND managed_by <> ?",
+                        )
+                        .bind(group)
+                        .bind(user_id)
+                        .bind(MANAGED_BY_CONFIG)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                        out.changed |= Self::insert_membership(
+                            &mut tx,
+                            group,
+                            user_id,
+                            MANAGED_BY_CONFIG,
+                            Some(email),
+                        )
+                        .await?;
+                        keep.insert((group.clone(), user_id.clone()));
+                    }
+                    [] => {
+                        keep_invites.insert((group.clone(), email.clone()));
+                    }
+                    _ => {
+                        out.warnings.push(format!(
+                            "LocalGroup {group} lists {email}, which several IdP users have; it binds to none of them"
+                        ));
+                        keep_invites.insert((group.clone(), email.clone()));
+                    }
+                }
+            }
+        }
+        // Remove memberships the policy directory no longer declares, and
+        // any other membership of a group it declares.
+        for (group, user_id, managed_by, _) in &memberships {
+            let owned = managed_by == MANAGED_BY_CONFIG || declared.contains(group.as_str());
+            if owned && !keep.contains(&(group.clone(), user_id.clone())) {
+                out.changed |=
+                    sqlx::query("DELETE FROM group_members WHERE group_name = ? AND user_id = ?")
+                        .bind(group)
+                        .bind(user_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?
+                        .rows_affected()
+                        > 0;
+            }
+        }
+        for (group, user_id) in &keep {
+            if !memberships
+                .iter()
+                .any(|(g, u, m, _)| g == group && u == user_id && m == MANAGED_BY_CONFIG)
+            {
+                sqlx::query(
+                    "DELETE FROM group_members WHERE group_name = ? AND user_id = ? AND managed_by <> ?",
+                )
+                .bind(group)
+                .bind(user_id)
+                .bind(MANAGED_BY_CONFIG)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+                out.changed |=
+                    Self::insert_membership(&mut tx, group, user_id, MANAGED_BY_CONFIG, None)
+                        .await?;
+            }
+        }
+        for (group, email, managed_by) in &invites {
+            let owned = managed_by == MANAGED_BY_CONFIG || declared.contains(group.as_str());
+            if owned && !keep_invites.contains(&(group.clone(), email.clone())) {
+                sqlx::query("DELETE FROM group_invites WHERE group_name = ? AND email = ?")
+                    .bind(group)
+                    .bind(email)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+            }
+        }
+        for (group, email) in &keep_invites {
+            sqlx::query(
+                "INSERT INTO group_invites (group_name, email, managed_by, created_at) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (group_name, email) DO UPDATE SET managed_by = excluded.managed_by",
+            )
+            .bind(group)
+            .bind(email)
+            .bind(MANAGED_BY_CONFIG)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(out)
+    }
+
     // Sign-in.
 
     /// Stores a sign-in in flight.
@@ -735,8 +1828,8 @@ impl Store {
         expires_at: i64,
     ) -> Result<(), Error> {
         sqlx::query(
-            "INSERT INTO auth_requests (state_hash, client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, created_at, login, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO auth_requests (state_hash, client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, created_at, login, browser_hash, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(state_hash)
         .bind(&r.client_redirect_uri)
@@ -746,6 +1839,7 @@ impl Store {
         .bind(&r.idp_verifier)
         .bind(r.created_at)
         .bind(r.login)
+        .bind(&r.browser_hash)
         .bind(expires_at)
         .execute(&self.pool)
         .await
@@ -753,12 +1847,27 @@ impl Store {
         Ok(())
     }
 
+    fn auth_request_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuthRequest, Error> {
+        Ok(AuthRequest {
+            client_redirect_uri: row.try_get("client_redirect_uri").map_err(db)?,
+            client_state: row.try_get("client_state").map_err(db)?,
+            client_challenge: row.try_get("client_challenge").map_err(db)?,
+            nonce: row.try_get("nonce").map_err(db)?,
+            idp_verifier: row.try_get("idp_verifier").map_err(db)?,
+            created_at: row.try_get("created_at").map_err(db)?,
+            login: row.try_get("login").map_err(db)?,
+            browser_hash: row.try_get("browser_hash").map_err(db)?,
+            local_user_id: row.try_get("local_user_id").map_err(db)?,
+            local_stage: row.try_get("local_stage").map_err(db)?,
+            pending_secret: row.try_get("pending_secret").map_err(db)?,
+        })
+    }
+
     /// Takes (and deletes) an unexpired sign-in in flight: each one is
     /// usable once.
     pub async fn take_auth_request(&self, state_hash: &str) -> Result<Option<AuthRequest>, Error> {
-        let row: Option<(String, String, String, String, String, i64, bool)> = sqlx::query_as(
-            "DELETE FROM auth_requests WHERE state_hash = ? AND expires_at > ? \
-             RETURNING client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, created_at, login",
+        let row = sqlx::query(
+            "DELETE FROM auth_requests WHERE state_hash = ? AND expires_at > ? RETURNING *",
         )
         .bind(state_hash)
         .bind(clock::now_secs())
@@ -770,25 +1879,47 @@ impl Store {
             .execute(&self.pool)
             .await
             .map_err(db)?;
-        Ok(row.map(
-            |(
-                client_redirect_uri,
-                client_state,
-                client_challenge,
-                nonce,
-                idp_verifier,
-                created_at,
-                login,
-            )| AuthRequest {
-                client_redirect_uri,
-                client_state,
-                client_challenge,
-                nonce,
-                idp_verifier,
-                created_at,
-                login,
-            },
-        ))
+        row.as_ref().map(Self::auth_request_from_row).transpose()
+    }
+
+    /// An unexpired sign-in in flight, left in place.
+    pub async fn auth_request(&self, state_hash: &str) -> Result<Option<AuthRequest>, Error> {
+        let row =
+            sqlx::query("SELECT * FROM auth_requests WHERE state_hash = ? AND expires_at > ?")
+                .bind(state_hash)
+                .bind(clock::now_secs())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?;
+        row.as_ref().map(Self::auth_request_from_row).transpose()
+    }
+
+    /// Moves a built-in account sign-in from stage `from` to `to`, for
+    /// `user_id`, with the authenticator secret being enrolled. Returns
+    /// false when the sign-in is gone or is no longer at `from`, so each
+    /// step happens once.
+    pub async fn advance_auth_request(
+        &self,
+        state_hash: &str,
+        from: Option<&str>,
+        to: &str,
+        user_id: &str,
+        pending_secret: Option<&str>,
+    ) -> Result<bool, Error> {
+        let r = sqlx::query(
+            "UPDATE auth_requests SET local_stage = ?, local_user_id = ?, pending_secret = ? \
+             WHERE state_hash = ? AND expires_at > ? AND local_stage IS ?",
+        )
+        .bind(to)
+        .bind(user_id)
+        .bind(pending_secret)
+        .bind(state_hash)
+        .bind(clock::now_secs())
+        .bind(from)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(r.rows_affected() == 1)
     }
 
     /// Stores a one-time sign-in code.

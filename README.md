@@ -10,7 +10,8 @@ through outbound-only connectors and self-hosted relays.
 > audit records, the HTTP/2 fallback and the 1280-byte MTU floor
 > ([scripts/e2e-kernel.sh](scripts/e2e-kernel.sh),
 > [docs/benchmarks.md](docs/benchmarks.md)). The control plane runs too:
-> sign-in through any OpenID Connect IdP, device enrollment and approval,
+> built-in accounts with a password and an authenticator app, sign-in through
+> Google or any OpenID Connect IdP, device enrollment and approval,
 > short-lived user+device certificates, policy compiled to Cedar and
 > published as signed bundles, the revocation push channel, and audit, with
 > a basic web console for admins and users ([docs/console.md](docs/console.md)). Until
@@ -27,7 +28,8 @@ through outbound-only connectors and self-hosted relays.
   user on one approved device, checked against default-deny policy at the
   connector, and audited. Revocation cuts live connections within 10 seconds.
 - **Effortless to use.** A signed macOS menu-bar app (Windows and Linux next):
-  enter your organization's URL, sign in once through SSO in the browser, and
+  enter your organization's URL, sign in once in the browser (with a warren
+  account or your organization's SSO), and
   internal apps just work. When something is blocked, it tells you exactly why.
 - **Kubernetes-native.** Connectors run as an operator, apps and policies are
   CRDs, and `kubectl` access is brokered through your IdP groups with no

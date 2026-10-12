@@ -14,7 +14,7 @@ publish.workspace = true
 # control-plane, console or Kubernetes crates (scripts/check-closure.sh).
 [features]
 default = ["control-plane", "relay", "connector", "client"]
-control-plane = ["dep:warren-control"]
+control-plane = ["dep:warren-control", "dep:serde_json"]
 relay = ["dep:warren-relay", "dep:warren-core", "dep:warren-masque", "dep:rustls"]
 connector = ["dep:warren-connector", "dep:warren-core", "dep:warren-masque", "dep:rustls"]
 client = ["dep:warren-client", "dep:warren-core", "dep:warren-masque", "dep:serde_json", "dep:libc"]

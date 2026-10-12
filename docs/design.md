@@ -82,7 +82,8 @@ proposal that needs one of them belongs in another project.
 - TLS interception by default, or any content inspection of private-app
   traffic.
 - A vendor cloud, phone-home telemetry, or a license server.
-- Being an identity provider (warren never stores passwords), an MDM (warren
+- Being a general identity provider (warren's built-in accounts sign people
+  in to warren only, and are never offered to other applications), an MDM (warren
   reads posture, it does not manage devices), or an endpoint security agent.
 - Opaque risk scores. Every decision is explained by named rules and named
   conditions.
@@ -125,6 +126,7 @@ tunable is a named parameter in [protocol.md](protocol.md#14-named-parameters).
 | **G17** Small, audited supply chain | Direct dependencies come from an explicit allowlist; every crate is pinned, vendored, and vetted; data-path builds never link console, operator or Kubernetes crates. |
 | **G18** Self-hosted | warren depends on no vendor-operated service and can run air-gapped. |
 | **G19** Code is the source of truth | Objects managed from Git or CRDs are read-only in the UI, and every change, wherever it comes from, is audited. |
+| **G20** No sign-in on a password alone | A built-in account signs in only with its password and a second factor: an authenticator code (TOTP) or a single-use recovery code; an account without an authenticator enrolls one before its first sign-in completes. Passwords are stored only as slow salted hashes and authenticator secrets only sealed under the deployment key-encryption key. Failed attempts lock the account and are limited per source. |
 
 ## 5. Architecture
 
@@ -132,7 +134,7 @@ tunable is a named parameter in [protocol.md](protocol.md#14-named-parameters).
 
 | Component | What it does | Where it runs |
 | --- | --- | --- |
-| **Control plane** | Brokers sign-in with the IdP, registers and approves devices, issues certificates, evaluates posture reports, compiles and distributes policy, pushes revocations, serves the admin API, CLI endpoint and console, stores audit for search. The root of trust. | `warren control-plane`, on Kubernetes or any host. |
+| **Control plane** | Signs in built-in accounts and brokers sign-in with the IdP, registers and approves devices, issues certificates, evaluates posture reports, compiles and distributes policy, pushes revocations, serves the admin API, CLI endpoint and console, stores audit for search. The root of trust. | `warren control-plane`, on Kubernetes or any host. |
 | **Relay** | Stateless rendezvous that clients and connectors both dial out to. Splices client sessions to connector sessions and forwards ciphertext. Also hosts clientless HTTP(S) access. | `warren relay`, anywhere reachable on 443. |
 | **Connector** | Terminates end-to-end sessions from clients, admits each flow against policy, resolves internal names, and forwards traffic to private destinations. | `warren connector`, standalone or in-cluster via the operator. |
 | **Client** | Native shell (Swift on macOS) around the shared Rust core: sign-in, device key, posture, DNS, and the packet tunnel. | macOS menu-bar app with a NetworkExtension system extension. |
@@ -205,7 +207,9 @@ a separate binary so the Kubernetes client libraries never enter the data path
   sees plaintext for its own apps and nothing else.
 - **The control plane** is the root of trust: it issues every identity and
   signs every policy. It never sees application traffic.
-- **The IdP** is trusted to authenticate users and assert group membership.
+- **The IdP** is trusted to authenticate its users and assert their IdP
+  group membership, never membership in warren's own groups or a built-in
+  account's identity.
 - **The Kubernetes API server** trusts warren's Kubernetes broker to
   impersonate users, within the limits in [section 9](#9-kubernetes).
 
@@ -215,8 +219,9 @@ a separate binary so the Kubernetes client libraries never enter the data path
 
 The client is where warren is felt, so its behavior is part of the design.
 
-- **Sign in once.** The user enters the organization URL and signs in through
-  SSO in the system browser (OAuth 2.0 for native apps, RFC 8252). There are no
+- **Sign in once.** The user enters the organization URL and signs in in the
+  system browser (OAuth 2.0 for native apps, RFC 8252), through the
+  organization's IdP or with a built-in warren account. There are no
   configuration files, keys or certificates to handle. A managed deployment can
   preset the URL and pre-approve the system extension through an MDM profile.
 - **Always on.** The tunnel survives sleep, wake and network changes without
@@ -260,14 +265,46 @@ Non-web clientless access (SSH, RDP, VNC in the browser) comes later.
 
 ### 7.1 Users
 
-- Any OpenID Connect IdP. SAML IdPs connect through an OIDC bridge.
-- Group membership comes from SCIM provisioning (or token claims where SCIM is
-  unavailable) and changes apply through the revocation path (G9).
+Users come from two sources, which coexist in one deployment: warren's own
+built-in accounts, so a deployment needs nothing else to start, and the
+organization's identity provider. Either is optional, but not both.
+
+- **Built-in accounts** (issuer `local`) are created through the admin API
+  and CLI, or declared as code in the policy directory (`LocalUser`), never
+  with a password in it. A new account gets a one-time setup link to set its
+  password; the first admin is created on the first start from a mounted
+  secret holding its password. Every sign-in needs the password and a second
+  factor (G20): at the first sign-in the user enrolls an authenticator app
+  (TOTP, RFC 6238) and receives single-use recovery codes. Passkeys come later.
+  Passwords are hashed with PBKDF2-HMAC-SHA256 from aws-lc-rs; authenticator
+  secrets are sealed under the key-encryption key. Consecutive failures lock
+  an account for a while and each source address is limited, and an admin
+  can reset an account's credentials (revoking its sessions) or unlock it.
+- **Any OpenID Connect IdP.** SAML IdPs connect through an OIDC bridge.
+  Google is supported out of the box as a preset needing only a client ID and
+  secret: only accounts with a verified email sign in, optionally only those
+  of one Workspace domain (the `hd` claim) or an allowed list.
+- **warren's own groups** (`local:<group>` in policy) hold built-in accounts
+  and IdP users alike, assigned through the API or declared as code
+  (`LocalGroup`). They are how users of an IdP without groups, such as Google,
+  get any: by issuer and subject, or by an invite for a verified email that
+  binds to the first user who signs in with it. IdP groups come from SCIM
+  provisioning (or token claims where SCIM is unavailable). Membership changes
+  from any source apply through the revocation path (G9).
+- **Policy tells the sources apart.** A built-in account is `local:<username>`
+  and warren's groups are `local:<group>`; the control plane refuses an IdP
+  subject and drops an IdP group carrying that prefix, so neither source can
+  pass for the other. Authentication facts (when, and whether with MFA) are
+  recorded the same way for both, so freshness rules apply alike; a built-in
+  account's sign-in always counts as MFA.
+- Disabling or deleting a built-in account, or removing anyone from a group,
+  goes through the same revocation push as any other change (G9).
 - IdPs that emit shared signals (the OpenID Shared Signals Framework: CAEP and
   RISC events) feed the same revocation path. IdP status polling arrives in
   v1.x for IdPs without them. The latency from an IdP-side change to warren is
   documented per IdP.
-- warren never stores user passwords and never acts as an IdP.
+- Built-in accounts sign in to warren only. warren is not an identity
+  provider for other applications.
 
 ### 7.2 Devices
 
@@ -556,7 +593,7 @@ through it; clients re-establish sessions on another replica automatically.
 | Milestone | Scope | Done when |
 | --- | --- | --- |
 | **M0** Design and skeleton | These documents, the Rust workspace skeleton, the dependency policy in code, CI. | Merged; CI green. |
-| **M1** Walking skeleton | In a homelab: control plane, relay, standalone connector, macOS app; one app reachable over CONNECT-IP inside the end-to-end inner QUIC session; policy evaluation with decision logs; HTTP/2 fallback; the benchmark suite. | A signed-in Mac reaches one internal app through a relay, every decision is logged, and benchmarks run in CI. |
+| **M1** Walking skeleton | In a homelab: control plane with built-in accounts and Google sign-in, relay, standalone connector, macOS app; one app reachable over CONNECT-IP inside the end-to-end inner QUIC session; policy evaluation with decision logs; HTTP/2 fallback; the benchmark suite. | A signed-in Mac reaches one internal app through a relay, every decision is logged, and benchmarks run in CI. |
 | **M2** Kubernetes and the zero-trust core | Operator and Helm chart, CRDs and Service annotations, identity-brokered `kubectl`; device approval, posture with trust classes, continuous re-evaluation, the 10-second revocation contract and its test, outage behavior. | G2, G4, G7 to G11 and G15 hold under test. |
 | **M3** Console, JIT, clientless | The console and end-user portal, the "why?" explorer and simulator, JIT access, clientless HTTP(S). | An admin can explain any decision; JIT and clientless work end to end. |
 | **M4** v1.0 | Hardening, scale and performance against the v1 targets, documentation, and an external security audit. | Audit findings resolved; v1 targets met. |

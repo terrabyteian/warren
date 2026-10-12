@@ -164,3 +164,122 @@ than `publicUrl`'s host is the one clients and nodes are given (for example
 and point them at it. Where the provider supports it, `ipMode: Proxy`,
 requested through the provider's Service annotation, sends in-cluster
 traffic through the balancer instead.
+
+## Accounts and sign-in
+
+People sign in with built-in warren accounts, through the organization's
+identity provider, or both. Built-in accounts are on unless
+`localAccounts.enabled` is `false`, which needs an `idp`. When an IdP is
+configured and no built-in account exists, sign-in goes straight to the IdP;
+once one exists, the sign-in page offers both.
+
+### The first admin
+
+The first admin is created from a mounted secret holding its password, on
+the first start that finds no built-in account. Later starts never read the
+file again, so it can be deleted once the admin has signed in, and deleting
+the admin never brings it back.
+
+```yaml
+localAccounts:
+  bootstrapAdmin:
+    username: admin                          # default admin
+    passwordFile: /etc/warren/admin-password # at least 12 characters
+    groups: [admins]                         # default [admins]; local:admins in policy
+```
+
+The admin signs in from the warren app with that password and is asked to set
+up an authenticator app (any TOTP app) at once; the recovery codes shown then
+are the way back in if the phone is lost. Policy grants the admin access like
+anyone else, for example with `who: { groups: ["local:admins"] }`.
+
+**On a host,** write the password with no other content, readable only by the
+control plane's user, and remove it after the first sign-in:
+
+```sh
+install -m 0600 -o warren /dev/null /etc/warren/admin-password
+openssl rand -base64 24 > /etc/warren/admin-password   # or a passphrase you choose
+```
+
+**On Kubernetes,** keep the password in a Secret and mount it as a file:
+
+```sh
+kubectl -n warren create secret generic warren-admin-password \
+  --from-literal=password="$(openssl rand -base64 24)"
+```
+
+```yaml
+# In the control plane's pod spec:
+volumes:
+  - name: admin-password
+    secret: { secretName: warren-admin-password, defaultMode: 0400 }
+containers:
+  - name: control-plane
+    volumeMounts:
+      - { name: admin-password, mountPath: /etc/warren/admin-password, subPath: password, readOnly: true }
+```
+
+Read it back once with `kubectl -n warren get secret warren-admin-password -o
+jsonpath='{.data.password}' | base64 -d`, and delete the Secret after the first
+sign-in.
+
+### Managing built-in accounts
+
+```sh
+warren admin users create ada --email ada@example.com --group ops
+#   prints a one-time setup link (valid 72 hours); give it to Ada over a channel you trust
+warren admin users groups ada --group ops --group oncall   # her local groups, exactly
+warren admin users disable ada      # cuts her connections within 10 seconds
+warren admin users reset ada        # clears password and authenticator, revokes sessions, new link
+warren admin users unlock ada       # after 5 failed attempts in a row (or wait 15 minutes)
+warren admin users delete ada       # cuts her connections; the username can be reused
+warren admin groups list
+```
+
+Accounts and groups can also be declared in the policy directory as
+`LocalUser` and `LocalGroup` objects ([policy.md](policy.md#51-users-and-groups));
+those change only there. A declared account has no password until
+`warren admin users reset <name>` prints its setup link.
+
+### Google sign-in
+
+```yaml
+idp:
+  type: google
+  clientId: 123456789012-abc.apps.googleusercontent.com
+  clientSecretFile: /etc/warren/google-client-secret
+  hostedDomain: example.com            # optional: only accounts of this Workspace domain
+  allowedEmails: [contractor@gmail.com] # optional: and these addresses
+```
+
+The issuer, endpoints and scopes are preset. Only accounts whose email Google
+has verified can sign in; with `hostedDomain` or `allowedEmails`, only accounts
+of that Workspace domain (by Google's `hd` claim) or on that list. Without
+either, any Google account can sign in and enroll a device, though it reaches
+nothing until policy names it.
+
+To create the OAuth client:
+
+1. In the Google Cloud console, open **APIs & Services**, then **OAuth consent
+   screen**, and configure it (**Internal** limits it to your Workspace).
+2. Under **Credentials**, choose **Create credentials**, then **OAuth client
+   ID**, with application type **Web application**.
+3. Add the authorized redirect URI `https://<publicUrl host>/v1/auth/callback`,
+   exactly, including any port.
+4. Save the client ID in `clientId` and the client secret, alone, in the file
+   `clientSecretFile` names.
+
+Google accepts redirect URIs only with `https` on a host name under a public
+top-level domain (such as `warren.example.com`), or on `localhost`; it refuses
+raw IP addresses and private suffixes such as `.local`, `.lan`, `.internal` or
+`.home.arpa`. The name need not be reachable from the internet: the redirect
+happens in the user's browser, which only has to reach the control plane.
+
+Google ID tokens carry no groups, so Google users get warren's own: assign them
+after a first sign-in (`warren admin users groups <email> --group ops`), or
+invite their address beforehand (`warren admin invites set ada@example.com
+--group ops`), which binds to the first account that signs in with it. Google
+reports neither MFA nor when the user signed in, so rules with `auth.mfa` or
+`auth.maxAge` never match Google sign-ins; enforce two-step verification in
+Google Workspace, and give apps that need such rules to built-in accounts or an
+IdP that reports both.
