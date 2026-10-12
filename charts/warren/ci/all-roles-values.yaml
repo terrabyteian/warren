@@ -8,6 +8,7 @@ controlPlane:
     clientId: warren.apps.googleusercontent.com
     scopes: [openid, email, profile]
   idpClientSecret: { existingSecret: warren-idp }
+  bootstrapAdmin: { existingSecret: warren-admin }
   tls: { existingSecret: warren-tls }
   keyEncryptionKey: { existingSecret: warren-kek }
   service: { type: LoadBalancer }

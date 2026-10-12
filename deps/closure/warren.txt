@@ -135,6 +135,7 @@ precomputed-hash v0.1.1
 pretty v0.12.5
 proc-macro2 v1.0.107
 psm v0.1.32
+qrcode v0.14.1
 quinn v0.11.12
 quinn-proto v0.11.19
 quinn-udp v0.5.16

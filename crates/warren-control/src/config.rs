@@ -26,12 +26,47 @@ pub enum Approval {
     Manual,
 }
 
+/// Which kind of identity provider `idp` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdpKind {
+    /// Any OpenID Connect provider, found through discovery.
+    Oidc,
+    /// Google, with its issuer and endpoints preset. Google ID tokens carry
+    /// no groups, so Google users get theirs from warren's own groups.
+    Google,
+}
+
+/// Where an IdP's endpoints are, when they are preset rather than found
+/// through discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoints {
+    /// The authorization endpoint.
+    pub authorization: String,
+    /// The token endpoint.
+    pub token: String,
+    /// The JWKS URI.
+    pub jwks: String,
+}
+
+/// Google's OpenID Connect issuer.
+pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
+
 /// The identity provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Idp {
+    /// What kind of provider this is.
+    pub kind: IdpKind,
+    /// How the sign-in page names the provider.
+    pub display_name: String,
     /// The OIDC issuer URL; discovery is fetched from
-    /// `{issuer}/.well-known/openid-configuration`.
+    /// `{issuer}/.well-known/openid-configuration` unless `endpoints` are
+    /// preset.
     pub issuer: String,
+    /// Other spellings of the issuer an ID token's `iss` may use (Google
+    /// also issues tokens as `accounts.google.com`).
+    pub issuer_aliases: Vec<String>,
+    /// Preset endpoints; discovery is skipped when these are set.
+    pub endpoints: Option<Endpoints>,
     /// The client ID registered for warren.
     pub client_id: String,
     /// A file holding the client secret, for confidential clients. Without
@@ -48,6 +83,46 @@ pub struct Idp {
     pub mfa_amr_values: Vec<String>,
     /// `acr` values that mean the sign-in used multi-factor authentication.
     pub mfa_acr_values: Vec<String>,
+    /// Google: only accounts of this Workspace domain (the `hd` claim) may
+    /// sign in, besides `allowed_emails`.
+    pub hosted_domain: Option<String>,
+    /// Google: these verified emails may sign in, besides accounts of
+    /// `hosted_domain`.
+    pub allowed_emails: Vec<String>,
+}
+
+impl Idp {
+    /// Whether an ID token's `iss` names this provider.
+    pub fn issued_by(&self, iss: &str) -> bool {
+        let iss = iss.trim_end_matches('/');
+        iss == self.issuer || self.issuer_aliases.iter().any(|a| a == iss)
+    }
+}
+
+/// The first admin, created from a mounted secret on the first start that
+/// finds no built-in accounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapAdmin {
+    /// The username.
+    pub username: String,
+    /// A file holding the initial password.
+    pub password_file: PathBuf,
+    /// The admin's email, if any.
+    pub email: Option<String>,
+    /// Local groups the admin joins.
+    pub groups: Vec<String>,
+}
+
+/// Built-in accounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAccounts {
+    /// Whether built-in accounts can sign in and be created.
+    pub enabled: bool,
+    /// The first admin, if one is to be created.
+    pub bootstrap_admin: Option<BootstrapAdmin>,
+    /// Failed sign-ins one source address may make per 15 minutes before
+    /// it is refused for the rest of them; 0 turns the limit off.
+    pub max_failures_per_source: u32,
 }
 
 /// A certificate the operator supplies for the public host, from WebPKI or
@@ -123,8 +198,10 @@ pub struct Config {
     pub kek_file: PathBuf,
     /// The policy directory.
     pub policy_dir: PathBuf,
-    /// The identity provider.
-    pub idp: Idp,
+    /// The identity provider, if there is one.
+    pub idp: Option<Idp>,
+    /// Built-in accounts.
+    pub local_accounts: LocalAccounts,
     /// Exact redirect URIs accepted at sign-in besides loopback ones.
     pub redirect_uris: Vec<String>,
     /// `SESSION_MAX_LIFETIME`: time between browser sign-ins.
@@ -163,6 +240,7 @@ const KEYS: &[&str] = &[
     "keyEncryptionKeyFile",
     "policyDir",
     "idp",
+    "localAccounts",
     "signIn",
     "devices",
     "certificates",
@@ -409,13 +487,20 @@ impl Config {
         let kek_file = path_or(&mut r, "keyEncryptionKeyFile", data_dir.join("kek"));
         let policy_dir = PathBuf::from(required(&mut r, "policyDir").unwrap_or_default());
 
-        let idp = match get(&f, "idp") {
-            Some(n) => parse_idp(&mut r, n),
-            None => {
-                r.errors.push("idp is required".into());
-                None
-            }
+        let idp = get(&f, "idp").map(|n| parse_idp(&mut r, n));
+        let mut local_accounts = LocalAccounts {
+            enabled: true,
+            bootstrap_admin: None,
+            max_failures_per_source: crate::accounts::SOURCE_FAILURE_LIMIT,
         };
+        if let Some(n) = get(&f, "localAccounts") {
+            parse_local_accounts(&mut r, n, &mut local_accounts);
+        }
+        if idp.is_none() && !local_accounts.enabled {
+            r.errors.push(
+                "with no idp, localAccounts must stay enabled, or nobody could sign in".into(),
+            );
+        }
 
         let mut redirect_uris = Vec::new();
         let mut session_max_lifetime = Duration::from_secs(7 * 86_400);
@@ -516,7 +601,11 @@ impl Config {
         if !r.errors.is_empty() {
             return Err(r.errors.join("; "));
         }
-        let idp = idp.ok_or("idp is invalid")?;
+        let idp = match idp {
+            Some(Some(idp)) => Some(idp),
+            Some(None) => return Err("idp is invalid".into()),
+            None => None,
+        };
         Ok(Config {
             trust_domain,
             public_url,
@@ -531,6 +620,7 @@ impl Config {
             kek_file,
             policy_dir,
             idp,
+            local_accounts,
             redirect_uris,
             session_max_lifetime,
             device_approval,
@@ -558,18 +648,25 @@ impl Config {
                 *p = base.join(&*p);
             }
         }
-        for p in [
-            &mut self.idp.client_secret_file,
-            &mut self.idp.ca_file,
-            &mut self.audit_file,
-        ]
-        .into_iter()
-        .flatten()
-        .chain(
-            self.tls
-                .iter_mut()
-                .flat_map(|t| [&mut t.cert_file, &mut t.key_file]),
-        ) {
+        let idp_files = self
+            .idp
+            .iter_mut()
+            .flat_map(|i| [&mut i.client_secret_file, &mut i.ca_file]);
+        for p in idp_files
+            .chain([&mut self.audit_file])
+            .flatten()
+            .chain(
+                self.local_accounts
+                    .bootstrap_admin
+                    .iter_mut()
+                    .map(|b| &mut b.password_file),
+            )
+            .chain(
+                self.tls
+                    .iter_mut()
+                    .flat_map(|t| [&mut t.cert_file, &mut t.key_file]),
+            )
+        {
             if p.is_relative() {
                 *p = base.join(&*p);
             }
@@ -625,7 +722,7 @@ impl Config {
     pub fn reserved(&self) -> Vec<String> {
         let mut names = vec![self.public_host.clone()];
         names.extend(self.dns_names.iter().cloned());
-        names.extend(url_host(&self.idp.issuer));
+        names.extend(self.idp.as_ref().and_then(|i| url_host(&i.issuer)));
         names.extend(self.reserved_names.iter().cloned());
         names
     }
@@ -674,6 +771,8 @@ fn parse_idp(r: &mut Reader, node: &Node) -> Option<Idp> {
         node,
         "idp",
         &[
+            "type",
+            "displayName",
             "issuer",
             "clientId",
             "clientSecretFile",
@@ -682,10 +781,99 @@ fn parse_idp(r: &mut Reader, node: &Node) -> Option<Idp> {
             "caFile",
             "mfaAmrValues",
             "mfaAcrValues",
+            "hostedDomain",
+            "allowedEmails",
         ],
     );
-    let issuer = get(&f, "issuer").and_then(|n| r.string(n, "idp.issuer"));
+    let kind = match get(&f, "type")
+        .and_then(|n| r.string(n, "idp.type"))
+        .as_deref()
+    {
+        None | Some("oidc") => IdpKind::Oidc,
+        Some("google") => IdpKind::Google,
+        Some(other) => {
+            r.err(node, format!("idp.type {other:?} must be oidc or google"));
+            return None;
+        }
+    };
     let client_id = get(&f, "clientId").and_then(|n| r.string(n, "idp.clientId"));
+    let client_secret_file = get(&f, "clientSecretFile")
+        .and_then(|n| r.string(n, "idp.clientSecretFile"))
+        .map(PathBuf::from);
+    let display_name = get(&f, "displayName").and_then(|n| r.string(n, "idp.displayName"));
+    if kind == IdpKind::Google {
+        for key in [
+            "issuer",
+            "scopes",
+            "groupsClaim",
+            "caFile",
+            "mfaAmrValues",
+            "mfaAcrValues",
+        ] {
+            if let Some(n) = get(&f, key) {
+                r.err(
+                    n,
+                    format!("idp.{key} is preset for type google and cannot be set"),
+                );
+            }
+        }
+        let (Some(client_id), Some(client_secret_file)) = (client_id, client_secret_file) else {
+            r.err(
+                node,
+                "idp type google needs clientId and clientSecretFile, from the OAuth client created in the Google Cloud console",
+            );
+            return None;
+        };
+        let hosted_domain = get(&f, "hostedDomain")
+            .and_then(|n| r.string(n, "idp.hostedDomain"))
+            .map(|d| d.to_ascii_lowercase());
+        if let Some(d) = &hosted_domain
+            && !is_host_name(d)
+        {
+            r.err(
+                node,
+                format!("idp.hostedDomain {d:?} must be a domain name such as example.com"),
+            );
+        }
+        let allowed_emails: Vec<String> = get(&f, "allowedEmails")
+            .map(|n| r.strings(n, "idp.allowedEmails"))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.to_ascii_lowercase())
+            .collect();
+        if let Some(bad) = allowed_emails.iter().find(|e| !e.contains('@')) {
+            r.err(
+                node,
+                format!("idp.allowedEmails entry {bad:?} is not an email address"),
+            );
+        }
+        return Some(Idp {
+            kind,
+            display_name: display_name.unwrap_or_else(|| "Google".into()),
+            issuer: GOOGLE_ISSUER.into(),
+            issuer_aliases: vec!["accounts.google.com".into()],
+            endpoints: Some(Endpoints {
+                authorization: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+                token: "https://oauth2.googleapis.com/token".into(),
+                jwks: "https://www.googleapis.com/oauth2/v3/certs".into(),
+            }),
+            client_id,
+            client_secret_file: Some(client_secret_file),
+            scopes: vec!["openid".into(), "email".into(), "profile".into()],
+            groups_claim: String::new(),
+            ca_file: None,
+            mfa_amr_values: Vec::new(),
+            mfa_acr_values: Vec::new(),
+            hosted_domain,
+            allowed_emails,
+        });
+    }
+    for key in ["hostedDomain", "allowedEmails"] {
+        if let Some(n) = get(&f, key) {
+            r.err(n, format!("idp.{key} applies only to type google"));
+        }
+    }
+    let issuer = get(&f, "issuer").and_then(|n| r.string(n, "idp.issuer"));
     let (Some(issuer), Some(client_id)) = (issuer, client_id) else {
         r.err(node, "idp needs issuer and clientId");
         return None;
@@ -708,11 +896,13 @@ fn parse_idp(r: &mut Reader, node: &Node) -> Option<Idp> {
         r.err(node, "idp.scopes must include openid");
     }
     Some(Idp {
+        kind,
+        display_name: display_name.unwrap_or_else(|| "your identity provider".into()),
         issuer: issuer.trim_end_matches('/').to_owned(),
+        issuer_aliases: Vec::new(),
+        endpoints: None,
         client_id,
-        client_secret_file: get(&f, "clientSecretFile")
-            .and_then(|n| r.string(n, "idp.clientSecretFile"))
-            .map(PathBuf::from),
+        client_secret_file,
         scopes,
         groups_claim: get(&f, "groupsClaim")
             .and_then(|n| r.string(n, "idp.groupsClaim"))
@@ -726,7 +916,93 @@ fn parse_idp(r: &mut Reader, node: &Node) -> Option<Idp> {
         mfa_acr_values: get(&f, "mfaAcrValues")
             .map(|n| r.strings(n, "idp.mfaAcrValues"))
             .unwrap_or_default(),
+        hosted_domain: None,
+        allowed_emails: Vec::new(),
     })
+}
+
+fn parse_local_accounts(r: &mut Reader, node: &Node, out: &mut LocalAccounts) {
+    let f = r.map(
+        node,
+        "localAccounts",
+        &["enabled", "bootstrapAdmin", "maxFailuresPerSource"],
+    );
+    if let Some(n) = get(&f, "maxFailuresPerSource") {
+        match r
+            .string(n, "localAccounts.maxFailuresPerSource")
+            .map(|t| t.parse::<u32>())
+        {
+            Some(Ok(limit)) => out.max_failures_per_source = limit,
+            Some(Err(_)) => r.err(
+                n,
+                "localAccounts.maxFailuresPerSource must be a whole number; 0 means no limit",
+            ),
+            None => {}
+        }
+    }
+    if let Some(n) = get(&f, "enabled") {
+        match r.string(n, "localAccounts.enabled").as_deref() {
+            Some("true") => out.enabled = true,
+            Some("false") => out.enabled = false,
+            Some(other) => r.err(
+                n,
+                format!("localAccounts.enabled {other:?} must be true or false"),
+            ),
+            None => {}
+        }
+    }
+    let Some(n) = get(&f, "bootstrapAdmin") else {
+        return;
+    };
+    let bf = r.map(
+        n,
+        "localAccounts.bootstrapAdmin",
+        &["username", "passwordFile", "email", "groups"],
+    );
+    let username = get(&bf, "username")
+        .and_then(|u| r.string(u, "bootstrapAdmin.username"))
+        .unwrap_or_else(|| "admin".into());
+    if !warren_core::identity::valid_id(&username) {
+        r.err(
+            n,
+            format!(
+                "bootstrapAdmin.username {username:?} must be 1 to 63 lowercase letters, digits and '-'"
+            ),
+        );
+    }
+    let Some(password_file) =
+        get(&bf, "passwordFile").and_then(|p| r.string(p, "bootstrapAdmin.passwordFile"))
+    else {
+        r.err(
+            n,
+            "localAccounts.bootstrapAdmin needs passwordFile, a mounted secret holding the first password",
+        );
+        return;
+    };
+    let email = get(&bf, "email")
+        .and_then(|e| r.string(e, "bootstrapAdmin.email"))
+        .map(|e| e.to_ascii_lowercase());
+    let groups = get(&bf, "groups")
+        .map(|g| r.strings(g, "bootstrapAdmin.groups"))
+        .unwrap_or_else(|| vec!["admins".into()]);
+    if let Some(bad) = groups.iter().find(|g| !warren_core::identity::valid_id(g)) {
+        r.err(
+            n,
+            format!("bootstrapAdmin.groups entry {bad:?} must be a local group name"),
+        );
+    }
+    if !out.enabled {
+        r.err(
+            n,
+            "localAccounts.bootstrapAdmin needs localAccounts enabled",
+        );
+    }
+    out.bootstrap_admin = Some(BootstrapAdmin {
+        username,
+        password_file: password_file.into(),
+        email,
+        groups,
+    });
 }
 
 #[cfg(test)]
@@ -739,7 +1015,12 @@ mod tests {
     fn minimal_config_gets_defaults() {
         let c = Config::parse(MINIMAL).unwrap();
         assert_eq!(c.public_host, "warren.example.com");
-        assert_eq!(c.idp.issuer, "https://idp.example.com");
+        let idp = c.idp.as_ref().unwrap();
+        assert_eq!(idp.issuer, "https://idp.example.com");
+        assert_eq!(idp.kind, IdpKind::Oidc);
+        assert!(idp.endpoints.is_none());
+        assert!(c.local_accounts.enabled);
+        assert!(c.local_accounts.bootstrap_admin.is_none());
         assert_eq!(c.client_cert_lifetime, CLIENT_CERT_LIFETIME);
         assert_eq!(c.device_approval, Approval::Manual);
         assert_eq!(c.database, PathBuf::from("/var/lib/warren/warren.db"));
@@ -916,6 +1197,107 @@ mod tests {
             let e = Config::parse(&format!("{MINIMAL}{bad}")).unwrap_err();
             assert!(e.contains(why), "{e}");
         }
+    }
+
+    #[test]
+    fn the_google_preset() {
+        let base =
+            "trustDomain: example.com\npublicUrl: https://warren.example.com\npolicyDir: policy\n";
+        let mut c = Config::parse(&format!(
+            "{base}idp:\n  type: google\n  clientId: 123.apps.googleusercontent.com\n  clientSecretFile: google-secret\n  hostedDomain: Example.com\n  allowedEmails: [Contractor@Gmail.com]\n"
+        ))
+        .unwrap();
+        c.resolve_paths(Path::new("/etc/warren"));
+        let idp = c.idp.as_ref().unwrap();
+        assert_eq!(idp.kind, IdpKind::Google);
+        assert_eq!(idp.issuer, GOOGLE_ISSUER);
+        assert!(idp.issued_by("accounts.google.com"));
+        assert!(idp.issued_by("https://accounts.google.com"));
+        assert!(!idp.issued_by("https://accounts.google.com.evil.example"));
+        let endpoints = idp.endpoints.as_ref().unwrap();
+        assert!(
+            endpoints
+                .authorization
+                .starts_with("https://accounts.google.com/")
+        );
+        assert_eq!(idp.scopes, ["openid", "email", "profile"]);
+        assert_eq!(idp.hosted_domain.as_deref(), Some("example.com"));
+        assert_eq!(idp.allowed_emails, ["contractor@gmail.com"]);
+        assert_eq!(
+            idp.client_secret_file.as_deref(),
+            Some(Path::new("/etc/warren/google-secret"))
+        );
+        assert_eq!(idp.display_name, "Google");
+
+        // A client secret is required, and the preset cannot be changed.
+        let e = Config::parse(&format!("{base}idp:\n  type: google\n  clientId: x\n")).unwrap_err();
+        assert!(e.contains("clientSecretFile"), "{e}");
+        let e = Config::parse(&format!(
+            "{base}idp:\n  type: google\n  clientId: x\n  clientSecretFile: s\n  issuer: https://evil.example\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("preset"), "{e}");
+        let e = Config::parse(&format!(
+            "{base}idp:\n  issuer: https://idp.example.com\n  clientId: x\n  hostedDomain: example.com\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("only to type google"), "{e}");
+        let e = Config::parse(&format!("{base}idp:\n  type: saml\n")).unwrap_err();
+        assert!(e.contains("oidc or google"), "{e}");
+    }
+
+    #[test]
+    fn local_accounts_and_the_bootstrap_admin() {
+        let base =
+            "trustDomain: example.com\npublicUrl: https://warren.example.com\npolicyDir: policy\n";
+        // Built-in accounts alone are enough to sign in.
+        let c = Config::parse(base).unwrap();
+        assert!(c.idp.is_none());
+        assert!(c.local_accounts.enabled);
+        assert_eq!(c.local_accounts.max_failures_per_source, 20);
+        assert_eq!(c.reserved(), ["warren.example.com"]);
+        for (value, limit) in [("0", 0), ("200", 200)] {
+            let c = Config::parse(&format!(
+                "{base}localAccounts:\n  maxFailuresPerSource: {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(c.local_accounts.max_failures_per_source, limit);
+        }
+        let e = Config::parse(&format!(
+            "{base}localAccounts:\n  maxFailuresPerSource: -1\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("maxFailuresPerSource"), "{e}");
+        let e = Config::parse(&format!("{base}localAccounts:\n  enabled: false\n")).unwrap_err();
+        assert!(e.contains("nobody could sign in"), "{e}");
+
+        let mut c = Config::parse(&format!(
+            "{base}localAccounts:\n  bootstrapAdmin:\n    passwordFile: secrets/admin-password\n"
+        ))
+        .unwrap();
+        c.resolve_paths(Path::new("/etc/warren"));
+        let admin = c.local_accounts.bootstrap_admin.unwrap();
+        assert_eq!(admin.username, "admin");
+        assert_eq!(admin.groups, ["admins"]);
+        assert_eq!(
+            admin.password_file,
+            PathBuf::from("/etc/warren/secrets/admin-password")
+        );
+        let e = Config::parse(&format!(
+            "{base}localAccounts:\n  bootstrapAdmin:\n    username: Admin\n    passwordFile: p\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("bootstrapAdmin.username"), "{e}");
+        let e = Config::parse(&format!(
+            "{base}localAccounts:\n  bootstrapAdmin:\n    username: root\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("passwordFile"), "{e}");
+        let e = Config::parse(&format!(
+            "{MINIMAL}localAccounts:\n  enabled: false\n  bootstrapAdmin:\n    passwordFile: p\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("needs localAccounts enabled"), "{e}");
     }
 
     #[test]

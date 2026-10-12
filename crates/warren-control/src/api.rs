@@ -29,7 +29,9 @@ use warren_policy::names::{DomainPattern, is_host_name};
 
 use crate::app::{App, new_secret, secret_hash};
 use crate::audit::{self, Activity, Actor};
-use crate::config::Approval;
+use crate::config::{Approval, IdpKind};
+use crate::oidc::Provider;
+use crate::signin;
 use crate::store::{AuthCode, AuthRequest, Device, DeviceStatus, Enrollment, Node, Session};
 use crate::stream;
 use crate::web::{
@@ -40,7 +42,7 @@ use crate::web::{
 /// How long a sign-in may take at the IdP.
 const AUTH_REQUEST_LIFETIME: i64 = 600;
 /// How long the one-time code handed to the client is valid.
-const AUTH_CODE_LIFETIME: i64 = 120;
+pub(crate) const AUTH_CODE_LIFETIME: i64 = 120;
 /// The largest body read before the caller is authenticated.
 const PREAUTH_BODY: usize = 16 << 10;
 
@@ -49,7 +51,13 @@ const PREAUTH_BODY: usize = 16 << 10;
 pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/.well-known/warren"),
     ("GET", "/v1/auth/authorize"),
+    ("GET", "/v1/auth/idp"),
     ("GET", "/v1/auth/callback"),
+    ("POST", "/v1/auth/password"),
+    ("POST", "/v1/auth/code"),
+    ("POST", "/v1/auth/continue"),
+    ("GET", "/v1/auth/setup"),
+    ("POST", "/v1/auth/setup"),
     ("POST", "/v1/auth/token"),
     ("POST", "/v1/devices"),
     ("GET", "/v1/devices/current"),
@@ -95,7 +103,12 @@ async fn route(
         path.as_str(),
         "/.well-known/warren"
             | "/v1/auth/authorize"
+            | "/v1/auth/idp"
             | "/v1/auth/callback"
+            | "/v1/auth/password"
+            | "/v1/auth/code"
+            | "/v1/auth/continue"
+            | "/v1/auth/setup"
             | "/v1/auth/token"
             | "/v1/devices"
             | "/v1/devices/current"
@@ -117,7 +130,13 @@ async fn route(
     match (method, path.as_str()) {
         (Method::GET, "/.well-known/warren") => Ok(discovery(&app)),
         (Method::GET, "/v1/auth/authorize") => authorize(&app, &req).await,
+        (Method::GET, "/v1/auth/idp") => to_idp(&app, &req).await,
         (Method::GET, "/v1/auth/callback") => callback(&app, &req).await,
+        (Method::POST, "/v1/auth/password") => signin::password(&app, req, &peer).await,
+        (Method::POST, "/v1/auth/code") => signin::code(&app, req, &peer).await,
+        (Method::POST, "/v1/auth/continue") => signin::proceed(&app, req, &peer).await,
+        (Method::GET, "/v1/auth/setup") => signin::setup_form(&app, &req).await,
+        (Method::POST, "/v1/auth/setup") => signin::setup(&app, req).await,
         (Method::POST, "/v1/auth/token") => token(&app, req).await,
         (Method::POST, "/v1/devices") => enroll(&app, req).await,
         (Method::GET, "/v1/devices/current") => current_device(&app, &req).await,
@@ -182,7 +201,7 @@ pub(crate) fn s256(verifier: &str) -> String {
     b64url(&sha256(verifier.as_bytes()))
 }
 
-fn with_query(base: &str, pairs: &[(&str, &str)]) -> String {
+pub(crate) fn with_query(base: &str, pairs: &[(&str, &str)]) -> String {
     let mut ser = form_urlencoded::Serializer::new(String::new());
     for (k, v) in pairs {
         ser.append_pair(k, v);
@@ -225,11 +244,9 @@ async fn authorize<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Api
             return bad("The sign-in request asks for an unknown prompt. Update the warren app.");
         }
     };
-    // Ask the IdP for a sign-in recent enough for every freshness rule.
-    let max_age = app.compiled().and_then(|c| c.shortest_max_age());
     let state = new_secret()?;
-    let nonce = new_secret()?;
-    let verifier = new_secret()?;
+    let local = signin::offers_local(app).await?;
+    let browser = if local { Some(new_secret()?) } else { None };
     app.store
         .insert_auth_request(
             &secret_hash(&state),
@@ -237,18 +254,50 @@ async fn authorize<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Api
                 client_redirect_uri: redirect_uri.into(),
                 client_state: client_state.into(),
                 client_challenge: challenge.into(),
-                nonce: nonce.clone(),
-                idp_verifier: verifier.clone(),
+                nonce: new_secret()?,
+                idp_verifier: new_secret()?,
                 created_at: clock::now_secs(),
                 login,
+                browser_hash: browser.as_deref().map(secret_hash),
+                ..AuthRequest::default()
             },
             clock::now_secs() + AUTH_REQUEST_LIFETIME,
         )
         .await?;
+    match browser {
+        Some(browser) => Ok(signin::start(app, &state, login, &browser)),
+        None => idp_redirect(app, &state, login).await,
+    }
+}
+
+/// Sends the browser to the IdP for the sign-in `state` names.
+async fn idp_redirect(app: &App, state: &str, login: bool) -> Result<Response<Body>, ApiError> {
+    let Some(idp) = &app.idp else {
+        return Ok(page(
+            StatusCode::NOT_FOUND,
+            "No identity provider",
+            "This deployment signs in with warren accounts only.",
+        ));
+    };
+    let Some(pending) = app.store.auth_request(&secret_hash(state)).await? else {
+        return Ok(page(
+            StatusCode::BAD_REQUEST,
+            "This sign-in has expired",
+            "Start sign-in again from the warren app.",
+        ));
+    };
+    // Ask the IdP for a sign-in recent enough for every freshness rule.
+    let max_age = app.compiled().and_then(|c| c.shortest_max_age());
     let callback = format!("{}/v1/auth/callback", app.config.public_url);
-    match app
-        .idp
-        .authorize_url(&callback, &state, &nonce, &s256(&verifier), max_age, login)
+    match idp
+        .authorize_url(
+            &callback,
+            state,
+            &pending.nonce,
+            &s256(&pending.idp_verifier),
+            max_age,
+            login,
+        )
         .await
     {
         Ok(url) => Ok(redirect(&url)),
@@ -263,12 +312,34 @@ async fn authorize<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Api
     }
 }
 
+/// `GET /v1/auth/idp`: the sign-in page's IdP button, for a sign-in that
+/// started at `/v1/auth/authorize` in this browser.
+async fn to_idp<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiError> {
+    let q = query(req)?;
+    let flow = param(&q, "flow").unwrap_or("");
+    let bound = match app.store.auth_request(&secret_hash(flow)).await? {
+        Some(r) => r.local_stage.is_none() && signin::bound_to_browser(req.headers(), &r),
+        None => false,
+    };
+    if !bound {
+        return Ok(page(
+            StatusCode::BAD_REQUEST,
+            "This sign-in has expired",
+            "Start sign-in again from the warren app.",
+        ));
+    }
+    idp_redirect(app, flow, param(&q, "login") == Some("1")).await
+}
+
 /// How a sign-in at the IdP ended, once its callback arrived.
 pub(crate) enum IdpSignIn {
     /// The IdP refused it or the user cancelled.
     Refused,
     /// The IdP's answer could not be verified.
     Unverified,
+    /// The IdP vouched for an account this deployment does not admit; the
+    /// text says why.
+    NotAdmitted(String),
     /// The user is disabled in warren.
     Disabled,
     /// Signed in.
@@ -289,6 +360,7 @@ pub(crate) enum IdpSignIn {
 /// The caller audits success, since what was signed in to differs.
 pub(crate) async fn finish_idp_sign_in(
     app: &App,
+    idp: &Provider,
     q: &[(String, String)],
     pending: &AuthRequest,
 ) -> Result<IdpSignIn, ApiError> {
@@ -302,8 +374,7 @@ pub(crate) async fn finish_idp_sign_in(
         return Ok(IdpSignIn::Refused);
     }
     let callback = format!("{}/v1/auth/callback", app.config.public_url);
-    let signin = match app
-        .idp
+    let signin = match idp
         .exchange(
             param(q, "code").unwrap_or(""),
             &pending.idp_verifier,
@@ -319,17 +390,35 @@ pub(crate) async fn finish_idp_sign_in(
             return Ok(IdpSignIn::Unverified);
         }
     };
-    let auth_time = signin.auth_time.unwrap_or_else(|| {
-        crate::log::warn(
-            "idp",
-            "the ID token has no auth_time, so how recently the user authenticated is unknown and rules with auth.maxAge will ask them to sign in again",
+    if let Err(why) = idp.admits(&signin) {
+        let mut r = audit::record(
+            Activity::Logon,
+            false,
+            &Actor::Anonymous,
+            &format!("sign-in refused: {why}"),
         );
+        r.insert("auth_protocol".into(), "OIDC".into());
+        r.insert(
+            "unmapped".into(),
+            json!({ "subject": signin.subject, "email": signin.email, "hosted_domain": signin.hosted_domain }),
+        );
+        app.audit(r);
+        return Ok(IdpSignIn::NotAdmitted(why));
+    }
+    let auth_time = signin.auth_time.unwrap_or_else(|| {
+        // Google never reports it; other IdPs should.
+        if idp.config().kind != IdpKind::Google {
+            crate::log::warn(
+                "idp",
+                "the ID token has no auth_time, so how recently the user authenticated is unknown and rules with auth.maxAge will ask them to sign in again",
+            );
+        }
         AUTH_TIME_UNKNOWN as i64
     });
     let (user, changed) = app
         .store
         .record_sign_in(
-            &app.config.idp.issuer,
+            &idp.config().issuer,
             &signin.subject,
             &signin.email,
             &signin.groups,
@@ -363,6 +452,13 @@ pub(crate) async fn finish_idp_sign_in(
 
 async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiError> {
     let q = query(req)?;
+    let Some(idp) = &app.idp else {
+        return Ok(page(
+            StatusCode::NOT_FOUND,
+            "No identity provider",
+            "This deployment signs in with warren accounts only.",
+        ));
+    };
     let Some(pending) = app
         .store
         .take_auth_request(&secret_hash(param(&q, "state").unwrap_or("")))
@@ -375,14 +471,14 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
         ));
     };
     if pending.client_redirect_uri == crate::console::REDIRECT {
-        return crate::console::finish_sign_in(app, req, &q, &pending).await;
+        return crate::console::finish_sign_in(app, idp, req, &q, &pending).await;
     }
     let back = |pairs: &[(&str, &str)]| {
         let mut all = pairs.to_vec();
         all.push(("state", pending.client_state.as_str()));
         Ok(redirect(&with_query(&pending.client_redirect_uri, &all)))
     };
-    let (user, auth_time, mfa) = match finish_idp_sign_in(app, &q, &pending).await? {
+    let (user, auth_time, mfa) = match finish_idp_sign_in(app, idp, &q, &pending).await? {
         IdpSignIn::Refused => {
             return back(&[
                 ("error", "access_denied"),
@@ -400,6 +496,9 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
                     "warren could not verify the sign-in with your identity provider.",
                 ),
             ]);
+        }
+        IdpSignIn::NotAdmitted(why) => {
+            return back(&[("error", "access_denied"), ("error_description", &why)]);
         }
         IdpSignIn::Disabled => {
             return back(&[

@@ -23,6 +23,8 @@ the enforcement can never disagree.
 | `PostureProfile` | A named set of device checks | Security admins |
 | `AccessPolicy` | Rules: who may reach what, under which conditions | App owners and security admins |
 | `AccessRequestPolicy` | Just-in-time access: who may request what, who approves, for how long | App owners and security admins |
+| `LocalUser` | A built-in warren account, without credentials | Deployment admins |
+| `LocalGroup` | One of warren's own groups and its members | Deployment admins |
 
 Every object has the same envelope in both forms:
 
@@ -309,7 +311,7 @@ spec:
 
 | Part | Fields |
 | --- | --- |
-| `who` | `users` (IdP identifiers or emails), `groups` (IdP groups). At least one is required; there is no implicit "everyone". |
+| `who` | `users` (IdP subject identifiers, verified emails, or `local:<username>` for built-in accounts), `groups` (IdP groups, or `local:<group>` for warren's own). At least one is required; there is no implicit "everyone". See [section 5.1](#51-users-and-groups). |
 | `what` | `apps` (names), `appSelector.matchLabels`. A selector needs at least one label; an empty one would match every app and is rejected. |
 | `when.posture` | Posture profiles that must all pass. |
 | `when.auth` | `maxAge` since the user last authenticated at the IdP; `mfa: true` requires that sign-in to have used MFA. When the IdP did not report when the user authenticated, freshness is unknown and `maxAge` fails, so the user is asked to sign in again. |
@@ -321,6 +323,64 @@ Some things hold before any rule and no rule can change them (G1): the client
 certificate is valid and unrevoked, the device is approved, the destination is
 inside both the app and its connector group's scope, and the flow is
 client-initiated unless the app allows otherwise.
+
+### 5.1 Users and groups
+
+Principals come from two issuers, and `who` names both the same way, with
+the issuer telling them apart:
+
+| Entry | Matches |
+| --- | --- |
+| `ada@example.com` in `users` | Any user whose email is verified: by the IdP, or set by an admin on a built-in account. |
+| `00u1abc` in `users` | The IdP user with that subject identifier. |
+| `local:ada` in `users` | The built-in account `ada`. |
+| `engineering` in `groups` | Users the IdP says are in `engineering`. |
+| `local:ops` in `groups` | Members of warren's own group `ops`. |
+
+`local:` is reserved: the control plane refuses an IdP subject and drops an IdP
+group carrying it, so no IdP can pass for a built-in account or claim
+membership in warren's groups, and no `local:` entry can match an IdP
+principal. warren's own groups can hold anyone: built-in accounts, and IdP
+users by issuer and subject. They are how users of an IdP without groups, such
+as Google, get any.
+
+Built-in accounts and warren's groups are managed with `warren admin users`
+and `warren admin groups`, or declared in the policy directory:
+
+```yaml
+apiVersion: warren.dev/v1alpha1
+kind: LocalUser
+metadata:
+  name: ada                    # the username: lowercase letters, digits, '-'
+spec:
+  email: ada@example.com       # optional
+  displayName: Ada Lovelace    # optional
+---
+apiVersion: warren.dev/v1alpha1
+kind: LocalGroup
+metadata:
+  name: ops                    # local:ops in who
+spec:
+  members:
+    users: [ada]               # built-in accounts, by username
+    emails: [bob@example.com]  # IdP users, by verified email
+```
+
+- Credentials never appear in the policy directory. A declared account starts
+  without a password; `warren admin users reset ada` prints its one-time setup
+  link, and the user enrolls an authenticator app at the first sign-in.
+- What the directory declares, only the directory changes (G19): the API
+  refuses to delete a declared account or to change a declared group's
+  members, and a declared group's members are exactly what it lists. An
+  account the API created is taken over when the directory declares it.
+  Removing a `LocalUser` deletes the account and removing anyone from a group
+  takes effect, both through the revocation path (G9). Disabling, resetting
+  and unlocking work on every account, since they answer incidents.
+- An email member, which only the policy directory declares, waits for the
+  first IdP user who signs in with that verified email and binds to them, by issuer and subject, and stays with that user;
+  another account later holding the address inherits nothing.
+- Built-in account sign-ins always use a second factor, so `auth.mfa` holds
+  for them, and `auth.maxAge` counts from when the code was entered.
 
 ## 6. Just-in-time access
 
@@ -444,13 +504,16 @@ The schema and the policy examples in this section validate in Cedar's strict
 mode with the Cedar 4.13 CLI.
 
 Users are identified by the IdP's issuer and subject identifier, which the
-IdP never reassigns. A user's `subject` is that identifier, and their `email`
+IdP never reassigns. A user's `subject` is that identifier, or
+`local:<username>` for a built-in account, and their `email`
 is the address the IdP asserted, lowercased, only when the ID token marks it
 verified (`email_verified: true`); otherwise, including when the IdP says
-nothing about verification, it is empty. They are what `who.users` matches,
-so an entry with `@` matches only a verified email: on an IdP that lets users
-set their own email address without verifying it, nobody can match another
-user's rules by taking their address.
+nothing about verification, it is empty; a built-in account's email is the
+one an admin set. The subject and email are what `who.users` matches, so an
+entry with `@` matches only a verified email: on an IdP that lets users set
+their own email address without verifying it, nobody can match another user's
+rules by taking their address. A user's groups, the parents of their entity,
+are their IdP groups followed by warren's own as `local:<group>`.
 
 The enforcement point builds the request: the principal and groups from the
 signed entity snapshot, the device and its signals from the latest verified

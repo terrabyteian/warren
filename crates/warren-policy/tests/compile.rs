@@ -944,3 +944,87 @@ fn a_clientless_upstream_needs_a_declared_port() {
     let errors = errors_of(&clientless("http://a.lab.example.com:8080/"));
     assert!(errors.iter().any(|e| e.contains("port 8080")), "{errors:?}");
 }
+
+#[test]
+fn local_principals_are_told_apart_from_the_idps() {
+    let text = format!(
+        "{GROUP}{}---\napiVersion: warren.dev/v1alpha1\nkind: AccessPolicy\nmetadata: {{ name: p }}\nspec:\n  rules:\n    - name: ops\n      who: {{ groups: [\"local:ops\"], users: [\"local:ada\"] }}\n      what: {{ apps: [a] }}\n---\napiVersion: warren.dev/v1alpha1\nkind: LocalUser\nmetadata: {{ name: ada }}\nspec:\n  email: Ada@Example.com\n  displayName: Ada Lovelace\n---\napiVersion: warren.dev/v1alpha1\nkind: LocalGroup\nmetadata: {{ name: ops }}\nspec:\n  members:\n    users: [ada]\n    emails: [Bob@Example.com]\n",
+        app("a", "a.lab.example.com", "")
+    );
+    let compiled = compile_text(&text).unwrap();
+    let ada = &compiled.objects.local_users[0];
+    assert_eq!(ada.meta.name, "ada");
+    assert_eq!(ada.email.as_deref(), Some("ada@example.com"));
+    assert_eq!(compiled.objects.local_groups[0].emails, ["bob@example.com"]);
+
+    // The control plane gives local accounts the subject `local:<name>`
+    // and warren's own groups the prefix, which no IdP principal carries.
+    let local = UserEntity {
+        id: "u-ada".into(),
+        email: String::new(),
+        subject: "local:ada".into(),
+        groups: vec![],
+    };
+    let member = user("bob", &["local:ops"]);
+    let idp_ops = user("carol", &["ops"]);
+    let idp_ada = UserEntity {
+        subject: "ada".into(),
+        ..user("dave", &[])
+    };
+    let engine = Engine::new(
+        &compiled,
+        &[local.clone(), member.clone(), idp_ops.clone(), idp_ada],
+    );
+    let ctx = || context(Some(good_device()), 60, true, None);
+    assert_eq!(engine.decide("u-ada", "a", ctx()).0, Decision::Allow);
+    assert_eq!(engine.decide("bob", "a", ctx()).0, Decision::Allow);
+    assert_eq!(engine.decide("carol", "a", ctx()).0, Decision::Deny);
+    assert_eq!(engine.decide("dave", "a", ctx()).0, Decision::Deny);
+    assert!(compiled.entitlements(&local).contains_key("a"));
+    assert!(compiled.entitlements(&member).contains_key("a"));
+    assert!(!compiled.entitlements(&idp_ops).contains_key("a"));
+
+    // A local principal must name a valid username or group.
+    let errors = errors_of(&text.replace("\"local:ops\"", "\"local:Ops Team\""));
+    assert!(
+        errors.iter().any(|e| e.contains("local group")),
+        "{errors:?}"
+    );
+    let errors = errors_of(&text.replace("\"local:ada\"", "\"local:\""));
+    assert!(
+        errors.iter().any(|e| e.contains("local user")),
+        "{errors:?}"
+    );
+    // Each local user and group is declared once, with what it allows.
+    let errors = errors_of(&format!(
+        "{text}---\napiVersion: warren.dev/v1alpha1\nkind: LocalUser\nmetadata: {{ name: ada }}\n"
+    ));
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("LocalUser ada is already defined")),
+        "{errors:?}"
+    );
+    let errors = errors_of(&text.replace("Ada@Example.com", "ada"));
+    assert!(
+        errors.iter().any(|e| e.contains("not an email")),
+        "{errors:?}"
+    );
+    let errors = errors_of(&text.replace("users: [ada]", "users: [\"Ada\"]"));
+    assert!(
+        errors.iter().any(|e| e.contains("local username")),
+        "{errors:?}"
+    );
+    let errors = errors_of(&text.replace("displayName: Ada Lovelace", "password: hunter2"));
+    assert!(errors.iter().any(|e| e.contains("password")), "{errors:?}");
+
+    // An unpopulated local group is flagged by its local name.
+    let known: BTreeSet<String> = BTreeSet::new();
+    let warnings = compile::unknown_groups(&compiled.objects, &known);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.message == "no user is in local group ops yet; check its spelling"),
+        "{warnings:?}"
+    );
+}

@@ -79,8 +79,9 @@ docker buildx build --target warren-connector -t warren-connector .
   relay's. Relays and connectors join and run at the control plane's name,
   so it must resolve inside the cluster too; a homelab router's DNS usually
   covers both.
-- **An OpenID Connect identity provider.** Register warren as a web client
-  with the redirect URI `https://<organization URL host>/v1/auth/callback`.
+- **Optionally, an identity provider.** Without one, people sign in with
+  built-in warren accounts ([The first admin](#the-first-admin)). Register
+  warren as a web client with the redirect URI `https://<organization URL host>/v1/auth/callback`.
   For Google, create an OAuth client ID of type "Web application" in the
   Google Cloud console; the issuer is `https://accounts.google.com`. Google's
   ID tokens carry no groups and no MFA claim, so rules that need either
@@ -104,6 +105,8 @@ somewhere safe, since without it the database cannot be opened.
 ```sh
 head -c 32 /dev/urandom | base64 > kek
 kubectl -n warren create secret generic warren-kek --from-file=kek=kek
+# With an identity provider (leave out idp and idpClientSecret below
+# without one):
 kubectl -n warren create secret generic warren-idp --from-literal=client-secret='<IdP client secret>'
 # Optional: a certificate for the organization URL that browsers trust,
 # for example one issued by cert-manager into this Secret.
@@ -166,6 +169,41 @@ terminates TLS (no Ingress that decrypts), since relays, connectors and
 enrolled clients authenticate with certificates. Behind a load balancer that
 hides client addresses, read [Behind a load balancer](operating.md#behind-a-load-balancer).
 
+### The first admin
+
+Built-in warren accounts sign in with a password and an authenticator app,
+with or without `controlPlane.idp`. To have the chart create the first admin,
+put its password in a Secret before installing:
+
+```sh
+kubectl -n warren create secret generic warren-admin \
+  --from-literal=password="$(openssl rand -base64 24)"
+```
+
+and name it in `values.yaml`:
+
+```yaml
+controlPlane:
+  bootstrapAdmin:
+    existingSecret: warren-admin
+    # key: password        # the Secret's key holding the password
+    # username: admin
+    # groups: [admins]     # local:admins in policy
+```
+
+The chart mounts the Secret read-only at `/etc/warren/admin/password` and
+sets `localAccounts.bootstrapAdmin` ([operating.md](operating.md#the-first-admin)).
+The admin is created on the first start that finds no built-in account; the
+password is never read again. Read it back once:
+
+```sh
+kubectl -n warren get secret warren-admin -o jsonpath='{.data.password}' | base64 -d
+```
+
+The admin signs in from the warren app with it and enrolls an authenticator
+app (any TOTP app) at once. Then delete the Secret and drop
+`bootstrapAdmin` from the values.
+
 ## 2. Reach the control plane and sign in
 
 The organization URL, for example `https://warren.home.example`, is where
@@ -193,7 +231,7 @@ sudo kubectl --kubeconfig "${KUBECONFIG:-$HOME/.kube/config}" \
 ```
 
 Sign in from a Mac with the warren client ([macos.md](macos.md#sign-in)),
-which opens the identity provider in the browser and enrolls the Mac;
+which opens the sign-in page in the browser and enrolls the Mac;
 without `controlPlane.tls`, add `--fingerprint` with the root fingerprint:
 
 ```sh
@@ -327,8 +365,9 @@ value. The ones most installs set:
 | `controlPlane.trustDomain` | (required) | The deployment's name in identity URIs. |
 | `controlPlane.publicUrl` | (required) | The organization URL, `https://host[:port]`. |
 | `controlPlane.dnsNames` | `[]` | More names for the control plane's own certificate; with `tls`, the first is where nodes and clients reach it. |
-| `controlPlane.idp` | (required) | The `idp` configuration section: `issuer`, `clientId`, `scopes`, `groupsClaim`, `mfaAmrValues`. |
+| `controlPlane.idp` | `{}` | The `idp` configuration section: `type`, `issuer`, `clientId`, `scopes`, `groupsClaim`, `mfaAmrValues`. Optional with built-in accounts. |
 | `controlPlane.idpClientSecret.existingSecret` | `""` | Secret with the IdP client secret (key `client-secret`). |
+| `controlPlane.bootstrapAdmin.existingSecret` | `""` | Secret with the first admin's password (key `password`); `username` and `groups` default to `admin` and `[admins]`. |
 | `controlPlane.tls.existingSecret` | `""` | `kubernetes.io/tls` Secret for the organization URL. |
 | `controlPlane.keyEncryptionKey.existingSecret` | `""` | Secret with the key-encryption key (key `kek`); empty keeps it on the data volume. |
 | `controlPlane.config` | `{}` | More configuration merged into the control plane's file. |

@@ -125,6 +125,20 @@ pub enum Activity {
     Enable,
     /// Account Change: Disable.
     Disable,
+    /// Account Change: Create.
+    AccountCreate,
+    /// Account Change: Password Change.
+    PasswordChange,
+    /// Account Change: Password Reset.
+    PasswordReset,
+    /// Account Change: Delete.
+    AccountDelete,
+    /// Account Change: Lock.
+    Lock,
+    /// Account Change: MFA Factor Enable.
+    MfaEnable,
+    /// Account Change: Unlock.
+    Unlock,
     /// Entity Management: Create.
     Create,
     /// Entity Management: Update.
@@ -145,7 +159,15 @@ impl Activity {
     fn class(self) -> Class {
         match self {
             Activity::Logon | Activity::Logoff => Class::Authentication,
-            Activity::Enable | Activity::Disable => Class::AccountChange,
+            Activity::Enable
+            | Activity::Disable
+            | Activity::AccountCreate
+            | Activity::PasswordChange
+            | Activity::PasswordReset
+            | Activity::AccountDelete
+            | Activity::Lock
+            | Activity::MfaEnable
+            | Activity::Unlock => Class::AccountChange,
             _ => Class::EntityManagement,
         }
     }
@@ -156,6 +178,13 @@ impl Activity {
             Activity::Logoff => (2, "Logoff"),
             Activity::Enable => (2, "Enable"),
             Activity::Disable => (5, "Disable"),
+            Activity::AccountCreate => (1, "Create"),
+            Activity::PasswordChange => (3, "Password Change"),
+            Activity::PasswordReset => (4, "Password Reset"),
+            Activity::AccountDelete => (6, "Delete"),
+            Activity::Lock => (9, "Lock"),
+            Activity::MfaEnable => (10, "MFA Factor Enable"),
+            Activity::Unlock => (12, "Unlock"),
             Activity::Create => (1, "Create"),
             Activity::Update => (3, "Update"),
             Activity::Delete => (4, "Delete"),
@@ -382,6 +411,9 @@ mod tests {
         let r = record(Activity::Disable, false, &Actor::LocalAdmin, "x");
         assert_eq!(r["type_uid"], 300_105);
         assert_eq!(r["status"], "Failure");
+        let r = record(Activity::MfaEnable, true, &Actor::System, "x");
+        assert_eq!(r["class_uid"], 3001);
+        assert_eq!(r["type_uid"], 300_110);
     }
 
     #[test]

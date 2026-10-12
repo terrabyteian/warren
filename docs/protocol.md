@@ -596,7 +596,9 @@ Requirements:
   `auth_time` claim, never from when the token was issued (a silent single
   sign-on issues a fresh token without authenticating anyone). When the IdP
   leaves `auth_time` out, `authTime` is 0: freshness is unknown, and every
-  `auth.maxAge` condition fails, asking the user to sign in again.
+  `auth.maxAge` condition fails, asking the user to sign in again. For a
+  built-in account it is the time the control plane verified the
+  authenticator or recovery code, and MFA is always set.
 - **Key identifiers** (Subject and Authority Key Identifier) are the leftmost
   160 bits of the SHA-256 digest of the subject public key (RFC 7093,
   method 1).
@@ -617,10 +619,13 @@ HTTPS (HTTP/2 or HTTP/3), JSON, under a versioned path. Requirements:
    client makes every later call at the `api_base` the enrollment answer
    gives ([section 10.1](#101-trust-hierarchy)).
 2. **Sign-in.** OAuth 2.0 for native apps (RFC 8252) in the system browser
-   with authorization code and PKCE (RFC 7636). The control plane is the OIDC
-   relying party toward the IdP; the client receives a one-time code bound to
-   its PKCE verifier and exchanges it, together with a request signed by the
-   device key, for a session bound to that key.
+   with authorization code and PKCE (RFC 7636). The user signs in with a
+   built-in account on the control plane's own pages (a password, then an
+   authenticator or recovery code), or through the IdP, toward which the
+   control plane is the OIDC relying party. Either way the client receives a
+   one-time code bound to its PKCE verifier and exchanges it, together with a
+   request signed by the device key, for a session bound to that key; the
+   client cannot tell the two apart and needs nothing more.
 3. **Enrollment.** The client registers the device public key, platform
    attributes, and a hardware attestation where the platform offers one. The
    device is pending until approved.
@@ -652,7 +657,9 @@ The endpoints, all JSON unless noted, are described in
 | Step | Request |
 | --- | --- |
 | Discovery | `GET /.well-known/warren`: trust domain, API base, sign-in endpoints, trust bundle (root, client CA, infrastructure CA, PEM), protocol versions. Its `api_base` is for sign-in and enrollment only; later calls use the enrollment answer's `api_base`. |
-| Sign-in | `GET /v1/auth/authorize` with `redirect_uri`, `code_challenge`, `code_challenge_method=S256` and `state`, and `prompt=login` when the user asked to sign in again (after a `reauth_required` or `mfa_required` refusal), in the system browser. The redirect URI is an `http` loopback URI on `127.0.0.1` or `[::1]` with any port (RFC 8252 section 7.3), or one the deployment configures exactly; anything else gets an error page, never a redirect. The control plane runs its own authorization-code flow with PKCE and a nonce toward the IdP, sending `max_age` set to the shortest `auth.maxAge` in policy when policy has one, and `prompt=login` when the client sent it, so the IdP authenticates the user afresh rather than reuse its own session; either one obliges the IdP to report `auth_time` (OpenID Connect Core section 3.1.2.1), and an ID token without it leaves the sign-in time unknown ([section 10.4](#104-encodings)). It then redirects to the client with a one-time `code` (valid 2 minutes) and the client's `state`, or with `error` and a human-readable `error_description`. |
+| Sign-in | `GET /v1/auth/authorize` with `redirect_uri`, `code_challenge`, `code_challenge_method=S256` and `state`, and `prompt=login` when the user asked to sign in again (after a `reauth_required` or `mfa_required` refusal), in the system browser. The redirect URI is an `http` loopback URI on `127.0.0.1` or `[::1]` with any port (RFC 8252 section 7.3), or one the deployment configures exactly; anything else gets an error page, never a redirect. The control plane runs its own authorization-code flow with PKCE and a nonce toward the IdP, sending `max_age` set to the shortest `auth.maxAge` in policy when policy has one, and `prompt=login` when the client sent it, so the IdP authenticates the user afresh rather than reuse its own session; either one obliges the IdP to report `auth_time` (OpenID Connect Core section 3.1.2.1), and an ID token without it leaves the sign-in time unknown ([section 10.4](#104-encodings)). It then redirects to the client with a one-time `code` (valid 2 minutes) and the client's `state`, or with `error` and a human-readable `error_description`. When built-in accounts are on and either no IdP is configured or built-in accounts exist, `authorize` answers with the sign-in page instead (below), which offers the IdP as a button (`GET /v1/auth/idp`) when there is one. With the Google preset, `prompt=login` becomes `prompt=select_account` and no `max_age` is sent, since Google supports neither; its ID tokens carry no `auth_time`, so the sign-in time is unknown. |
+| Built-in account | The sign-in page sets a `__Host-warren-signin` cookie (Secure, HttpOnly, SameSite=Strict) and carries the sign-in's `flow` token; each form post must present both, come from the control plane's origin, and moves the sign-in on exactly once. `POST /v1/auth/password` checks the username and password (PBKDF2-HMAC-SHA256); the same page, with the same status, answers an unknown username, a locked account, a wrong password and a disabled account's right password ([threat-model.md T18](threat-model.md#t18-attacks-on-built-in-accounts)). It leads to `POST /v1/auth/code` with a six-digit TOTP code (RFC 6238: SHA-1, 30 s, one step either side, each step accepted once per account) or a single-use recovery code. An account without an authenticator is shown a new secret as a QR code and key instead, and its first code enrolls it; the ten recovery codes are then shown once and `POST /v1/auth/continue` finishes. Finishing redirects (303) to the client exactly as an IdP sign-in does, with `auth_time` the time the code was verified and `mfa` true. `ACCOUNT_LOCKOUT` failed passwords or codes in a row lock the account; `SOURCE_FAILURE_LIMIT` applies per source address (per /64 for IPv6). Pages carry a CSP of `default-src 'none'` with the stylesheet allowed by hash, `form-action` limited to the control plane and the client's redirect URI, and no framing. |
+| Setup link | `GET /v1/auth/setup?token=...` and `POST /v1/auth/setup`: an admin's one-time link, valid `SETUP_LINK_LIFETIME`, sets a built-in account's password (at least 12 characters, not the username). |
 | Session | `POST /v1/auth/token` with a compact JWS (ES256, `typ` `warren-session-request+jws`, the device's public key as the header's `jwk`) whose payload is `{code, code_verifier, redirect_uri, iat}`. The control plane checks the signature, the PKCE verifier, the redirect URI and that `iat` is within `CLOCK_SKEW_ALLOWANCE`, and returns a session bound to that key with a bearer token. |
 | Enrollment | `POST /v1/devices` with a PKCS#10 request signed by the session's device key, platform facts, and where the key lives. The answer, and `GET /v1/devices/current`, carry `api_base`: where every later call goes, verified against the trust bundle with the control-plane URI SAN ([section 10.1](#101-trust-hierarchy)). |
 | Certificates | `POST {api_base}/certificates` with a PKCS#10 request signed by the session's device key. Renewal is the same call. |
@@ -826,6 +833,11 @@ defaults are initial and may change with measurement.
 | `JOIN_TOKEN_LIFETIME` | 1 h, single use | Node bootstrap token |
 | `EVENT_RETENTION` | 7 days | How far back a node can resume the event stream |
 | `SESSION_MAX_LIFETIME` | deployment setting | Maximum time between browser sign-ins |
+| `PASSWORD_KDF` | PBKDF2-HMAC-SHA256, 600,000 iterations, 16-byte salt | Built-in account password hashes; each records its iteration count and is rehashed at sign-in when it falls behind |
+| `ACCOUNT_LOCKOUT` | 5 failures in a row, 15 min | Lockout of a built-in account after failed passwords or codes |
+| `SOURCE_FAILURE_LIMIT` | 20 failures per 15 min by default (`localAccounts.maxFailuresPerSource`; 0 turns it off) | Failed built-in account sign-ins per source address |
+| `SETUP_LINK_LIFETIME` | 72 h, single use | One-time link that sets a built-in account's password |
+| `RECOVERY_CODES` | 10, 50 bits each, single use | Issued when an authenticator is enrolled |
 | `TUNNEL_MTU` | 1280 | Initial tunnel MTU |
 | `TUNNEL_MTU_MAX` | 1380 | Largest tunnel MTU used when proven |
 | `FALLBACK_DELAY` | 300 ms | QUIC head start before racing HTTP/2 |

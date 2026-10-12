@@ -159,7 +159,7 @@ the workspace crates that use it.
 
 | Binary | Third-party crates | Notes |
 | --- | --- | --- |
-| `warren` | 231 | Cedar (about 100, mostly its build-time parser generator) and sqlx with `url` (about 60) are the bulk; the data path's transport stack is most of the rest. |
+| `warren` | 232 | Cedar (about 100, mostly its build-time parser generator) and sqlx with `url` (about 60) are the bulk; the data path's transport stack is most of the rest. |
 | `warren-datapath` | 77 | The transport stack (tokio, quinn, rustls, h2), the aws-lc-rs build (cc, cmake and friends), clap, and base64 and zeroize through warren-core. |
 | `warren-client` | 73 | The data-path set without the clap family. |
 | `warren-client-cli` | 77 | The client core and the clap family. |
@@ -178,6 +178,24 @@ evaluation) is reached through about thirty C functions declared in
 `warren-client`'s `apple` module, not binding crates: security-framework is
 in the control plane's closure through rustls-native-certs, but bringing it
 into the data path would add crates for what those calls do.
+
+Built-in accounts add one crate, to the control plane only:
+
+| Crate | Used by | Why | Notes |
+| --- | --- | --- | --- |
+| qrcode 0.14.1 | warren-control | The QR code an authenticator app scans when a built-in account enrolls TOTP, drawn as inline SVG on the sign-in page | No dependencies with default features off, no `unsafe`, no build script. A QR encoder (Reed-Solomon blocks, masking, version tables) is a few hundred lines that are easy to get subtly wrong; this one is widely used. Grows only the `warren` closure, by one crate. |
+
+Everything else the accounts need comes from crates already here, so the
+crypto stays in the one provider (G16): passwords are hashed with
+PBKDF2-HMAC-SHA256 from aws-lc-rs (600,000 iterations, the current OWASP
+figure for it, recorded in each hash so it can be raised), authenticator codes
+are HMAC-SHA1 from aws-lc-rs as RFC 6238 requires, authenticator secrets are
+sealed with the existing AES-256-GCM key-encryption key, and base32 is a dozen
+lines of encoding. Argon2id is memory-hard and so slower to attack on GPUs,
+but it would bring a second implementation of cryptography (the argon2 and
+blake2 crates) for the one place passwords are stored, where a password alone
+never signs anyone in (G20) and attempts are limited per account and per
+source; that trade was made for PBKDF2 from the FIPS-validated provider.
 
 The control plane's crates stay out of both data-path closures:
 `scripts/check-closure.sh` checks them against

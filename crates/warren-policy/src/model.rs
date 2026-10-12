@@ -252,12 +252,18 @@ pub struct PostureProfile {
     pub checks: Vec<Check>,
 }
 
+/// The prefix that names a built-in account (`local:ada`) or a group warren
+/// itself manages (`local:ops`) in `who`, where the issuer tells a local
+/// principal from one the IdP asserts. No IdP subject or group can carry
+/// it: the control plane refuses such a subject and drops such a group.
+pub const LOCAL_PREFIX: &str = "local:";
+
 /// Who a rule is about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Who {
-    /// IdP subject identifiers or email addresses.
+    /// IdP subject identifiers, email addresses, or `local:` usernames.
     pub users: Vec<String>,
-    /// IdP groups.
+    /// IdP groups, or `local:` groups.
     pub groups: Vec<String>,
 }
 
@@ -380,6 +386,33 @@ pub struct AccessRequestPolicy {
     pub when: When,
 }
 
+/// A `LocalUser`: a built-in account declared as code. Its password and
+/// authenticator are never in the policy directory; the user sets them
+/// through a one-time setup link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalUser {
+    /// Metadata; the name is the username.
+    pub meta: Meta,
+    /// The user's email, lowercased, if given.
+    pub email: Option<String>,
+    /// A name to show for the user.
+    pub display_name: Option<String>,
+}
+
+/// A `LocalGroup`: a group warren manages, referenced in `who` as
+/// `local:<name>`. Members are built-in accounts by username, or users of
+/// the IdP by a verified email, which binds to the first such user to sign
+/// in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalGroup {
+    /// Metadata; the name is the group's.
+    pub meta: Meta,
+    /// Built-in accounts, by username.
+    pub users: Vec<String>,
+    /// IdP users, by verified email, lowercased.
+    pub emails: Vec<String>,
+}
+
 /// Every object read from a policy directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Objects {
@@ -393,6 +426,10 @@ pub struct Objects {
     pub policies: Vec<AccessPolicy>,
     /// Access request policies.
     pub request_policies: Vec<AccessRequestPolicy>,
+    /// Built-in accounts.
+    pub local_users: Vec<LocalUser>,
+    /// Groups warren manages.
+    pub local_groups: Vec<LocalGroup>,
 }
 
 /// Reads every `.yaml` and `.yml` file under `dir`, recursively, in sorted
@@ -704,11 +741,21 @@ fn parse_object(ctx: &mut Ctx<'_>, doc: &Node, out: &mut Objects) {
                 out.request_policies.push(p);
             }
         }
+        "LocalUser" => {
+            if let Some(u) = parse_local_user(ctx, meta, spec) {
+                out.local_users.push(u);
+            }
+        }
+        "LocalGroup" => {
+            if let Some(g) = parse_local_group(ctx, meta, spec) {
+                out.local_groups.push(g);
+            }
+        }
         other => ctx.error(
             doc.line,
             format!(
                 "unknown kind {other:?}; expected ConnectorGroup, App, PostureProfile, \
-                 AccessPolicy or AccessRequestPolicy"
+                 AccessPolicy, AccessRequestPolicy, LocalUser or LocalGroup"
             ),
         ),
     }
@@ -1266,22 +1313,105 @@ fn parse_profile(ctx: &mut Ctx<'_>, meta: Meta, spec: &Node) -> Option<PosturePr
     })
 }
 
+/// Checks that a `local:` principal names a valid username or group.
+fn local_principal(ctx: &mut Ctx<'_>, entry: &str, line: usize, what: &str) -> bool {
+    match entry.strip_prefix(LOCAL_PREFIX) {
+        Some(name) if !valid_id(name) => {
+            ctx.error(
+                line,
+                format!(
+                    "{what} entry {entry:?}: a local {what} must be 1 to 63 lowercase letters, \
+                     digits and '-' after \"{LOCAL_PREFIX}\""
+                ),
+            );
+            false
+        }
+        _ => true,
+    }
+}
+
+/// A plausible email address: something before and after a single `@`.
+fn email_like(s: &str) -> bool {
+    matches!(s.split_once('@'), Some((local, domain))
+        if !local.is_empty() && domain.contains('.') && !domain.contains('@')
+            && !s.chars().any(|c| c.is_whitespace() || c.is_control()))
+}
+
+fn parse_local_user(ctx: &mut Ctx<'_>, meta: Meta, spec: &Node) -> Option<LocalUser> {
+    let f = ctx.fields(spec, "LocalUser spec", &["email", "displayName"])?;
+    let email = match f.get("email") {
+        Some(n) => {
+            let e = ctx.string(n, "email")?.to_ascii_lowercase();
+            if !email_like(&e) {
+                ctx.error(n.line, format!("email {e:?} is not an email address"));
+                return None;
+            }
+            Some(e)
+        }
+        None => None,
+    };
+    let display_name = match f.get("displayName") {
+        Some(n) => Some(ctx.string(n, "displayName")?),
+        None => None,
+    };
+    Some(LocalUser {
+        meta,
+        email,
+        display_name,
+    })
+}
+
+fn parse_local_group(ctx: &mut Ctx<'_>, meta: Meta, spec: &Node) -> Option<LocalGroup> {
+    let f = ctx.fields(spec, "LocalGroup spec", &["members"])?;
+    let mut group = LocalGroup {
+        meta,
+        users: Vec::new(),
+        emails: Vec::new(),
+    };
+    if let Some(m) = f.get("members") {
+        let mf = ctx.fields(m, "members", &["users", "emails"])?;
+        if let Some(u) = mf.get("users") {
+            for (name, line) in ctx.strings(u, "members.users") {
+                if valid_id(&name) {
+                    group.users.push(name);
+                } else {
+                    ctx.error(
+                        line,
+                        format!("members.users entry {name:?} must be a local username"),
+                    );
+                }
+            }
+        }
+        if let Some(e) = mf.get("emails") {
+            for (email, line) in ctx.strings(e, "members.emails") {
+                let email = email.to_ascii_lowercase();
+                if email_like(&email) {
+                    group.emails.push(email);
+                } else {
+                    ctx.error(line, format!("{email:?} is not an email address"));
+                }
+            }
+        }
+    }
+    Some(group)
+}
+
 fn parse_who(ctx: &mut Ctx<'_>, node: &Node, what: &str) -> Option<Who> {
     let f = ctx.fields(node, what, &["users", "groups"])?;
     let mut who = Who::default();
     if let Some(u) = f.get("users") {
-        who.users = ctx
-            .strings(u, "users")
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
+        for (s, line) in ctx.strings(u, "users") {
+            if local_principal(ctx, &s, line, "user") {
+                who.users.push(s);
+            }
+        }
     }
     if let Some(g) = f.get("groups") {
-        who.groups = ctx
-            .strings(g, "groups")
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
+        for (s, line) in ctx.strings(g, "groups") {
+            if local_principal(ctx, &s, line, "group") {
+                who.groups.push(s);
+            }
+        }
     }
     if who.users.is_empty() && who.groups.is_empty() {
         ctx.error(

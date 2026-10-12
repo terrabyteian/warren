@@ -38,6 +38,7 @@ use warren_policy::model::{self, DestinationKind};
 use crate::api::{IdpSignIn, finish_idp_sign_in, s256};
 use crate::app::{App, new_secret, secret_hash};
 use crate::audit::{self, Activity, Actor};
+use crate::oidc::Provider;
 use crate::store::{AuthRequest, ConsoleSession, Device, User, new_id};
 use crate::web::{self, ApiError, Body, param, query, read_body};
 
@@ -389,6 +390,7 @@ fn why_text(why: Option<&str>) -> Option<&'static str> {
         "signed-out" => "You have signed out.",
         "disabled" => "Your warren account is disabled. Contact your administrator.",
         "refused" => "Your identity provider did not complete the sign-in.",
+        "not-allowed" => "This account is not allowed to sign in to warren.",
         "unverified" => {
             "warren could not verify the sign-in with your identity provider. Try again."
         }
@@ -407,7 +409,9 @@ async fn login_page<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Ap
         return Ok(see_other(&next));
     }
     let status = match why {
-        Some("disabled" | "refused" | "unverified" | "browser") => StatusCode::FORBIDDEN,
+        Some("disabled" | "refused" | "not-allowed" | "unverified" | "browser") => {
+            StatusCode::FORBIDDEN
+        }
         _ => StatusCode::OK,
     };
     Ok(html(status, pages::sign_in(&next, why_text(why), false)))
@@ -417,6 +421,17 @@ async fn login_start<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, A
     let q = query(req)?;
     let next = safe_next(param(&q, "next"));
     let reauth = param(&q, "reauth") == Some("1");
+    let Some(idp) = &app.idp else {
+        return Ok(html(
+            StatusCode::NOT_FOUND,
+            pages::message(
+                None,
+                "Sign-in is unavailable",
+                "The console signs in through an identity provider, and this deployment has none.",
+                None,
+            ),
+        ));
+    };
     // Signing in again is for changes, so ask the IdP for a sign-in recent
     // enough for them too.
     let policy_max_age = app.compiled().and_then(|c| c.shortest_max_age());
@@ -441,13 +456,13 @@ async fn login_start<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, A
                 idp_verifier: verifier.clone(),
                 created_at: clock::now_secs(),
                 login: reauth,
+                ..AuthRequest::default()
             },
             clock::now_secs() + LOGIN_LIFETIME,
         )
         .await?;
     let callback = format!("{}/v1/auth/callback", app.config.public_url);
-    match app
-        .idp
+    match idp
         .authorize_url(&callback, &state, &nonce, &s256(&verifier), max_age, reauth)
         .await
     {
@@ -481,6 +496,7 @@ async fn login_start<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, A
 /// the time stays unknown, which is never recent enough for changes.
 pub(crate) async fn finish_sign_in<B>(
     app: &App,
+    idp: &Provider,
     req: &Request<B>,
     q: &[(String, String)],
     pending: &AuthRequest,
@@ -511,8 +527,9 @@ pub(crate) async fn finish_sign_in<B>(
         app.audit(r);
         return back("browser");
     }
-    let (user, auth_time, mfa) = match finish_idp_sign_in(app, q, pending).await? {
+    let (user, auth_time, mfa) = match finish_idp_sign_in(app, idp, q, pending).await? {
         IdpSignIn::Refused => return back("refused"),
+        IdpSignIn::NotAdmitted(_) => return back("not-allowed"),
         IdpSignIn::Unverified => return back("unverified"),
         IdpSignIn::Disabled => return back("disabled"),
         IdpSignIn::Done {
@@ -955,8 +972,8 @@ async fn overview(app: &App, viewer: &Viewer) -> Result<Overview, ApiError> {
     Ok(Overview {
         trust_domain: app.config.trust_domain.clone(),
         public_url: app.config.public_url.clone(),
-        users: users.len(),
-        users_disabled: users.iter().filter(|u| u.disabled).count(),
+        users: users.iter().filter(|u| !u.deleted).count(),
+        users_disabled: users.iter().filter(|u| u.disabled && !u.deleted).count(),
         devices: DeviceCounts {
             approved: count("approved"),
             pending: count("pending"),
@@ -1004,7 +1021,8 @@ fn rules_by_group(app: &App) -> BTreeMap<String, Vec<String>> {
 }
 
 async fn users(app: &App) -> Result<(Vec<UserRow>, Vec<GroupRow>), ApiError> {
-    let users = app.store.users().await?;
+    let mut users = app.store.users().await?;
+    users.retain(|u| !u.deleted);
     let devices = app.store.devices().await?;
     let rows = users
         .iter()

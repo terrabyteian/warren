@@ -61,9 +61,104 @@ paths:
         - { name: state, in: query, required: true, schema: { type: string, maxLength: 512 } }
         - { name: prompt, in: query, required: false, schema: { type: string, enum: [login] }, description: "login when the user asked to sign in again: the identity provider must authenticate them afresh." }
       responses:
-        "302": { description: "Redirect to the identity provider, with max_age set to the shortest auth.maxAge in policy, and prompt=login if the client sent it." }
+        "200":
+          description: >-
+            The sign-in page, when built-in accounts are on and either no
+            identity provider is configured or built-in accounts exist: a
+            username and password form, and a button for the identity
+            provider when there is one. It sets the __Host-warren-signin
+            cookie that binds the sign-in to this browser.
+        "302": { description: "Redirect to the identity provider, with max_age set to the shortest auth.maxAge in policy, and prompt=login if the client sent it (Google: prompt=select_account, and no max_age)." }
         "400": { description: An HTML page explaining why sign-in could not start; never a redirect. }
         "502": { description: The identity provider is unreachable. }
+  /v1/auth/idp:
+    get:
+      tags: [client]
+      operationId: signInWithIdp
+      summary: The sign-in page's identity provider button
+      parameters:
+        - { name: flow, in: query, required: true, schema: { type: string } }
+        - { name: login, in: query, required: false, schema: { type: string, enum: ["0", "1"] } }
+      responses:
+        "302": { description: Redirect to the identity provider, as from authorize. }
+        "400": { description: The sign-in expired, or belongs to another browser. }
+  /v1/auth/password:
+    post:
+      tags: [client]
+      operationId: signInPassword
+      summary: A built-in account's username and password, the first of two steps
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema: { $ref: "#/components/schemas/PasswordForm" }
+      responses:
+        "200": { description: The authenticator code page, or the authenticator enrollment page (with its QR code) for an account without one. }
+        "400": { description: The sign-in expired or belongs to another browser. }
+        "401": { description: "The username or password is incorrect, the username is locked after failed sign-ins, or the account is disabled: the same page and status for an unknown username, a locked account, a wrong password and a disabled account's right password." }
+        "403": { description: The form came from another origin. }
+        "429": { description: Too many failed sign-ins from this source. }
+  /v1/auth/code:
+    post:
+      tags: [client]
+      operationId: signInCode
+      summary: An authenticator code or a recovery code, or the first code of an authenticator being enrolled
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema: { $ref: "#/components/schemas/CodeForm" }
+      responses:
+        "200": { description: After enrollment, the page showing the new recovery codes once. }
+        "303": { description: "Redirect to the client's redirect URI with a one-time code (auth_time now, mfa true) and the client's state." }
+        "400": { description: The sign-in expired or belongs to another browser. }
+        "401": { description: The code is wrong, too old, or was already used, or the account is locked after failed sign-ins (the same page either way). }
+        "403": { description: The form came from another origin. }
+        "429": { description: Too many failed sign-ins from this source. }
+  /v1/auth/continue:
+    post:
+      tags: [client]
+      operationId: signInContinue
+      summary: Finish a sign-in once the new recovery codes were shown
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [flow]
+              properties: { flow: { type: string } }
+      responses:
+        "303": { description: Redirect to the client's redirect URI with a one-time code and the client's state. }
+        "400": { description: The sign-in expired or belongs to another browser. }
+  /v1/auth/setup:
+    get:
+      tags: [client]
+      operationId: setupForm
+      summary: The password form of a one-time setup link
+      parameters:
+        - { name: token, in: query, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The form. }
+        "400": { description: The link expired or was already used. }
+    post:
+      tags: [client]
+      operationId: setupPassword
+      summary: Set a built-in account's password and spend the setup link
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token, password, confirm]
+              properties:
+                token: { type: string }
+                password: { type: string, minLength: 12, maxLength: 256 }
+                confirm: { type: string }
+      responses:
+        "200": { description: The password is set; the user signs in from the app and enrolls an authenticator then. }
+        "400": { description: The passwords differ or are not acceptable, or the link expired. }
   /v1/auth/callback:
     get:
       tags: [client]
@@ -298,7 +393,93 @@ paths:
       tags: [admin]
       operationId: listUsers
       responses:
-        "200": { description: Every user. }
+        "200": { description: "Every user that is not deleted; built-in accounts carry a local object with their state (password set, authenticator, recovery codes left, lockout, managed_by), never their secrets." }
+    post:
+      tags: [admin]
+      operationId: createUser
+      summary: Create a built-in account and get its one-time setup link
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateUserRequest" }
+      responses:
+        "201":
+          description: Created; setup_url is shown once and valid for 72 hours.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { type: object }
+                  setup_url: { type: string }
+                  setup_expires_at: { type: integer }
+        "400": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /v1/admin/users/{user}:
+    delete:
+      tags: [admin]
+      operationId: deleteUser
+      summary: Delete a built-in account; its connections are cut through the push channel
+      description: >-
+        The account stays as a disabled row so its revocation stays in every
+        bundle; its username is freed. Accounts declared in the policy
+        directory are refused with reason managed_in_config.
+      parameters: [{ $ref: "#/components/parameters/user" }]
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /v1/admin/users/{user}/reset:
+    post:
+      tags: [admin]
+      operationId: resetUser
+      summary: Reset a built-in account's credentials and get a new setup link
+      description: >-
+        Clears the password, the authenticator, recovery codes and the
+        lockout, and revokes every live session through the push channel.
+        Also how an account declared in the policy directory gets its first
+        setup link.
+      parameters: [{ $ref: "#/components/parameters/user" }]
+      responses:
+        "200":
+          description: The new setup link.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  setup_url: { type: string }
+                  setup_expires_at: { type: integer }
+                  sessions_revoked: { type: integer }
+        "404": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /v1/admin/users/{user}/unlock:
+    post:
+      tags: [admin]
+      operationId: unlockUser
+      summary: Lift a built-in account's lockout after failed sign-ins
+      parameters: [{ $ref: "#/components/parameters/user" }]
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+  /v1/admin/users/{user}/groups:
+    put:
+      tags: [admin]
+      operationId: setUserGroups
+      summary: Set the local groups a user (built-in or of the IdP) is in through the API
+      description: >-
+        Groups declared as LocalGroup objects in the policy directory are
+        refused with reason managed_in_config. Removing a group ships a new
+        bundle through the push channel.
+      parameters: [{ $ref: "#/components/parameters/user" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GroupsRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/Changed" }
+        "409": { $ref: "#/components/responses/Problem" }
   /v1/admin/users/{user}/disable:
     post:
       tags: [admin]
@@ -321,6 +502,13 @@ paths:
       parameters: [{ $ref: "#/components/parameters/user" }]
       responses:
         "200": { description: The user's sessions, newest first. }
+  /v1/admin/groups:
+    get:
+      tags: [admin]
+      operationId: listGroups
+      summary: warren's own groups, with members, the emails of policy-declared members waiting for their first sign-in, and whether the policy directory or the API manages each
+      responses:
+        "200": { description: The groups. }
   /v1/admin/sessions/{session}/revoke:
     post:
       tags: [admin]
@@ -472,7 +660,7 @@ components:
       description: An infrastructure certificate from the deployment's infrastructure CA, naming an enabled relay or connector.
   parameters:
     user:
-      { name: user, in: path, required: true, schema: { type: string }, description: "User ID, email or IdP subject." }
+      { name: user, in: path, required: true, schema: { type: string }, description: "User ID, email, IdP subject, or a built-in account's username (local:<username> when it could be ambiguous)." }
     device:
       { name: device, in: path, required: true, schema: { type: string } }
   responses:
@@ -633,6 +821,35 @@ components:
             root: { type: string, description: The root CA certificate, DER, base64. }
             clientCas: { type: array, items: { type: string } }
             infraCas: { type: array, items: { type: string } }
+    PasswordForm:
+      type: object
+      required: [flow, username, password]
+      properties:
+        flow: { type: string, description: The sign-in's flow token from the page. }
+        username: { type: string }
+        password: { type: string }
+        login: { type: string, enum: ["0", "1"], description: "1 when the client asked for a fresh sign-in (prompt=login), kept for the identity provider button if the password fails." }
+    CodeForm:
+      type: object
+      required: [flow, code]
+      properties:
+        flow: { type: string }
+        code: { type: string, description: "Six digits from the authenticator app, or a recovery code (xxxxx-xxxxx)." }
+    CreateUserRequest:
+      type: object
+      required: [username]
+      additionalProperties: false
+      properties:
+        username: { type: string, pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$" }
+        email: { type: string }
+        display_name: { type: string }
+        groups: { type: array, items: { type: string }, description: "Local groups, with or without the local: prefix." }
+    GroupsRequest:
+      type: object
+      required: [groups]
+      additionalProperties: false
+      properties:
+        groups: { type: array, items: { type: string } }
     AckRequest:
       type: object
       required: [acks]

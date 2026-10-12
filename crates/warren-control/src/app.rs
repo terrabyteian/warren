@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use http::StatusCode;
 use serde_json::json;
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, watch};
 use warren_core::clock;
 use warren_core::events::Event;
 use warren_core::identity::NodeRole;
@@ -17,14 +17,18 @@ use warren_core::keys::{hex, sha256};
 use warren_core::pki::{self, NodeIdentity};
 use warren_core::policy_bundle::{self, BUNDLE_FORMAT, Bundle, View};
 use warren_policy::compile::{self, Compiled, UserEntity};
-use warren_policy::model;
+use warren_policy::model::{self, LOCAL_PREFIX};
+use zeroize::Zeroizing;
 
 use crate::Error;
+use crate::accounts::{self, SourceLimiter, UnknownNames};
 use crate::audit::{self, Activity, Actor};
-use crate::authority::Authority;
+use crate::authority::{Authority, Kek};
 use crate::config::Config;
 use crate::oidc::Provider;
-use crate::store::{BundleState, DeviceStatus, Node, Session, Store, StoredBundle, User};
+use crate::store::{
+    BundleState, DesiredAccounts, DeviceStatus, Node, Session, Store, StoredBundle, User,
+};
 use crate::web::{ApiError, Peer};
 
 /// The outcome of the last policy load.
@@ -111,8 +115,17 @@ pub struct App {
     pub store: Store,
     /// Keys and CAs.
     pub authority: Authority,
-    /// The IdP.
-    pub idp: Provider,
+    /// The IdP, if one is configured.
+    pub idp: Option<Provider>,
+    /// The key-encryption key, which seals authenticator secrets.
+    pub kek: Kek,
+    /// Failed sign-ins with built-in accounts, per source.
+    pub limiter: SourceLimiter,
+    /// Failed sign-ins with usernames that are not built-in accounts.
+    pub unknown_names: UnknownNames,
+    /// Bounds how many password hashes are computed at once, so sign-in
+    /// attempts cannot take every core.
+    kdf: Semaphore,
     /// The audit sink.
     pub audit: audit::Sink,
     /// The control plane's own node ID.
@@ -141,20 +154,26 @@ pub fn new_secret() -> Result<String, Error> {
 
 impl App {
     /// Assembles the state. Policy is loaded separately.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         store: Store,
         authority: Authority,
-        idp: Provider,
+        kek: Kek,
+        idp: Option<Provider>,
         audit: audit::Sink,
         id: String,
         latest_seq: u64,
     ) -> App {
         App {
+            limiter: SourceLimiter::new(config.local_accounts.max_failures_per_source),
             config,
             store,
             authority,
             idp,
+            kek,
+            unknown_names: UnknownNames::default(),
+            kdf: Semaphore::new(4),
             audit,
             id,
             recent: audit::Recent::new(RECENT_DECISIONS),
@@ -181,13 +200,70 @@ impl App {
         self.audit.write(&serde_json::Value::Object(record));
     }
 
+    /// Runs a password hash computation off the async workers, a few at a
+    /// time.
+    async fn kdf<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, Error> {
+        let _permit = self
+            .kdf
+            .acquire()
+            .await
+            .map_err(|_| Error::Internal("password hashing stopped".into()))?;
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))
+    }
+
+    /// Hashes a new password.
+    pub async fn hash_password(&self, password: Zeroizing<String>) -> Result<String, Error> {
+        self.kdf(move || accounts::hash_password(&password)).await?
+    }
+
+    /// Checks a password against its hash; with no hash, spends the same
+    /// time and fails.
+    pub async fn verify_password(
+        &self,
+        hash: Option<String>,
+        password: Zeroizing<String>,
+    ) -> Result<bool, Error> {
+        self.kdf(move || match hash {
+            Some(hash) => accounts::verify_password(&hash, &password),
+            None => {
+                accounts::verify_nothing(&password);
+                false
+            }
+        })
+        .await
+    }
+
     /// Reads and compiles the policy directory. On success the new policy
     /// takes effect and a bundle is published; on failure the previous
     /// policy stays in force (fail closed: a broken change never ships) and
     /// the errors are returned.
     pub async fn load_policy(&self, actor: &Actor) -> Result<PolicyStatus, Vec<String>> {
         let now = clock::now_secs();
-        match self.compile_policy().await {
+        let compiled = match self.compile_policy().await {
+            Ok(mut compiled) => match self.reconcile_accounts(&compiled.objects).await {
+                Ok(warnings) => {
+                    compiled
+                        .warnings
+                        .extend(warnings.into_iter().map(|message| model::Diagnostic {
+                            severity: model::Severity::Warning,
+                            file: "(built-in accounts)".into(),
+                            line: 0,
+                            message,
+                        }));
+                    Ok(compiled)
+                }
+                Err(e) => Err(vec![format!(
+                    "cannot apply the LocalUser and LocalGroup objects: {e}"
+                )]),
+            },
+            Err(errors) => Err(errors),
+        };
+        match compiled {
             Ok(compiled) => {
                 let digest = compiled.policy.digest.clone();
                 let rules = compiled.policy.rules.len();
@@ -249,7 +325,7 @@ impl App {
         {
             reserved.extend(n.dns_names.iter().cloned());
         }
-        let known_groups: BTreeSet<String> = self
+        let mut known_groups: BTreeSet<String> = self
             .store
             .users()
             .await
@@ -257,13 +333,86 @@ impl App {
             .into_iter()
             .flat_map(|u| u.groups)
             .collect();
+        // A local group with invites only, or declared in the policy
+        // directory, is no misspelling.
+        known_groups.extend(
+            self.store
+                .invites()
+                .await
+                .map_err(unreadable)?
+                .into_iter()
+                .map(|i| format!("{LOCAL_PREFIX}{}", i.group)),
+        );
         let (objects, diags) = model::load_dir(&self.config.policy_dir)
             .map_err(|e| vec![format!("{}: {e}", self.config.policy_dir.display())])?;
+        if !self.config.local_accounts.enabled
+            && let Some(user) = objects.local_users.first()
+        {
+            return Err(vec![format!(
+                "{}: LocalUser {} needs localAccounts enabled in the control plane's configuration",
+                user.meta.source, user.meta.name
+            )]);
+        }
+        known_groups.extend(
+            objects
+                .local_groups
+                .iter()
+                .map(|g| format!("{LOCAL_PREFIX}{}", g.meta.name)),
+        );
         let mut compiled = compile::compile(objects, diags, &reserved)
             .map_err(|d| d.iter().map(|d| d.to_string()).collect::<Vec<_>>())?;
         let unknown = compile::unknown_groups(&compiled.objects, &known_groups);
         compiled.warnings.extend(unknown);
         Ok(compiled)
+    }
+
+    /// Brings built-in accounts and warren's own groups in line with the
+    /// `LocalUser` and `LocalGroup` objects, auditing what changed and
+    /// announcing any revocation. Returns warnings for the operator.
+    async fn reconcile_accounts(&self, objects: &model::Objects) -> Result<Vec<String>, Error> {
+        let desired = DesiredAccounts {
+            users: objects
+                .local_users
+                .iter()
+                .map(|u| (u.meta.name.clone(), u.email.clone(), u.display_name.clone()))
+                .collect(),
+            groups: objects
+                .local_groups
+                .iter()
+                .map(|g| (g.meta.name.clone(), g.users.clone(), g.emails.clone()))
+                .collect(),
+        };
+        let out = self.store.reconcile_accounts(&desired).await?;
+        for event in &out.events {
+            self.announce(Some(event));
+        }
+        for (names, activity, message) in [
+            (
+                &out.created,
+                Activity::AccountCreate,
+                "built-in account created from the policy directory",
+            ),
+            (
+                &out.deleted,
+                Activity::AccountDelete,
+                "built-in account deleted: it left the policy directory",
+            ),
+            (
+                &out.adopted,
+                Activity::Update,
+                "built-in account now managed by the policy directory",
+            ),
+        ] {
+            for name in names {
+                let mut r = audit::record(activity, true, &Actor::System, message);
+                r.insert("user".into(), json!({ "name": name }));
+                self.audit(r);
+            }
+        }
+        if out.changed {
+            self.request_publish();
+        }
+        Ok(out.warnings)
     }
 
     /// Announces committed events to every event stream.
@@ -569,11 +718,17 @@ impl App {
     }
 }
 
+/// Built-in accounts are `local:<username>` to policy, which no IdP
+/// subject can be.
 fn user_entity(u: &User) -> UserEntity {
     UserEntity {
         id: u.id.clone(),
         email: u.email.clone(),
-        subject: u.subject.clone(),
+        subject: if u.is_local() {
+            format!("{LOCAL_PREFIX}{}", u.subject)
+        } else {
+            u.subject.clone()
+        },
         groups: u.groups.clone(),
     }
 }

@@ -16,14 +16,18 @@
 {{- if $cp.keyEncryptionKey.existingSecret }}
 {{- $_ := set $cfg "keyEncryptionKeyFile" (printf "/etc/warren/kek/%s" $cp.keyEncryptionKey.key) }}
 {{- end }}
-{{- if not $cp.idp }}
-{{- fail "controlPlane.idp is required: the control plane's OpenID Connect identity provider (see docs/kubernetes.md)" }}
-{{- end }}
+{{- if $cp.idp }}
 {{- $idp := deepCopy $cp.idp }}
 {{- if $cp.idpClientSecret.existingSecret }}
 {{- $_ := set $idp "clientSecretFile" (printf "/etc/warren/idp/%s" $cp.idpClientSecret.key) }}
 {{- end }}
 {{- $_ := set $cfg "idp" $idp }}
+{{- end }}
+{{- if $cp.bootstrapAdmin.existingSecret }}
+{{- $accounts := deepCopy (default dict (get $cfg "localAccounts")) }}
+{{- $_ := set $accounts "bootstrapAdmin" (dict "username" $cp.bootstrapAdmin.username "passwordFile" (printf "/etc/warren/admin/%s" $cp.bootstrapAdmin.key) "groups" $cp.bootstrapAdmin.groups) }}
+{{- $_ := set $cfg "localAccounts" $accounts }}
+{{- end }}
 {{- $config := toYaml $cfg }}
 apiVersion: v1
 kind: ConfigMap
@@ -197,6 +201,11 @@ spec:
               mountPath: /etc/warren/idp
               readOnly: true
             {{- end }}
+            {{- if $cp.bootstrapAdmin.existingSecret }}
+            - name: admin
+              mountPath: /etc/warren/admin
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -231,6 +240,15 @@ spec:
             items:
               - key: {{ $cp.idpClientSecret.key }}
                 path: {{ $cp.idpClientSecret.key }}
+        {{- end }}
+        {{- if $cp.bootstrapAdmin.existingSecret }}
+        - name: admin
+          secret:
+            secretName: {{ $cp.bootstrapAdmin.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: {{ $cp.bootstrapAdmin.key }}
+                path: {{ $cp.bootstrapAdmin.key }}
         {{- end }}
   {{- if $cp.persistence.enabled }}
   volumeClaimTemplates:

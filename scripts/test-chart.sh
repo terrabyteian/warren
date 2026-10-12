@@ -108,8 +108,8 @@ check cp 'cp.image == "ghcr.io/terrabyteian/warren:0.0.0"' "the control plane im
 check cp 'obj("Service"; "control-plane").spec | .type == "ClusterIP"
   and .ports == [{name: "https", port: 443, targetPort: "https", protocol: "TCP"}]' \
   "the control plane Service is ClusterIP on TCP 443 by default"
-config cp 'has("tls") or has("keyEncryptionKeyFile") or (.idp | has("clientSecretFile")) | not' \
-  "no operator certificate, key-encryption key file or IdP secret unless given"
+config cp 'has("tls") or has("keyEncryptionKeyFile") or (.idp | has("clientSecretFile")) or has("localAccounts") | not' \
+  "no operator certificate, key-encryption key file, IdP secret or first admin unless given"
 check cp '[pod("StatefulSet"; "control-plane").volumes[] | select(.secret)] == []' "no Secrets are mounted unless given"
 check cp '[.[] | select(.kind == "Deployment")] == []' "no relay or connector unless enabled"
 check cp '[obj("ConfigMap"; "bundle")] == []' "no node bundle unless a node is enabled"
@@ -119,6 +119,8 @@ render cp-secrets "${base[@]}" \
   --set controlPlane.tls.existingSecret=warren-tls \
   --set controlPlane.keyEncryptionKey.existingSecret=warren-kek \
   --set controlPlane.idpClientSecret.existingSecret=warren-idp \
+  --set controlPlane.bootstrapAdmin.existingSecret=warren-admin \
+  --set controlPlane.config.localAccounts.maxFailuresPerSource=0 \
   --set 'controlPlane.dnsNames={nodes.warren.lab.test}' \
   --set controlPlane.config.devices.approval=automatic \
   --set controlPlane.service.type=LoadBalancer \
@@ -127,10 +129,25 @@ config cp-secrets '.tls == {certFile: "/etc/warren/tls/tls.crt", keyFile: "/etc/
   "the operator certificate is read from the TLS Secret's mount"
 config cp-secrets '.keyEncryptionKeyFile == "/etc/warren/kek/kek"' "the key-encryption key is read from its Secret's mount"
 config cp-secrets '.idp.clientSecretFile == "/etc/warren/idp/client-secret"' "the IdP client secret is read from its Secret's mount"
-check cp-secrets 'mounts(cp) | .tls == "/etc/warren/tls" and .kek == "/etc/warren/kek" and .idp == "/etc/warren/idp"' \
-  "each Secret is mounted where the configuration reads it"
+config cp-secrets '.localAccounts == {maxFailuresPerSource: 0,
+  bootstrapAdmin: {username: "admin", passwordFile: "/etc/warren/admin/password", groups: ["admins"]}}' \
+  "the first admin's password is read from its Secret's mount, beside the other localAccounts settings"
+check cp-secrets 'mounts(cp) | .tls == "/etc/warren/tls" and .kek == "/etc/warren/kek" and .idp == "/etc/warren/idp"
+  and .admin == "/etc/warren/admin"' "each Secret is mounted where the configuration reads it"
 check cp-secrets '[pod("StatefulSet"; "control-plane").volumes[] | select(.secret) | {(.name): .secret.secretName}] | add
-  == {tls: "warren-tls", kek: "warren-kek", idp: "warren-idp"}' "the mounts are the named Secrets"
+  == {tls: "warren-tls", kek: "warren-kek", idp: "warren-idp", admin: "warren-admin"}' "the mounts are the named Secrets"
+check cp-secrets '[pod("StatefulSet"; "control-plane").volumes[] | select(.name == "admin") | .secret]
+  == [{secretName: "warren-admin", defaultMode: 256, items: [{key: "password", path: "password"}]}]' \
+  "the first admin's Secret is mounted read-only to its owner"
+
+# Built-in accounts only: no identity provider, a first admin with another
+# name and groups.
+render cp-local --set controlPlane.trustDomain=lab.test --set controlPlane.publicUrl=https://warren.lab.test \
+  --set controlPlane.bootstrapAdmin.existingSecret=warren-admin --set controlPlane.bootstrapAdmin.key=pw \
+  --set controlPlane.bootstrapAdmin.username=root-admin --set 'controlPlane.bootstrapAdmin.groups={admins,ops}'
+config cp-local '(has("idp") | not) and .localAccounts.bootstrapAdmin
+  == {username: "root-admin", passwordFile: "/etc/warren/admin/pw", groups: ["admins", "ops"]}' \
+  "without an identity provider the configuration has none, and the first admin is as given"
 config cp-secrets '.dnsNames == ["nodes.warren.lab.test"]' "dnsNames pass through"
 config cp-secrets '.devices.approval == "automatic"' "more configuration merges in"
 check cp-secrets 'obj("ConfigMap"; "control-plane-policy").data == {"lab.yaml": "kind: AccessPolicy\n"}' \
@@ -198,8 +215,6 @@ check nodes-options '[pod("Deployment"; "connector").volumes[] | select(.name ==
 
 # What the chart refuses.
 refuses "controlPlane.trustDomain is required" "a missing trust domain is refused"
-refuses "controlPlane.idp is required" "a missing identity provider is refused" \
-  --set controlPlane.trustDomain=lab.test --set controlPlane.publicUrl=https://warren.lab.test
 refuses "nodes.bundle" "a relay without a node bundle is refused" \
   "${base[@]}" --set relay.enabled=true --set relay.joinToken.existingSecret=relay-join
 refuses "relay.joinToken.existingSecret is required" "a relay without a join token is refused" \

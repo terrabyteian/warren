@@ -168,6 +168,9 @@ pub struct TestIdp {
     pub authorize_requests: Mutex<Vec<HashMap<String, String>>>,
     /// Leave `auth_time` out of ID tokens, as some IdPs do.
     pub omit_auth_time: Mutex<bool>,
+    /// Claims to set in ID tokens over the defaults; a null removes one.
+    /// This is how the IdP passes for another, such as Google.
+    pub claims_patch: Mutex<serde_json::Map<String, Value>>,
 }
 
 impl Handler for TestIdp {
@@ -273,6 +276,14 @@ impl Handler for TestIdp {
                 if *self.omit_auth_time.lock().unwrap() {
                     claims.as_object_mut().unwrap().remove("auth_time");
                 }
+                for (k, v) in self.claims_patch.lock().unwrap().iter() {
+                    let claims = claims.as_object_mut().unwrap();
+                    if v.is_null() {
+                        claims.remove(k);
+                    } else {
+                        claims.insert(k.clone(), v.clone());
+                    }
+                }
                 let header = Header {
                     alg: "ES256".into(),
                     typ: "JWT".into(),
@@ -314,6 +325,7 @@ impl RunningIdp {
             token_requests: Mutex::new(0),
             authorize_requests: Mutex::new(Vec::new()),
             omit_auth_time: Mutex::new(false),
+            claims_patch: Mutex::new(serde_json::Map::new()),
         });
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let key = provider

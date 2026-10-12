@@ -37,7 +37,9 @@ warren login https://warren.example.com
 
 `login` opens your browser at the organization's sign-in page (OAuth 2.0 for
 native apps with PKCE; the browser returns to a one-time listener on
-`127.0.0.1`). After you sign in at your identity provider, the client
+`127.0.0.1`). After you sign in, with a warren account (its password,
+then a code from your authenticator app, which the first sign-in sets up) or
+at your identity provider, the client
 exchanges the one-time code for a session bound to this Mac's device key and
 enrolls the device. Run it without `sudo`: it signs you in as yourself.
 
@@ -62,7 +64,8 @@ An administrator approves the device (`warren admin devices approve
   session; `$BROWSER`, when set, is used instead of the default browser.
 - **Sign in again.** Run `warren login` again whenever warren says so, for
   example when a rule needs a more recent sign-in (`--fresh` asks the
-  identity provider to authenticate you afresh). The same device and key are
+  identity provider to authenticate you afresh; a warren account always
+  does). The same device and key are
   kept, and a running `warren up` is asked to move to the new sign-in
   without restarting; its output shows the renewal. A sign-in that would
   replace the one `warren up` uses (another organization, or a redeployed

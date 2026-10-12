@@ -181,6 +181,22 @@ fn check(objects: &Objects, reserved: &[String], diags: &mut Vec<Diagnostic>) {
         "AccessPolicy or AccessRequestPolicy",
         diags,
     );
+    duplicates(
+        objects
+            .local_users
+            .iter()
+            .map(|u| (u.meta.name.as_str(), &u.meta.source)),
+        "LocalUser",
+        diags,
+    );
+    duplicates(
+        objects
+            .local_groups
+            .iter()
+            .map(|g| (g.meta.name.as_str(), &g.meta.source)),
+        "LocalGroup",
+        diags,
+    );
 
     // Every schedule's time zone gets its own context field.
     let mut fields: BTreeMap<String, (String, Source, usize)> = BTreeMap::new();
@@ -484,12 +500,14 @@ pub fn unknown_groups(objects: &Objects, known: &BTreeSet<String>) -> Vec<Diagno
     let mut diags = Vec::new();
     let mut check = |who: &Who, deny: bool, source: &Source, line: usize| {
         for group in who.groups.iter().filter(|g| !known.contains(*g)) {
+            let has = match group.strip_prefix(crate::model::LOCAL_PREFIX) {
+                Some(name) => format!("no user is in local group {name}"),
+                None => format!("no user has group {group} at the IdP"),
+            };
             let message = if deny {
-                format!(
-                    "no user has group {group} at the IdP yet, so this deny rule blocks nobody; check its spelling"
-                )
+                format!("{has} yet, so this deny rule blocks nobody; check its spelling")
             } else {
-                format!("no user has group {group} at the IdP yet; check its spelling")
+                format!("{has} yet; check its spelling")
             };
             warning(&mut diags, source, line, message);
         }

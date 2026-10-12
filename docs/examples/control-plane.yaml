@@ -54,9 +54,30 @@ keyEncryptionKeyFile: /etc/warren/kek
 # not compile changes nothing.
 policyDir: /etc/warren/policy
 
-# Any OpenID Connect identity provider. Register warren with the redirect
-# URI https://warren.example.com/v1/auth/callback.
+# Built-in warren accounts: a password and an authenticator app (TOTP) for
+# every sign-in. On unless enabled is false, which needs an idp. The first
+# admin is created from bootstrapAdmin.passwordFile on the first start that
+# finds no built-in account; the file is never read again (see
+# docs/operating.md).
+localAccounts:
+  enabled: true
+  bootstrapAdmin:
+    username: admin
+    passwordFile: /etc/warren/admin-password
+    groups: [admins]          # local:admins in policy
+  maxFailuresPerSource: 20    # failed sign-ins per source per 15 minutes; 0: no limit
+
+# An identity provider, optional when built-in accounts are on. Any OpenID
+# Connect provider; register warren with the redirect URI
+# https://warren.example.com/v1/auth/callback. For Google, use instead:
+#   idp:
+#     type: google
+#     clientId: 123456789012-abc.apps.googleusercontent.com
+#     clientSecretFile: /etc/warren/google-client-secret
+#     hostedDomain: example.com           # optional
+#     allowedEmails: [contractor@gmail.com]   # optional
 idp:
+  # displayName: Example SSO                        # the sign-in page's button
   issuer: https://idp.example.com
   clientId: warren
   clientSecretFile: /etc/warren/idp-client-secret   # omit for a public client (PKCE only)

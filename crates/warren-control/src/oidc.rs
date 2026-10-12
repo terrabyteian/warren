@@ -6,6 +6,11 @@
 //! asymmetric allowlist and match its key, the issuer must match exactly,
 //! the audience must include warren, the nonce must be the one sent, and
 //! the token must be within its validity with the configured clock skew.
+//!
+//! The Google preset (`idp.type: google`) skips discovery for its known
+//! endpoints, accepts both spellings of Google's issuer, and admits only
+//! accounts with a verified email, of the configured Workspace domain or on
+//! the allowed list when either is set ([`Provider::admits`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,8 +27,9 @@ use warren_core::jose::b64url_decode;
 use zeroize::Zeroizing;
 
 use crate::Error;
-use crate::config;
+use crate::config::{self, IdpKind};
 use crate::web::Client;
+use warren_policy::model::LOCAL_PREFIX;
 
 /// What the IdP's discovery document says.
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +57,8 @@ pub struct SignIn {
     pub issued_at: i64,
     /// Whether the authentication used multi-factor authentication.
     pub mfa: bool,
+    /// Google: the Workspace domain of the account (the `hd` claim), if any.
+    pub hosted_domain: Option<String>,
 }
 
 struct Keys {
@@ -104,10 +112,25 @@ impl Provider {
         })
     }
 
+    /// The provider's configuration.
+    pub fn config(&self) -> &config::Idp {
+        &self.config
+    }
+
     async fn metadata(&self) -> Result<Arc<Metadata>, Error> {
         let mut slot = self.metadata.lock().await;
         if let Some(m) = slot.as_ref() {
             return Ok(m.clone());
+        }
+        if let Some(e) = &self.config.endpoints {
+            let m = Arc::new(Metadata {
+                issuer: self.config.issuer.clone(),
+                authorization_endpoint: e.authorization.clone(),
+                token_endpoint: e.token.clone(),
+                jwks_uri: e.jwks.clone(),
+            });
+            *slot = Some(m.clone());
+            return Ok(m);
         }
         let url = format!("{}/.well-known/openid-configuration", self.config.issuer);
         let reply = self.http.request(Method::GET, &url, &[], None).await?;
@@ -140,7 +163,11 @@ impl Provider {
     /// authenticate the user again if they last did longer ago than that
     /// many seconds, and `login` to authenticate them again regardless
     /// (OpenID Connect Core section 3.1.2.1); either way the ID token must
-    /// then carry `auth_time`.
+    /// then carry `auth_time`. Google supports neither: it is asked to show
+    /// its account chooser instead, and its ID tokens report no
+    /// authentication time, so freshness rules ask Google users to sign in
+    /// again every time. A hosted domain is passed on as Google's `hd`
+    /// hint; the `hd` claim is what is enforced.
     pub async fn authorize_url(
         &self,
         redirect_uri: &str,
@@ -161,11 +188,23 @@ impl Provider {
             .append_pair("nonce", nonce)
             .append_pair("code_challenge", challenge)
             .append_pair("code_challenge_method", "S256");
-        if let Some(max_age) = max_age {
-            query.append_pair("max_age", &max_age.to_string());
-        }
-        if login {
-            query.append_pair("prompt", "login");
+        match self.config.kind {
+            IdpKind::Oidc => {
+                if let Some(max_age) = max_age {
+                    query.append_pair("max_age", &max_age.to_string());
+                }
+                if login {
+                    query.append_pair("prompt", "login");
+                }
+            }
+            IdpKind::Google => {
+                if login {
+                    query.append_pair("prompt", "select_account");
+                }
+                if let Some(hd) = &self.config.hosted_domain {
+                    query.append_pair("hd", hd);
+                }
+            }
         }
         let query = query.finish();
         let sep = if m.authorization_endpoint.contains('?') {
@@ -320,7 +359,7 @@ impl Provider {
         let bad = |why: &str| Error::Idp(format!("ID token rejected: {why}"));
         let str_claim = |name: &str| claims.get(name).and_then(Value::as_str);
         let int_claim = |name: &str| claims.get(name).and_then(Value::as_i64);
-        if str_claim("iss").map(|i| i.trim_end_matches('/')) != Some(self.config.issuer.as_str()) {
+        if !str_claim("iss").is_some_and(|i| self.config.issued_by(i)) {
             return Err(bad("wrong issuer"));
         }
         let audiences: Vec<&str> = match claims.get("aud") {
@@ -350,6 +389,13 @@ impl Provider {
         let subject = str_claim("sub")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| bad("no subject"))?;
+        // `local:` names warren's built-in accounts in policy; no IdP
+        // subject may pass for one.
+        if subject.starts_with(LOCAL_PREFIX) {
+            return Err(bad(
+                "the subject uses the prefix reserved for built-in accounts",
+            ));
+        }
         let auth_time = int_claim("auth_time");
         if auth_time.is_some_and(|t| t > now + self.skew) {
             return Err(bad("authentication time in the future"));
@@ -363,7 +409,8 @@ impl Provider {
             (Some(e), Some(true)) => e.to_ascii_lowercase(),
             _ => String::new(),
         };
-        let groups = match claims.get(&self.config.groups_claim) {
+        let mut groups: Vec<String> = match claims.get(&self.config.groups_claim) {
+            _ if self.config.groups_claim.is_empty() => Vec::new(),
             Some(Value::Array(g)) => g
                 .iter()
                 .filter_map(Value::as_str)
@@ -372,6 +419,16 @@ impl Provider {
             Some(Value::String(g)) => vec![g.clone()],
             _ => Vec::new(),
         };
+        // Groups named `local:` are warren's own; the IdP cannot assert
+        // membership in them.
+        let before = groups.len();
+        groups.retain(|g| !g.starts_with(LOCAL_PREFIX));
+        if groups.len() != before {
+            crate::log::warn(
+                "idp",
+                "ignored groups the IdP asserted with the prefix reserved for warren's own groups (local:)",
+            );
+        }
         let amr: Vec<&str> = claims
             .get("amr")
             .and_then(Value::as_array)
@@ -382,6 +439,7 @@ impl Provider {
             .any(|v| self.config.mfa_amr_values.iter().any(|m| m == v))
             || str_claim("acr")
                 .is_some_and(|acr| self.config.mfa_acr_values.iter().any(|m| m == acr));
+        let hosted_domain = str_claim("hd").map(str::to_ascii_lowercase);
         Ok(SignIn {
             subject: subject.to_owned(),
             email,
@@ -389,7 +447,42 @@ impl Provider {
             auth_time,
             issued_at: iat,
             mfa,
+            hosted_domain,
         })
+    }
+
+    /// Whether a verified sign-in may proceed, or why not, in words for the
+    /// person signing in. Google admits only accounts with a verified email,
+    /// and when a hosted domain or allowed emails are configured, only
+    /// accounts of that Workspace domain (by the `hd` claim, never the
+    /// email's domain) or on that list.
+    pub fn admits(&self, signin: &SignIn) -> Result<(), String> {
+        if self.config.kind != IdpKind::Google {
+            return Ok(());
+        }
+        if signin.email.is_empty() {
+            return Err(
+                "Google did not confirm this account's email address, so warren cannot accept it."
+                    .into(),
+            );
+        }
+        let restricted =
+            self.config.hosted_domain.is_some() || !self.config.allowed_emails.is_empty();
+        let in_domain = self
+            .config
+            .hosted_domain
+            .as_ref()
+            .is_some_and(|d| signin.hosted_domain.as_ref() == Some(d));
+        let listed = self.config.allowed_emails.contains(&signin.email);
+        if restricted && !in_domain && !listed {
+            return Err(match &self.config.hosted_domain {
+                Some(d) => format!(
+                    "This Google account is not allowed to sign in to warren. Use your {d} account."
+                ),
+                None => "This Google account is not allowed to sign in to warren.".into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -461,7 +554,13 @@ mod tests {
     fn provider() -> Provider {
         Provider {
             config: config::Idp {
+                kind: IdpKind::Oidc,
+                display_name: "your identity provider".into(),
                 issuer: "https://idp.example.com".into(),
+                issuer_aliases: vec![],
+                endpoints: None,
+                hosted_domain: None,
+                allowed_emails: vec![],
                 client_id: "warren".into(),
                 client_secret_file: None,
                 scopes: vec!["openid".into()],
@@ -604,6 +703,118 @@ mod tests {
         assert!(!s.mfa);
         c["acr"] = json!("urn:example:mfa");
         assert!(p.check_claims(&c, "n", 1_500).unwrap().mfa);
+    }
+
+    fn google() -> Provider {
+        let mut p = provider();
+        p.config.kind = IdpKind::Google;
+        p.config.issuer = config::GOOGLE_ISSUER.into();
+        p.config.issuer_aliases = vec!["accounts.google.com".into()];
+        p.config.groups_claim = String::new();
+        p.config.mfa_amr_values = vec![];
+        p.config.mfa_acr_values = vec![];
+        p.config.endpoints = Some(config::Endpoints {
+            authorization: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token: "https://oauth2.googleapis.com/token".into(),
+            jwks: "https://www.googleapis.com/oauth2/v3/certs".into(),
+        });
+        p
+    }
+
+    /// Claims as Google issues them: no groups, no amr, no auth_time.
+    fn google_claims() -> Value {
+        json!({
+            "iss": "accounts.google.com",
+            "azp": "warren",
+            "aud": "warren",
+            "sub": "110169484474386276334",
+            "hd": "example.com",
+            "email": "ada@example.com",
+            "email_verified": true,
+            "at_hash": "HK6E_P6Dh8Y93mRNtsDB1Q",
+            "nonce": "n",
+            "iat": 1_000,
+            "exp": 2_000,
+            "groups": ["admins"],
+        })
+    }
+
+    #[test]
+    fn google_claims_and_who_may_sign_in() {
+        let mut p = google();
+        let s = p.check_claims(&google_claims(), "n", 1_500).unwrap();
+        assert_eq!(s.subject, "110169484474386276334");
+        assert_eq!(s.email, "ada@example.com");
+        assert_eq!(s.hosted_domain.as_deref(), Some("example.com"));
+        // Google asserts no groups; a claim by that name is not trusted.
+        assert!(s.groups.is_empty());
+        assert_eq!(s.auth_time, None);
+        assert!(!s.mfa);
+        let mut c = google_claims();
+        c["iss"] = json!("https://accounts.google.com");
+        assert!(p.check_claims(&c, "n", 1_500).is_ok());
+        c["iss"] = json!("https://accounts.google.com.example.net");
+        assert!(p.check_claims(&c, "n", 1_500).is_err());
+
+        // With no restriction, any account with a verified email.
+        assert!(p.admits(&s).is_ok());
+        let mut unverified = google_claims();
+        unverified["email_verified"] = json!(false);
+        let u = p.check_claims(&unverified, "n", 1_500).unwrap();
+        assert!(p.admits(&u).unwrap_err().contains("email"));
+
+        // A hosted domain admits its accounts by the hd claim alone.
+        p.config.hosted_domain = Some("example.com".into());
+        assert!(p.admits(&s).is_ok());
+        let mut gmail = google_claims();
+        gmail.as_object_mut().unwrap().remove("hd");
+        gmail["email"] = json!("ada@example.com");
+        let g = p.check_claims(&gmail, "n", 1_500).unwrap();
+        let refusal = p.admits(&g).unwrap_err();
+        assert!(refusal.contains("example.com account"), "{refusal}");
+        // Allowed emails add to the domain.
+        p.config.allowed_emails = vec!["ada@example.com".into()];
+        assert!(p.admits(&g).is_ok());
+        p.config.hosted_domain = None;
+        let mut other = google_claims();
+        other["email"] = json!("eve@example.com");
+        let o = p.check_claims(&other, "n", 1_500).unwrap();
+        assert!(p.admits(&o).is_err());
+        assert!(p.admits(&s).is_ok());
+    }
+
+    #[test]
+    fn local_principals_cannot_come_from_an_idp() {
+        let p = provider();
+        let mut c = claims();
+        c["sub"] = json!("local:admin");
+        assert!(p.check_claims(&c, "n", 1_500).is_err());
+        let mut c = claims();
+        c["groups"] = json!(["engineering", "local:admins"]);
+        assert_eq!(
+            p.check_claims(&c, "n", 1_500).unwrap().groups,
+            ["engineering"]
+        );
+    }
+
+    #[tokio::test]
+    async fn google_is_asked_for_what_it_supports() {
+        let mut p = google();
+        p.config.hosted_domain = Some("example.com".into());
+        let url = p
+            .authorize_url("https://cp/cb", "s", "n", "c", Some(3600), true)
+            .await
+            .unwrap();
+        assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        let (_, query) = url.split_once('?').unwrap();
+        let params: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("prompt"), Some("select_account"));
+        assert_eq!(get("max_age"), None);
+        assert_eq!(get("hd"), Some("example.com"));
+        assert_eq!(get("scope"), Some("openid"));
     }
 
     #[test]

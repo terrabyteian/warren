@@ -15,4 +15,5 @@ fn the_example_configuration_is_valid() {
     assert!(config.reserved().contains(&"idp.example.com".to_owned()));
     assert_eq!(config.internal_url(), "https://nodes.warren.example.com");
     assert_eq!(config.connections.max_per_source, 64);
+    assert_eq!(config.local_accounts.max_failures_per_source, 20);
 }

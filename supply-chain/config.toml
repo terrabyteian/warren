@@ -711,6 +711,11 @@ version = "0.1.32"
 criteria = "safe-to-deploy"
 notes = "M1 dependency closure, exempted without review; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
 
+[[exemptions.qrcode]]
+version = "0.14.1"
+criteria = "safe-to-deploy"
+notes = "Control plane only (QR codes for authenticator enrollment on the sign-in page), never in a data-path build; no dependencies, no unsafe, no build script, no I/O outside its unused qrencode binary. Exempted without a recorded audit; replace with an audit, an imported audit or reviewed publisher trust before the M4 external audit (docs/dependencies.md section 4)"
+
 [[exemptions.r-efi]]
 version = "6.0.0"
 criteria = "safe-to-deploy"

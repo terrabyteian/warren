@@ -113,6 +113,14 @@ fn roles() -> Vec<&'static str> {
 }
 
 #[cfg(feature = "control-plane")]
+fn group_arg() -> Arg {
+    Arg::new("group")
+        .long("group")
+        .action(clap::ArgAction::Append)
+        .help("A local group (repeatable)")
+}
+
+#[cfg(feature = "control-plane")]
 fn admin_command() -> Command {
     let id = |name: &'static str, help: &'static str| Arg::new(name).required(true).help(help);
     let action = |name: &'static str, about: &'static str, arg: Arg| {
@@ -130,24 +138,68 @@ fn admin_command() -> Command {
         )
         .subcommand(
             Command::new("users")
-                .about("Users")
+                .about("Users: the IdP's and built-in accounts")
                 .subcommand_required(true)
                 .subcommand(Command::new("list").about("List users"))
+                .subcommand(
+                    Command::new("create")
+                        .about("Create a built-in account and print its one-time setup link")
+                        .arg(id(
+                            "username",
+                            "Username: lowercase letters, digits and '-'",
+                        ))
+                        .arg(Arg::new("email").long("email").help("The user's email"))
+                        .arg(
+                            Arg::new("name")
+                                .long("name")
+                                .help("A name to show for the user"),
+                        )
+                        .arg(group_arg()),
+                )
+                .subcommand(action(
+                    "delete",
+                    "Delete a built-in account and cut its connections",
+                    id("user", "User ID, username or email"),
+                ))
                 .subcommand(action(
                     "disable",
                     "Disable a user and cut their connections",
-                    id("user", "User ID, email or IdP subject"),
+                    id("user", "User ID, email, IdP subject or username"),
                 ))
                 .subcommand(action(
                     "enable",
                     "Enable a user",
-                    id("user", "User ID, email or IdP subject"),
+                    id("user", "User ID, email, IdP subject or username"),
                 ))
+                .subcommand(action(
+                    "reset",
+                    "Clear a built-in account's password and authenticator, revoke its sessions, and print a new setup link",
+                    id("user", "User ID, username or email"),
+                ))
+                .subcommand(action(
+                    "unlock",
+                    "Lift a built-in account's lockout after failed sign-ins",
+                    id("user", "User ID, username or email"),
+                ))
+                .subcommand(
+                    action(
+                        "groups",
+                        "Set the local groups a user is in (no --group: none)",
+                        id("user", "User ID, email, IdP subject or username"),
+                    )
+                    .arg(group_arg()),
+                )
                 .subcommand(action(
                     "sessions",
                     "List a user's sessions",
-                    id("user", "User ID, email or IdP subject"),
+                    id("user", "User ID, email, IdP subject or username"),
                 )),
+        )
+        .subcommand(
+            Command::new("groups")
+                .about("warren's own groups, named local:<group> in policy")
+                .subcommand_required(true)
+                .subcommand(Command::new("list").about("List local groups with their members and invites")),
         )
         .subcommand(
             Command::new("sessions")
@@ -440,9 +492,9 @@ fn run(name: &str, matches: &ArgMatches) -> Result<(), String> {
 #[cfg(feature = "control-plane")]
 fn path_segment(value: &str) -> Result<&str, String> {
     if !value.is_empty()
-        && value
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'@' | b'+'))
+        && value.bytes().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'@' | b'+' | b':')
+        })
     {
         Ok(value)
     } else {
@@ -464,8 +516,43 @@ fn admin_request(m: &ArgMatches) -> Result<(&'static str, String, Option<String>
             .and_then(path_segment)
     };
     let action = sub.subcommand_name().unwrap_or("");
+    let groups = || -> Vec<String> {
+        sub.subcommand()
+            .and_then(|(_, a)| a.get_many::<String>("group"))
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    };
+    let text = |name: &str| -> Option<String> {
+        sub.subcommand()
+            .and_then(|(_, a)| a.get_one::<String>(name))
+            .cloned()
+    };
     Ok(match (group, action) {
         ("users", "list") => ("GET", "/v1/admin/users".into(), None),
+        ("users", "create") => {
+            let mut body = serde_json::Map::new();
+            body.insert("username".into(), arg("username")?.into());
+            if let Some(email) = text("email") {
+                body.insert("email".into(), email.into());
+            }
+            if let Some(name) = text("name") {
+                body.insert("display_name".into(), name.into());
+            }
+            body.insert("groups".into(), groups().into());
+            (
+                "POST",
+                "/v1/admin/users".into(),
+                Some(serde_json::Value::Object(body).to_string()),
+            )
+        }
+        ("users", "delete") => ("DELETE", format!("/v1/admin/users/{}", arg("user")?), None),
+        ("users", "groups") => (
+            "PUT",
+            format!("/v1/admin/users/{}/groups", arg("user")?),
+            Some(serde_json::json!({ "groups": groups() }).to_string()),
+        ),
         ("users", "sessions") => (
             "GET",
             format!("/v1/admin/users/{}/sessions", arg("user")?),
@@ -476,6 +563,7 @@ fn admin_request(m: &ArgMatches) -> Result<(&'static str, String, Option<String>
             format!("/v1/admin/users/{}/{a}", arg("user")?),
             None,
         ),
+        ("groups", "list") => ("GET", "/v1/admin/groups".into(), None),
         ("sessions", "revoke") => (
             "POST",
             format!("/v1/admin/sessions/{}/revoke", arg("session")?),
@@ -752,6 +840,57 @@ mod tests {
                 None,
             ),
             (&["deployment"], "GET", "/v1/admin/deployment", None),
+            (
+                &[
+                    "users",
+                    "create",
+                    "ada",
+                    "--email",
+                    "ada@example.com",
+                    "--name",
+                    "Ada \"the Countess\" Lovelace",
+                    "--group",
+                    "ops",
+                    "--group",
+                    "admins",
+                ],
+                "POST",
+                "/v1/admin/users",
+                Some(
+                    r#"{"username":"ada","email":"ada@example.com","display_name":"Ada \"the Countess\" Lovelace","groups":["ops","admins"]}"#,
+                ),
+            ),
+            (
+                &["users", "delete", "local:ada"],
+                "DELETE",
+                "/v1/admin/users/local:ada",
+                None,
+            ),
+            (
+                &["users", "reset", "ada"],
+                "POST",
+                "/v1/admin/users/ada/reset",
+                None,
+            ),
+            (
+                &["users", "unlock", "ada"],
+                "POST",
+                "/v1/admin/users/ada/unlock",
+                None,
+            ),
+            (
+                &["users", "groups", "ada", "--group", "ops"],
+                "PUT",
+                "/v1/admin/users/ada/groups",
+                Some(r#"{"groups":["ops"]}"#),
+            ),
+            (
+                &["users", "groups", "ada"],
+                "PUT",
+                "/v1/admin/users/ada/groups",
+                Some(r#"{"groups":[]}"#),
+            ),
+            (&["groups", "list"], "GET", "/v1/admin/groups", None),
         ];
         for (args, method, path, body) in cases {
             let argv: Vec<&str> = ["warren", "admin"]
