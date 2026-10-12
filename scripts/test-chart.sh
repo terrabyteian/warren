@@ -30,6 +30,7 @@ yaml2json() { ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load_stream($stdin.
 # per line on stdout. helm and yaml2json keep the last of them, but
 # kustomize (and so Flux's post-renderer) and kubeconform -strict refuse the
 # document.
+# shellcheck disable=SC2016 # the #{} interpolations are Ruby's
 repeated_keys() {
   ruby -ryaml -e '
     def walk(node)
