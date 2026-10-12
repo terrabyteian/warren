@@ -95,8 +95,8 @@ paths:
       responses:
         "200": { description: The authenticator code page, or the authenticator enrollment page (with its QR code) for an account without one. }
         "400": { description: The sign-in expired or belongs to another browser. }
-        "401": { description: The username or password is incorrect (the same page either way). }
-        "403": { description: The account is locked or disabled, or the form came from another origin. }
+        "401": { description: "The username or password is incorrect, or the username is locked after failed sign-ins: the same page and status for an unknown username, a locked account and a wrong password." }
+        "403": { description: The password is correct but the account is disabled, or the form came from another origin. }
         "429": { description: Too many failed sign-ins from this source. }
   /v1/auth/code:
     post:
@@ -112,8 +112,8 @@ paths:
         "200": { description: After enrollment, the page showing the new recovery codes once. }
         "303": { description: "Redirect to the client's redirect URI with a one-time code (auth_time now, mfa true) and the client's state." }
         "400": { description: The sign-in expired or belongs to another browser. }
-        "401": { description: The code is wrong, too old, or was already used. }
-        "403": { description: The account is locked. }
+        "401": { description: The code is wrong, too old, or was already used, or the account is locked after failed sign-ins (the same page either way). }
+        "403": { description: The form came from another origin. }
         "429": { description: Too many failed sign-ins from this source. }
   /v1/auth/continue:
     post:
@@ -828,6 +828,7 @@ components:
         flow: { type: string, description: The sign-in's flow token from the page. }
         username: { type: string }
         password: { type: string }
+        login: { type: string, enum: ["0", "1"], description: "1 when the client asked for a fresh sign-in (prompt=login), kept for the identity provider button if the password fails." }
     CodeForm:
       type: object
       required: [flow, code]
