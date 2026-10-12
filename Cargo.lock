@@ -2733,9 +2733,12 @@ name = "warren"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "libc",
  "rustls",
+ "serde_json",
  "tokio",
  "tracing",
+ "warren-client",
  "warren-connector",
  "warren-control",
  "warren-core",
@@ -2750,10 +2753,13 @@ dependencies = [
  "bytes",
  "quinn",
  "rustls",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "warren-core",
  "warren-masque",
+ "zeroize",
 ]
 
 [[package]]
@@ -2824,17 +2830,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "warren-ffi"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "tokio",
+ "warren-client",
+ "warren-core",
+]
+
+[[package]]
 name = "warren-harness"
 version = "0.0.0"
 dependencies = [
  "aws-lc-rs",
  "bytes",
  "clap",
+ "http",
  "rustls",
  "serde_json",
  "tokio",
  "warren-client",
  "warren-connector",
+ "warren-control",
  "warren-core",
  "warren-masque",
  "warren-relay",

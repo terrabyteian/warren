@@ -36,4 +36,6 @@ pub mod quic;
 pub mod tls;
 #[cfg(target_os = "linux")]
 pub mod tun;
+#[cfg(target_os = "macos")]
+pub mod utun;
 pub mod vsock;

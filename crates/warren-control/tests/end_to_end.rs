@@ -255,6 +255,15 @@ async fn sign_in_enroll_certify_and_revoke() {
         discovery.authorize_endpoint,
         format!("{}/v1/auth/authorize", d.base)
     );
+    // The admin can read the root fingerprint clients pin.
+    let (status, deployment) = d.admin("GET", "/v1/admin/deployment", None).await;
+    assert_eq!(status, 200);
+    let root = pem_certs(&d.bundle).remove(0);
+    assert_eq!(
+        deployment["root_fingerprint"],
+        format!("sha256:{}", sha256_hex(&root))
+    );
+    assert_eq!(deployment["trust_domain"], "example.test");
 
     // Sign in through the IdP; the session is bound to the device key.
     let session = client.sign_in().await;

@@ -9,8 +9,24 @@
 //! When the outer path breaks, the core re-dials and the inner session
 //! migrates instead of restarting.
 //!
+//! Around the tunnel, the client core holds everything a native shell
+//! shares: signing in and enrolling ([`signin`]), the device key in the
+//! Secure Enclave ([`device`]), the control-plane calls of link D
+//! ([`control`]), the state kept between runs ([`state`]), relay choice
+//! ([`relays`]), and the engine that keeps one tunnel per connector group
+//! and routes only internal apps into them ([`engine`]).
+//!
 //! This crate is a data-path build: it must never link control-plane,
 //! console or Kubernetes crates, which `scripts/check-closure.sh` enforces.
+
+#[cfg(target_os = "macos")]
+mod apple;
+pub mod control;
+pub mod device;
+pub mod engine;
+pub mod relays;
+pub mod signin;
+pub mod state;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -24,7 +40,9 @@ use tracing::{debug, info, warn};
 use warren_core::params;
 use warren_core::pki::{self, ClientIdentity, TrustBundle};
 use warren_core::quic::{self, Layer, TransportTuning};
-use warren_core::tls::{self, Credentials, ExpectServer, NoRevocations, WarrenServerVerifier};
+use warren_core::tls::{
+    self, DeviceCredentials, ExpectServer, NoRevocations, WarrenServerVerifier,
+};
 use warren_core::vsock::{self, Inbound, PacketSink, VirtualSocket};
 use warren_masque::capsule::{
     AddressEntry, Capsule, CertRefresh, FlowDenied, IpRange, NameBind, Notice, split_context,
@@ -46,8 +64,9 @@ pub struct ClientConfig {
     pub relays: Vec<RelayAddress>,
     /// Carrier selection.
     pub transport: TransportMode,
-    /// The user+device certificate and key.
-    pub credentials: Credentials,
+    /// The user+device certificate and the device key, which may live in
+    /// hardware.
+    pub credentials: DeviceCredentials,
     /// The deployment trust bundle.
     pub trust: Arc<TrustBundle>,
     /// The tunnel MTU (never below the 1280-byte floor).
@@ -138,6 +157,8 @@ pub struct TunnelInfo {
     pub tunnel_mtu: u16,
     /// The verified identity.
     pub identity: ClientIdentity,
+    /// The relay the session was set up through.
+    pub relay: String,
 }
 
 /// Counters for diagnostics.
@@ -192,7 +213,7 @@ pub struct Tunnel {
     carrier: watch::Receiver<Option<CarrierKind>>,
     _endpoint: quinn::Endpoint,
     shutdown: Arc<watch::Sender<bool>>,
-    renew: watch::Sender<Option<Credentials>>,
+    renew: watch::Sender<Option<DeviceCredentials>>,
 }
 
 impl Tunnel {
@@ -274,9 +295,10 @@ impl Tunnel {
     /// device key, which may live in hardware.
     pub async fn refresh_certificate(
         &self,
-        credentials: Credentials,
+        credentials: impl Into<DeviceCredentials>,
         sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>,
     ) -> Result<(), String> {
+        let credentials = credentials.into();
         let mut exporter = [0u8; 32];
         self.inner
             .export_keying_material(&mut exporter, REFRESH_EXPORTER_LABEL, b"")
@@ -284,7 +306,7 @@ impl Tunnel {
         let signature = sign(&exporter)?;
         let capsule = Capsule::CertRefresh(CertRefresh {
             chain: credentials
-                .chain
+                .chain()
                 .iter()
                 .map(|c| Bytes::copy_from_slice(c))
                 .collect(),
@@ -501,15 +523,18 @@ struct OuterConfigs {
     h2: Arc<rustls::ClientConfig>,
 }
 
-fn outer_configs(config: &ClientConfig, creds: &Credentials) -> Result<OuterConfigs, ConnectError> {
+fn outer_configs(
+    config: &ClientConfig,
+    creds: &DeviceCredentials,
+) -> Result<OuterConfigs, ConnectError> {
     let verifier = Arc::new(WarrenServerVerifier::new(
         config.trust.clone(),
         ExpectServer::Relay,
         Arc::new(NoRevocations),
     ));
-    let quic_tls = tls::client_config(creds, verifier.clone(), tls::ALPN_H3)
+    let quic_tls = tls::device_client_config(creds, verifier.clone(), tls::ALPN_H3)
         .map_err(|e| ConnectError::Credentials(e.to_string()))?;
-    let h2 = tls::client_config(creds, verifier, tls::ALPN_H2)
+    let h2 = tls::device_client_config(creds, verifier, tls::ALPN_H2)
         .map_err(|e| ConnectError::Credentials(e.to_string()))?;
     Ok(OuterConfigs {
         quic: quic::client_config(quic_tls, Layer::Outer, config.tuning),
@@ -528,7 +553,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
     }
     let leaf = config
         .credentials
-        .chain
+        .chain()
         .first()
         .ok_or_else(|| ConnectError::Credentials("empty certificate chain".into()))?;
     let identity = pki::check_client_profile(leaf, &config.trust.trust_domain)
@@ -558,6 +583,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
     )
     .await?;
     info!(relay = %outer.relay, carrier = ?outer.conn.carrier(), "spliced through relay");
+    let relay = outer.relay.clone();
 
     // Inner session over the outer stream.
     let path = Arc::new(OuterPath::default());
@@ -597,7 +623,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
         },
         Arc::new(NoRevocations),
     ));
-    let inner_tls = tls::client_config(&config.credentials, inner_verifier, tls::ALPN_H3)
+    let inner_tls = tls::device_client_config(&config.credentials, inner_verifier, tls::ALPN_H3)
         .map_err(|e| ConnectError::Credentials(e.to_string()))?;
     let inner_config = quic::client_config(inner_tls, Layer::Inner, TransportTuning::default());
     let target = connect::group_target(&config.group);
@@ -739,6 +765,7 @@ pub async fn connect(config: ClientConfig) -> Result<Tunnel, ConnectError> {
             routes: routes.unwrap_or_default(),
             tunnel_mtu: config.tunnel_mtu,
             identity,
+            relay,
         },
         tx,
         packets,
@@ -769,7 +796,7 @@ async fn supervise_outer(
     events: mpsc::Sender<ClientEvent>,
     mut shutdown: watch::Receiver<bool>,
     inner: Arc<Mutex<Option<quinn::Connection>>>,
-    mut renew: watch::Receiver<Option<Credentials>>,
+    mut renew: watch::Receiver<Option<DeviceCredentials>>,
 ) {
     let end = |why: String| {
         info!(reason = %why, "tunnel ended");

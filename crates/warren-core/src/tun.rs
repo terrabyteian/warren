@@ -1,8 +1,8 @@
 //! The Linux TUN device (kernel forwarding mode, docs/design.md section 10)
 //! and the interface, route and NAT setup around it.
 //!
-//! Opening the device needs one `ioctl`, which is the only `unsafe` code in
-//! warren; each call is a thin, checked wrapper. Interface addresses,
+//! Opening the device needs one `ioctl`; each call is a thin, checked
+//! wrapper. Interface addresses,
 //! routes and NAT are configured through the system's `ip` and `nft`
 //! commands with fixed argument lists (no shell), which keeps netlink and
 //! nftables libraries out of the dependency closure.

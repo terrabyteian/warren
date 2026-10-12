@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - run: cargo fmt --all --check
-      - run: shellcheck scripts/*.sh
+      - run: shellcheck scripts/*.sh macos/*.sh
       - name: DCO gate tests
         run: scripts/test-check-dco.sh
 
@@ -47,6 +47,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
       - name: clippy, data-path build
         run: cargo clippy -p warren --no-default-features --features relay,connector --all-targets --locked --offline -- -D warnings
+      - name: clippy, client build
+        run: cargo clippy -p warren --no-default-features --features client --all-targets --locked --offline -- -D warnings
 
   test:
     name: build and test (${{ matrix.os }})
@@ -80,6 +82,44 @@ jobs:
       - run: cargo build -p warren -p warren-harness --locked --offline
       - name: relay, connector (TUN and NAT) and test client in namespaces
         run: sudo scripts/e2e-kernel.sh target/debug
+
+  macos-client:
+    name: macOS client (clippy, end-to-end with sudo, Swift app build)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: clippy on macOS (utun, Secure Enclave, privilege separation)
+        run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
+      - name: clippy, client build
+        run: cargo clippy -p warren --no-default-features --features client --all-targets --locked --offline -- -D warnings
+      - run: cargo build -p warren -p warren-harness --locked --offline
+      - name: control plane, relay, connector stand-in and warren up on this Mac
+        run: scripts/e2e-macos.sh target/debug
+      - name: menu-bar app and packet tunnel extension (unsigned)
+        run: macos/build.sh
+
+  macos-release:
+    name: macOS client release build (universal, unsigned)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install && rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: build the client for both architectures
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release -p warren --no-default-features --features client --target "$target" --locked --offline
+          done
+      - name: universal binary and tarball
+        run: scripts/package-macos.sh "ci-${GITHUB_SHA::12}" dist
 
   bench:
     name: benchmarks (informative, never gating)

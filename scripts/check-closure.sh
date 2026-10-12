@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Per-binary transitive closure report and growth gate.
 #
-# For each shipped binary, and the client core the native shells link, lists
-# every third-party crate compiled into it (normal and build dependencies,
-# proc macros included) across the release targets, then compares that list
-# with the committed baseline in deps/closure/. Any difference fails: a new
-# crate or version is growth that needs review, and a stale baseline must be
-# refreshed. Data-path builds also fail if they reach any crate named in
-# deps/data-path-forbidden.txt.
+# For each shipped binary, the client core and the static library the native
+# shells link, lists every third-party crate compiled into it (normal and
+# build dependencies, proc macros included) across the release targets, then
+# compares that list with the committed baseline in deps/closure/. Any
+# difference fails: a new crate or version is growth that needs review, and a
+# stale baseline must be refreshed. Data-path builds also fail if they reach
+# any crate named in deps/data-path-forbidden.txt.
 #
 # Usage: scripts/check-closure.sh [--update]
 set -euo pipefail
@@ -21,7 +21,9 @@ aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin"
 # name|data path?|cargo tree package and feature selection
 binaries="warren|no|-p warren
 warren-datapath|yes|-p warren --no-default-features --features relay,connector
-warren-client|yes|-p warren-client"
+warren-client|yes|-p warren-client
+warren-client-cli|yes|-p warren --no-default-features --features client
+warren-ffi|yes|-p warren-ffi"
 
 update=0
 case "${1:-}" in
@@ -100,7 +102,7 @@ while IFS='|' read -r name datapath selection; do
     fi
   fi
 
-  printf '%-16s data-path=%-3s third-party crates=%-4s %s\n' "$name" "$datapath" "$count" "$status"
+  printf '%-17s data-path=%-3s third-party crates=%-4s %s\n' "$name" "$datapath" "$count" "$status"
   summary="$summary| $name | $datapath | $count | $status |
 "
 done <<<"$binaries"

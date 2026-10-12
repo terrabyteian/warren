@@ -36,13 +36,50 @@ pub struct Joined {
     pub identity: NodeIdentity,
 }
 
-/// Verifies the control plane's certificate against the root the join
-/// token pins; the node has no trust bundle yet.
+/// Verifies the control plane's certificate against a pinned deployment
+/// root: the root a join token pins, before a node has a trust bundle, or
+/// the fingerprint an MDM profile presets for a client signing in
+/// (docs/protocol.md section 10.1). The control plane presents the root in
+/// its chain, and its certificate must name the control-plane role in the
+/// trust domain.
 #[derive(Debug)]
-struct PinnedRoot {
+pub struct PinnedRoot {
     pin: String,
-    trust_domain: String,
+    trust_domain: Option<String>,
     algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl PinnedRoot {
+    /// Pins the root whose DER has SHA-256 `pin` (lowercase hex), for a
+    /// control plane of `trust_domain`.
+    pub fn new(pin: &str, trust_domain: &str) -> PinnedRoot {
+        PinnedRoot {
+            pin: pin.to_ascii_lowercase(),
+            trust_domain: Some(trust_domain.to_owned()),
+            algorithms: rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
+
+    /// Pins a root without knowing the trust domain yet, as a client does
+    /// before discovery: the certificate must still name the control-plane
+    /// role, in whichever trust domain it names.
+    pub fn any_trust_domain(pin: &str) -> PinnedRoot {
+        PinnedRoot {
+            trust_domain: None,
+            ..PinnedRoot::new(pin, "")
+        }
+    }
+}
+
+/// The trust domain a node certificate's warren URI names.
+fn named_trust_domain(leaf: &[u8]) -> Option<String> {
+    let names = pki::parse_cert(leaf).ok()?.subject_alt_names().ok()?;
+    names.uris.iter().find_map(|u| {
+        u.strip_prefix("warren://")
+            .and_then(|rest| rest.split('/').next())
+            .map(str::to_owned)
+    })
 }
 
 impl ServerCertVerifier for PinnedRoot {
@@ -78,7 +115,12 @@ impl ServerCertVerifier for PinnedRoot {
         .map_err(|e| fail(&format!("control plane certificate: {e}")))?;
         ee.verify_is_valid_for_subject_name(server_name)
             .map_err(|e| fail(&format!("control plane name: {e}")))?;
-        let id = pki::check_infra_profile(end_entity, &self.trust_domain)
+        let trust_domain = match &self.trust_domain {
+            Some(td) => td.clone(),
+            None => named_trust_domain(end_entity)
+                .ok_or_else(|| fail("the control plane certificate names no trust domain"))?,
+        };
+        let id = pki::check_infra_profile(end_entity, &trust_domain)
             .map_err(|e| fail(&e.to_string()))?;
         if id.role != NodeRole::ControlPlane {
             return Err(fail("the join endpoint is not the control plane"));
@@ -128,11 +170,7 @@ pub async fn join(token: &JoinToken, key: &NodeKey) -> Result<Joined, JoinError>
         .to_socket_addrs()
         .map_err(|e| JoinError(format!("{}: {e}", token.cp)))?
         .collect();
-    let verifier = Arc::new(PinnedRoot {
-        pin: token.root.to_ascii_lowercase(),
-        trust_domain: token.td.clone(),
-        algorithms: rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
-    });
+    let verifier = Arc::new(PinnedRoot::new(&token.root, &token.td));
     let mut config = rustls::ClientConfig::builder_with_provider(tls::provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| fail(&e))?

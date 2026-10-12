@@ -6,30 +6,30 @@
 # version, vendored, and covered by cargo-vet. scripts/check-deps.sh enforces
 # this list; docs/dependencies.md explains how to add a crate.
 #
-# crate             users                                                                                                      purpose
-aws-lc-rs           warren-control,warren-core,warren-harness                                                                  the one crypto provider: signatures, digests, AEAD for keys at rest, randomness; node key generation and signing (join requests, test PKI)
-base64              warren-control,warren-core                                                                                 base64 and base64url for JOSE objects, PEM and tokens
-bytes               warren-client,warren-connector,warren-control,warren-core,warren-harness,warren-masque                     shared byte buffers for packets, capsules, frames and hyper bodies; already required by quinn and h2
-cedar-policy        warren-policy                                                                                              the policy engine: parse, validate and evaluate compiled Cedar policy
-clap                warren,warren-harness                                                                                      command-line parsing (builder API only: no derive, no color)
-form_urlencoded     warren-control                                                                                             query strings and form bodies in the OIDC flow
-h2                  warren-masque                                                                                              HTTP/2 with extended CONNECT (RFC 8441) for the TCP 443 fallback carrier
-http                warren-control,warren-masque                                                                               HTTP request and response types shared by h2 and hyper
-http-body           warren-control                                                                                             the body trait for the streaming revocation event response
-http-body-util      warren-control                                                                                             fixed and size-limited request and response bodies
-hyper               warren-control                                                                                             HTTP/1.1 and HTTP/2 server and client for the control-plane API and IdP calls
-hyper-util          warren-control                                                                                             tokio glue and the HTTP/1.1-or-HTTP/2 server builder for hyper
-libc                warren-core                                                                                                the TUN device's open, ioctl, read and write on Linux
-quinn               warren-client,warren-connector,warren-core,warren-masque,warren-relay                                      QUIC (RFC 9000, RFC 9221 datagrams, DPLPMTUD) on tokio with rustls
-rustls              warren,warren-client,warren-connector,warren-control,warren-core,warren-harness,warren-masque,warren-relay TLS 1.3 on aws-lc-rs, warren's only TLS stack
-rustls-native-certs warren-control                                                                                             the operating system's trust store for calls to a public IdP
-rustls-webpki       warren-core,warren-masque                                                                                  certificate path verification against the deployment trust bundle
-saphyr-parser       warren-policy                                                                                              YAML parsing with line numbers for the policy surface (compiler feature only)
-serde               warren-control,warren-core                                                                                 serialization of wire types (bundles, events, API bodies)
-serde_json          warren-control,warren-core,warren-harness,warren-masque,warren-policy                                      JSON for the APIs, bundles, Cedar entities, the join exchange and OCSF-shaped audit records
-sqlx                warren-control                                                                                             the one SQL layer: SQLite embedded now, PostgreSQL later, one migration set
-tokio               warren,warren-client,warren-connector,warren-control,warren-core,warren-harness,warren-masque,warren-relay async runtime, sockets, timers and signals
-tokio-rustls        warren-control,warren-masque                                                                               rustls over tokio sockets (control-plane listener, HTTP/2 fallback)
-tracing             warren,warren-client,warren-connector,warren-core,warren-masque,warren-relay                               structured logging; quinn and h2 log through it as well
-tracing-subscriber  warren-core                                                                                                JSON-lines log output on stderr
-zeroize             warren-control,warren-core                                                                                 wiping private keys and secrets from memory after use
+# crate             users                                                                                                                 purpose
+aws-lc-rs           warren-control,warren-core,warren-harness                                                                             the one crypto provider: signatures, digests, AEAD for keys at rest, randomness; node key generation and signing (join requests, test PKI)
+base64              warren-control,warren-core                                                                                            base64 and base64url for JOSE objects, PEM and tokens
+bytes               warren-client,warren-connector,warren-control,warren-core,warren-harness,warren-masque                                shared byte buffers for packets, capsules, frames and hyper bodies; already required by quinn and h2
+cedar-policy        warren-policy                                                                                                         the policy engine: parse, validate and evaluate compiled Cedar policy
+clap                warren,warren-harness                                                                                                 command-line parsing (builder API only: no derive, no color)
+form_urlencoded     warren-control                                                                                                        query strings and form bodies in the OIDC flow
+h2                  warren-masque                                                                                                         HTTP/2 with extended CONNECT (RFC 8441) for the TCP 443 fallback carrier
+http                warren-control,warren-harness,warren-masque                                                                           HTTP request and response types shared by h2 and hyper
+http-body           warren-control                                                                                                        the body trait for the streaming revocation event response
+http-body-util      warren-control                                                                                                        fixed and size-limited request and response bodies
+hyper               warren-control                                                                                                        HTTP/1.1 and HTTP/2 server and client for the control-plane API and IdP calls
+hyper-util          warren-control                                                                                                        tokio glue and the HTTP/1.1-or-HTTP/2 server builder for hyper
+libc                warren,warren-core                                                                                                    the TUN device on Linux and the utun device on macOS (open, ioctl, read and write), and privilege separation for `warren up` on macOS
+quinn               warren-client,warren-connector,warren-core,warren-masque,warren-relay                                                 QUIC (RFC 9000, RFC 9221 datagrams, DPLPMTUD) on tokio with rustls
+rustls              warren,warren-client,warren-connector,warren-control,warren-core,warren-harness,warren-masque,warren-relay            TLS 1.3 on aws-lc-rs, warren's only TLS stack
+rustls-native-certs warren-control                                                                                                        the operating system's trust store for calls to a public IdP
+rustls-webpki       warren-core,warren-masque                                                                                             certificate path verification against the deployment trust bundle
+saphyr-parser       warren-policy                                                                                                         YAML parsing with line numbers for the policy surface (compiler feature only)
+serde               warren-client,warren-control,warren-core                                                                              serialization of wire types (bundles, events, API bodies)
+serde_json          warren,warren-client,warren-control,warren-core,warren-ffi,warren-harness,warren-masque,warren-policy                 JSON for the APIs, bundles, Cedar entities, the join exchange, OCSF-shaped audit records and the client's saved state and status
+sqlx                warren-control                                                                                                        the one SQL layer: SQLite embedded now, PostgreSQL later, one migration set
+tokio               warren,warren-client,warren-connector,warren-control,warren-core,warren-ffi,warren-harness,warren-masque,warren-relay async runtime, sockets, timers and signals
+tokio-rustls        warren-control,warren-masque                                                                                          rustls over tokio sockets (control-plane listener, HTTP/2 fallback)
+tracing             warren,warren-client,warren-connector,warren-core,warren-masque,warren-relay                                          structured logging; quinn and h2 log through it as well
+tracing-subscriber  warren-core                                                                                                           JSON-lines log output on stderr
+zeroize             warren-client,warren-control,warren-core                                                                              wiping private keys and secrets from memory after use

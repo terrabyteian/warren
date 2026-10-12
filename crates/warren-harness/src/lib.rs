@@ -4,6 +4,9 @@
 
 pub mod bench;
 pub mod deploy;
+pub mod idp;
 pub mod join;
 pub mod pki;
 pub mod serve;
+#[cfg(target_os = "macos")]
+pub mod utun_nat;

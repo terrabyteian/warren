@@ -121,14 +121,27 @@ pub struct Header {
 
 /// Signs `payload` as a JWS compact serialization with ES256.
 pub fn sign(header: &Header, payload: &[u8], key: &SigningKey) -> Result<String, JoseError> {
+    sign_with(header, payload, |input| {
+        key.sign_fixed(input).map_err(|e| e.0.to_owned())
+    })
+}
+
+/// Like [`sign`], with a signer that returns the fixed-length ES256
+/// signature (`r || s`) over its input, for keys held in hardware.
+pub fn sign_with(
+    header: &Header,
+    payload: &[u8],
+    sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>,
+) -> Result<String, JoseError> {
     if header.alg != "ES256" {
         return Err(err("only ES256 is supported"));
     }
     let header_json = serde_json::to_vec(header).map_err(|e| err(e.to_string()))?;
     let signing_input = format!("{}.{}", b64url(&header_json), b64url(payload));
-    let signature = key
-        .sign_fixed(signing_input.as_bytes())
-        .map_err(|e| err(e.0))?;
+    let signature = sign(signing_input.as_bytes()).map_err(err)?;
+    if signature.len() != 64 {
+        return Err(err("an ES256 signature is 64 bytes"));
+    }
     Ok(format!("{signing_input}.{}", b64url(&signature)))
 }
 

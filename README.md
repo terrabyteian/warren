@@ -14,7 +14,11 @@ through outbound-only connectors and self-hosted relays.
 > short-lived user+device certificates, policy compiled to Cedar and
 > published as signed bundles, the revocation push channel, and audit. Until
 > relays and connectors consume the control plane's bundles, they read policy
-> from a static bundle file. The macOS app is next.
+> from a static bundle file. The macOS client runs as a command-line tool:
+> `warren login` signs in through the browser with a Secure Enclave device
+> key, and `sudo warren up` routes the apps you may reach through warren
+> ([docs/macos.md](docs/macos.md)); the menu-bar app and its packet tunnel
+> extension build, and run once they can be signed.
 
 ## What warren will be
 
@@ -62,6 +66,18 @@ cargo run --locked --offline -- --help
 
 [CONTRIBUTING.md](CONTRIBUTING.md) lists the full set of checks CI runs.
 
+## Using warren on a Mac
+
+Download the universal binary from a release (it is not notarized yet, so
+remove the quarantine mark; [docs/macos.md](docs/macos.md) has the steps),
+then:
+
+```sh
+warren login https://warren.example.com   # sign in in your browser
+sudo warren up                            # connect; Ctrl-C or `warren down` to stop
+warren status
+```
+
 ## Running the control plane
 
 Write a configuration (see
@@ -81,6 +97,7 @@ through its local admin socket:
 ```sh
 warren admin devices list
 warren admin devices approve <device>
+warren admin deployment                           # the root fingerprint clients can pin
 warren admin users disable alice@example.com      # cut within 10 seconds
 warren admin join-token create --role connector --group homelab --name lab-1
 warren admin policy reload
