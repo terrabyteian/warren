@@ -123,11 +123,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "warren.labels" . | nindent 8 }}
-        {{- include "warren.selectorLabels" (dict "root" . "role" "control-plane") | nindent 8 }}
-        {{- with $cp.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- include "warren.podLabels" (dict "root" . "role" "control-plane" "podLabels" $cp.podLabels) | nindent 8 }}
       annotations:
         checksum/config: {{ $config | sha256sum }}
         {{- with $cp.podAnnotations }}

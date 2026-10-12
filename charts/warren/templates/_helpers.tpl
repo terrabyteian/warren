@@ -32,6 +32,17 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 app.kubernetes.io/component: {{ .role }}
 {{- end }}
 
+{{/*
+A role's pod template labels, each key once: (dict "root" $ "role" "relay"
+"podLabels" .Values.relay.podLabels). The selector labels win over podLabels,
+and podLabels over the common labels.
+*/}}
+{{- define "warren.podLabels" -}}
+{{- $selector := include "warren.selectorLabels" (dict "root" .root "role" .role) | fromYaml }}
+{{- $common := include "warren.labels" .root | fromYaml }}
+{{- toYaml (merge $selector (.podLabels | default dict) $common) }}
+{{- end }}
+
 {{/* An image reference: (dict "image" .Values.image "root" $). */}}
 {{- define "warren.image" -}}
 {{- $tag := default .root.Chart.AppVersion .image.tag -}}
