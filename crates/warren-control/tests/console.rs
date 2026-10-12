@@ -1788,7 +1788,10 @@ async fn step_ups_follow_the_built_in_accounts_switch() {
     assert!(!page.contains("/console/step-up"), "{page}");
     let r = b.get("/console/step-up?next=/console/users").await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
-    assert!(text(&r).contains("No step-up available"));
+    let body = text(&r);
+    assert!(body.contains("No step-up available"), "{body}");
+    assert!(body.contains("Built-in accounts are turned off"), "{body}");
+    assert!(!body.contains("ask an administrator"), "{body}");
     let r = b
         .step_up("/console/users", &code_at(&secret, step + 1))
         .await;
@@ -1831,6 +1834,22 @@ async fn stale_sign_ins_that_reported_mfa_sign_in_again() {
         page.contains("/console/step-up?next=/console/users"),
         "{page}"
     );
+
+    // Without an account to step up with, the reason is the missing
+    // account, not the time it never reported.
+    let mut other = d
+        .signed_in(IdpUser {
+            sub: "00u-other".into(),
+            email: "other@example.com".into(),
+            groups: vec!["warren-admins".into()],
+            amr: vec!["mfa".into()],
+        })
+        .await;
+    let r = other.get("/console/step-up?next=/console/users").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let body = text(&r);
+    assert!(!body.contains("too long ago"), "{body}");
+    assert!(body.contains("a warren account with your email"), "{body}");
     d.cp.shutdown().await;
 }
 

@@ -739,14 +739,18 @@ pub(crate) async fn open_session(
 
 /// The step-up page's answer when the sign-in cannot step up: it may make
 /// changes already, or no built-in account can step it up.
-fn no_step_up(s: &Signed, next: &str) -> Response<Body> {
+fn no_step_up(app: &App, s: &Signed, next: &str) -> Response<Body> {
     if s.viewer.changes == Changes::Allowed {
         return see_other(next);
     }
     let text = if s.viewer.local {
         "A step-up is for sign-ins through an identity provider. Sign in again with your warren account instead."
-    } else if s.viewer.changes == Changes::NeedRecentSignIn {
+    } else if s.viewer.changes == Changes::NeedRecentSignIn
+        && s.session.auth_time != AUTH_TIME_UNKNOWN as i64
+    {
         "Your identity provider reported a second factor, but too long ago. Sign in again."
+    } else if !app.config.local_accounts.enabled {
+        "Built-in accounts are turned off, so no authenticator code can confirm this sign-in. Sign in again with a second factor your identity provider reports."
     } else {
         "To confirm with an authenticator code, you need a warren account with your email address and an authenticator app; ask an administrator. Until then, sign in again with a second factor your identity provider reports."
     };
@@ -791,7 +795,7 @@ async fn step_up_page<B>(app: &App, req: &Request<B>) -> Response<Body> {
                 None,
             ),
         ),
-        None => no_step_up(&s, &next),
+        None => no_step_up(app, &s, &next),
     }
 }
 
@@ -812,7 +816,7 @@ async fn step_up(app: &App, req: Request<Incoming>, peer: &Peer) -> Response<Bod
     };
     let next = safe_next(param(&form, "next"));
     let Some(account) = &s.step_up else {
-        return no_step_up(&s, &next);
+        return no_step_up(app, &s, &next);
     };
     if signin::too_many(app, peer).is_some() {
         return html(
