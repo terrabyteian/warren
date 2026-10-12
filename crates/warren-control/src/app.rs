@@ -21,7 +21,7 @@ use warren_policy::model::{self, LOCAL_PREFIX};
 use zeroize::Zeroizing;
 
 use crate::Error;
-use crate::accounts::{self, SourceLimiter};
+use crate::accounts::{self, SourceLimiter, UnknownNames};
 use crate::audit::{self, Activity, Actor};
 use crate::authority::{Authority, Kek};
 use crate::config::Config;
@@ -121,6 +121,8 @@ pub struct App {
     pub kek: Kek,
     /// Failed sign-ins with built-in accounts, per source.
     pub limiter: SourceLimiter,
+    /// Failed sign-ins with usernames that are not built-in accounts.
+    pub unknown_names: UnknownNames,
     /// Bounds how many password hashes are computed at once, so sign-in
     /// attempts cannot take every core.
     kdf: Semaphore,
@@ -170,6 +172,7 @@ impl App {
             idp,
             kek,
             limiter: SourceLimiter::default(),
+            unknown_names: UnknownNames::default(),
             kdf: Semaphore::new(4),
             audit,
             id,

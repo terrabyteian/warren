@@ -220,8 +220,8 @@ of one Workspace domain, judged by the `hd` claim (an address at the domain is
 not enough: a personal Google account can carry a company address) or on an
 allowed list. Without either restriction any Google account can sign in and
 enroll a device, but reaches nothing unless policy names it (G1). Google
-carries no groups, so its users get warren's own; an invite to a verified
-email binds to the first account that signs in with it, by issuer and
+carries no groups, so its users get warren's own; a verified email listed in
+a declared `LocalGroup` binds to the first account that signs in with it, by issuer and
 subject, so an address later recycled to another account inherits nothing.
 Google reports neither MFA nor the time of authentication, so `auth.mfa` and
 `auth.maxAge` rules are never met by Google sign-ins; such apps need a
@@ -409,9 +409,12 @@ extend access past the other's view (G4, G9).
 - **Guessing and stuffing.** A password alone never signs in (G20), so a
   guessed or leaked password is not enough. Five failures in a row (passwords
   or codes) lock the account for 15 minutes, failures from one source address
-  are limited across all accounts, an unknown username and a wrong password
-  get the same answer after the same password-hashing work, and every failure
-  is audited (G13). Passwords must be at least 12 characters and not the
+  are limited across all accounts, and both count each attempt before checking
+  it, so concurrent attempts cannot exceed either bound. Usernames that are not
+  accounts are counted and locked the same way, and an unknown username, a
+  locked account and a wrong password get the same answer after the same work,
+  so neither the response nor its timing tells which usernames exist; only the
+  audit log, where every failure is recorded (G13), says why. Passwords must be at least 12 characters and not the
   username.
 - **Database theft.** Passwords are PBKDF2-HMAC-SHA256 hashes with 600,000
   iterations and a per-password salt, and each records its iteration count so
@@ -430,8 +433,8 @@ extend access past the other's view (G4, G9).
   hours and only sets a password; the authenticator is enrolled at the first
   sign-in. Whoever intercepts an unused link can set the password and enroll
   their own authenticator, so admins deliver links over a channel they trust.
-  A reset clears the password, authenticator and recovery codes and revokes
-  every session (G9). The bootstrap admin's password file is read once, on the
+  A reset clears the password, authenticator and recovery codes, ends every
+  sign-in in progress and revokes every session (G9). The bootstrap admin's password file is read once, on the
   first start that finds no built-in account, and never again.
 - **Offboarding.** Disabling or deleting an account, or removing it from a
   group, takes effect through the revocation path within 10 seconds (G9).
@@ -462,8 +465,9 @@ and code in real time; passkeys, which bind to the origin, arrive later.
 - Authenticator codes can be phished in real time until passkeys arrive, and
   anyone who knows a username can lock its account for 15 minutes by failing
   on purpose; an admin can unlock it (T18).
-- The per-source limit on failed sign-ins is kept in memory, so a restart
-  clears it; the per-account lockout is stored and survives (T18).
+- The per-source limit on failed sign-ins and the lockout of unknown usernames
+  are kept in memory, so a restart clears them; the per-account lockout is
+  stored and survives (T18).
 - Google sign-ins report neither MFA nor when the user authenticated (T6).
 
 ## 7. Open items

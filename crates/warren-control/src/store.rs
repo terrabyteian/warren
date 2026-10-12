@@ -1117,7 +1117,8 @@ impl Store {
 
     /// Deletes a built-in account inside `tx`: it stays as a disabled row,
     /// so its revocation stays in every bundle, with its username freed
-    /// and its credentials, memberships and pending codes gone. Commits a
+    /// and its credentials, memberships, pending codes and sign-ins in
+    /// progress gone. Commits a
     /// `user_disabled` event if it was enabled. Returns `None` if there is
     /// no such live account.
     async fn delete_local_user_tx(
@@ -1152,6 +1153,7 @@ impl Store {
             "DELETE FROM setup_tokens WHERE user_id = ?",
             "DELETE FROM group_members WHERE user_id = ?",
             "DELETE FROM auth_codes WHERE user_id = ?",
+            "DELETE FROM auth_requests WHERE local_user_id = ?",
         ] {
             sqlx::query(sql)
                 .bind(user_id)
@@ -1188,7 +1190,8 @@ impl Store {
     }
 
     /// Resets a built-in account's credentials: clears the password, the
-    /// authenticator, recovery codes, setup links and the lockout, revokes
+    /// authenticator, recovery codes, setup links, sign-ins in progress and
+    /// the lockout, revokes
     /// every live session with a `session_revoked` event each, and stores a
     /// new setup link. Returns `None` if there is no such account.
     pub async fn reset_local_credentials(
@@ -1215,6 +1218,7 @@ impl Store {
             "DELETE FROM recovery_codes WHERE user_id = ?",
             "DELETE FROM setup_tokens WHERE user_id = ?",
             "DELETE FROM auth_codes WHERE user_id = ?",
+            "DELETE FROM auth_requests WHERE local_user_id = ?",
         ] {
             sqlx::query(sql)
                 .bind(user_id)
@@ -1256,38 +1260,60 @@ impl Store {
         Ok(r.rows_affected() == 1)
     }
 
-    /// Counts a failed sign-in against a built-in account, locking it for
-    /// `LOCKOUT_SECONDS` once `MAX_FAILED_ATTEMPTS` failures in a row
-    /// accumulate. Returns whether this failure locked it.
-    pub async fn record_local_failure(&self, user_id: &str) -> Result<bool, Error> {
-        let mut tx = self.begin().await?;
-        let now = clock::now_secs();
-        let failures: Option<i64> = sqlx::query_scalar(
-            "UPDATE local_accounts SET failed_attempts = failed_attempts + 1, updated_at = ? \
-             WHERE user_id = ? RETURNING failed_attempts",
+    /// Counts a sign-in attempt against a built-in account before it is
+    /// checked, so concurrent attempts cannot outrun the lockout: the
+    /// attempt counts as failed until [`Store::refund_local_attempt`] or a
+    /// completed sign-in says otherwise, and the attempt that makes
+    /// `MAX_FAILED_ATTEMPTS` in a row locks the account for
+    /// `LOCKOUT_SECONDS`. Returns `None`, counting nothing, while the
+    /// account is locked; otherwise the lock this attempt set (0 if none).
+    pub async fn reserve_local_attempt(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Option<i64>, Error> {
+        sqlx::query_scalar(
+            "UPDATE local_accounts SET \
+             failed_attempts = CASE WHEN failed_attempts + 1 >= ? THEN 0 ELSE failed_attempts + 1 END, \
+             locked_until = CASE WHEN failed_attempts + 1 >= ? THEN ? ELSE 0 END, updated_at = ? \
+             WHERE user_id = ? AND locked_until <= ? RETURNING locked_until",
         )
+        .bind(MAX_FAILED_ATTEMPTS)
+        .bind(MAX_FAILED_ATTEMPTS)
+        .bind(now + LOCKOUT_SECONDS)
         .bind(now)
         .bind(user_id)
-        .fetch_optional(&mut *tx)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// Takes back an attempt [`Store::reserve_local_attempt`] counted, once
+    /// its step succeeded, lifting the lock it set (`lock`) if it set one.
+    pub async fn refund_local_attempt(&self, user_id: &str, lock: i64) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE local_accounts SET \
+             failed_attempts = CASE WHEN ? > 0 AND locked_until = ? THEN ? \
+             WHEN failed_attempts > 0 THEN failed_attempts - 1 ELSE 0 END, \
+             locked_until = CASE WHEN ? > 0 AND locked_until = ? THEN 0 ELSE locked_until END, \
+             updated_at = ? WHERE user_id = ?",
+        )
+        .bind(lock)
+        .bind(lock)
+        .bind(MAX_FAILED_ATTEMPTS - 1)
+        .bind(lock)
+        .bind(lock)
+        .bind(clock::now_secs())
+        .bind(user_id)
+        .execute(&self.pool)
         .await
         .map_err(db)?;
-        let locked = failures.is_some_and(|n| n >= MAX_FAILED_ATTEMPTS);
-        if locked {
-            sqlx::query(
-                "UPDATE local_accounts SET failed_attempts = 0, locked_until = ? WHERE user_id = ?",
-            )
-            .bind(now + LOCKOUT_SECONDS)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-        }
-        tx.commit().await.map_err(db)?;
-        Ok(locked)
+        Ok(())
     }
 
     /// Records a completed sign-in with a built-in account: clears the
-    /// failure count, records when, and, for an authenticator code, its
+    /// failure count and lockout, records when, and, for an authenticator code, its
     /// time step, which must be later than the last one accepted. Returns
     /// false if it was not (the code was replayed).
     pub async fn record_local_success(
@@ -1299,7 +1325,7 @@ impl Store {
         let mut tx = self.begin().await?;
         let r = match totp_step {
             Some(step) => sqlx::query(
-                "UPDATE local_accounts SET totp_last_step = ?, failed_attempts = 0, updated_at = ? \
+                "UPDATE local_accounts SET totp_last_step = ?, failed_attempts = 0, locked_until = 0, updated_at = ? \
                  WHERE user_id = ? AND totp_last_step < ?",
             )
             .bind(step)
@@ -1307,7 +1333,7 @@ impl Store {
             .bind(user_id)
             .bind(step),
             None => sqlx::query(
-                "UPDATE local_accounts SET failed_attempts = 0, updated_at = ? WHERE user_id = ?",
+                "UPDATE local_accounts SET failed_attempts = 0, locked_until = 0, updated_at = ? WHERE user_id = ?",
             )
             .bind(now)
             .bind(user_id),
@@ -1345,7 +1371,8 @@ impl Store {
 
     /// Enrolls an authenticator (its sealed secret, and the time step of
     /// the code that proved it) with new recovery codes, replacing any
-    /// left. Refuses, returning false, if one was enrolled meanwhile.
+    /// left, and clears the failure count and lockout. Refuses, returning
+    /// false, if one was enrolled meanwhile or the password was reset.
     pub async fn enroll_totp(
         &self,
         user_id: &str,
@@ -1356,8 +1383,8 @@ impl Store {
         let mut tx = self.begin().await?;
         let now = clock::now_secs();
         let r = sqlx::query(
-            "UPDATE local_accounts SET totp_secret = ?, totp_last_step = ?, failed_attempts = 0, updated_at = ? \
-             WHERE user_id = ? AND totp_secret IS NULL",
+            "UPDATE local_accounts SET totp_secret = ?, totp_last_step = ?, failed_attempts = 0, locked_until = 0, updated_at = ? \
+             WHERE user_id = ? AND totp_secret IS NULL AND password_hash IS NOT NULL",
         )
         .bind(sealed_secret)
         .bind(step)
@@ -1565,42 +1592,6 @@ impl Store {
         }
         tx.commit().await.map_err(db)?;
         Ok(changed)
-    }
-
-    /// Sets the API's invites for `email` to exactly `groups`.
-    pub async fn set_invites(&self, email: &str, groups: &[String]) -> Result<(), Error> {
-        let mut tx = self.begin().await?;
-        let current: Vec<String> = sqlx::query_scalar(
-            "SELECT group_name FROM group_invites WHERE email = ? AND managed_by = ?",
-        )
-        .bind(email)
-        .bind(MANAGED_BY_API)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db)?;
-        for group in current.iter().filter(|g| !groups.contains(g)) {
-            sqlx::query("DELETE FROM group_invites WHERE group_name = ? AND email = ?")
-                .bind(group)
-                .bind(email)
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-        }
-        for group in groups {
-            sqlx::query(
-                "INSERT INTO group_invites (group_name, email, managed_by, created_at) VALUES (?, ?, ?, ?) \
-                 ON CONFLICT (group_name, email) DO NOTHING",
-            )
-            .bind(group)
-            .bind(email)
-            .bind(MANAGED_BY_API)
-            .bind(clock::now_secs())
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-        }
-        tx.commit().await.map_err(db)?;
-        Ok(())
     }
 
     /// Brings built-in accounts and warren's own groups in line with the

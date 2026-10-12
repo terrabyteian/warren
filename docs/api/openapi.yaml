@@ -506,34 +506,9 @@ paths:
     get:
       tags: [admin]
       operationId: listGroups
-      summary: warren's own groups, with members, pending invites, and whether the policy directory or the API manages each
+      summary: warren's own groups, with members, the emails of policy-declared members waiting for their first sign-in, and whether the policy directory or the API manages each
       responses:
         "200": { description: The groups. }
-  /v1/admin/invites:
-    get:
-      tags: [admin]
-      operationId: listInvites
-      responses:
-        "200": { description: "Pending invites: group, email, managed_by." }
-  /v1/admin/invites/{email}:
-    put:
-      tags: [admin]
-      operationId: setInvites
-      summary: Invite a verified email to local groups
-      description: >-
-        When an IdP user signs in with this verified email, the invites
-        become memberships bound to that user's issuer and subject; another
-        account later holding the email gets nothing.
-      parameters:
-        - { name: email, in: path, required: true, schema: { type: string } }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/GroupsRequest" }
-      responses:
-        "200": { description: The invites set. }
-        "409": { $ref: "#/components/responses/Problem" }
   /v1/admin/sessions/{session}/revoke:
     post:
       tags: [admin]

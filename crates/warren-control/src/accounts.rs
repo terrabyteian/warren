@@ -1,6 +1,7 @@
 //! Built-in accounts: password hashing, authenticator codes (TOTP, RFC
-//! 6238), recovery codes, the per-source limit on failed sign-ins, and the
-//! QR code an authenticator app scans.
+//! 6238), recovery codes, the per-source limit on failed sign-ins, the
+//! lockout of unknown usernames, and the QR code an authenticator app
+//! scans.
 //!
 //! Every primitive comes from aws-lc-rs, warren's one crypto provider:
 //! passwords are hashed with PBKDF2-HMAC-SHA256 and authenticator codes are
@@ -351,26 +352,14 @@ fn source_key(ip: IpAddr) -> IpAddr {
 }
 
 impl SourceLimiter {
-    /// Whether `source` may try to sign in at `now`. Sources without an
+    /// Counts a sign-in attempt from `source` at `now` before it is
+    /// checked, refusing it (false) once the window's limit is reached, so
+    /// concurrent attempts cannot outrun the limit. Sources without an
     /// address (the local socket) are not limited.
-    pub fn allowed(&self, source: Option<IpAddr>, now: i64) -> bool {
+    pub fn attempt(&self, source: Option<IpAddr>, now: i64) -> bool {
         let Some(ip) = source else { return true };
-        let Ok(map) = self.failures.lock() else {
-            return false;
-        };
-        match map.get(&source_key(ip)) {
-            Some((start, count)) => {
-                now - start >= SOURCE_WINDOW_SECONDS || *count < SOURCE_FAILURE_LIMIT
-            }
-            None => true,
-        }
-    }
-
-    /// Records a failed sign-in from `source`.
-    pub fn failed(&self, source: Option<IpAddr>, now: i64) {
-        let Some(ip) = source else { return };
         let Ok(mut map) = self.failures.lock() else {
-            return;
+            return false;
         };
         if map.len() > 100_000 {
             map.retain(|_, (start, _)| now - *start < SOURCE_WINDOW_SECONDS);
@@ -379,7 +368,55 @@ impl SourceLimiter {
         if now - entry.0 >= SOURCE_WINDOW_SECONDS {
             *entry = (now, 0);
         }
-        entry.1 = entry.1.saturating_add(1);
+        if entry.1 >= SOURCE_FAILURE_LIMIT {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
+    /// Takes back an attempt from `source` that succeeded.
+    pub fn succeeded(&self, source: Option<IpAddr>, now: i64) {
+        let Some(ip) = source else { return };
+        let Ok(mut map) = self.failures.lock() else {
+            return;
+        };
+        if let Some(entry) = map.get_mut(&source_key(ip))
+            && now - entry.0 < SOURCE_WINDOW_SECONDS
+        {
+            entry.1 = entry.1.saturating_sub(1);
+        }
+    }
+}
+
+/// Failed sign-ins with usernames that are not built-in accounts, counted
+/// and locked out exactly as accounts are, so the responses never tell
+/// which usernames exist. Kept in memory by a digest of the name.
+#[derive(Default)]
+pub struct UnknownNames {
+    attempts: Mutex<HashMap<[u8; 32], (i64, i64)>>,
+}
+
+impl UnknownNames {
+    /// As [`crate::store::Store::reserve_local_attempt`]: `None` while the
+    /// name is locked, otherwise the lock this attempt set (0 if none).
+    pub fn attempt(&self, name: &str, now: i64) -> Option<i64> {
+        let Ok(mut map) = self.attempts.lock() else {
+            return None;
+        };
+        if map.len() > 100_000 {
+            map.retain(|_, (_, locked_until)| *locked_until > now);
+        }
+        let (failed, locked_until) = map.entry(sha256(name.as_bytes())).or_insert((0, 0));
+        if *locked_until > now {
+            return None;
+        }
+        (*failed, *locked_until) = if *failed + 1 >= MAX_FAILED_ATTEMPTS {
+            (0, now + LOCKOUT_SECONDS)
+        } else {
+            (*failed + 1, 0)
+        };
+        Some(*locked_until)
     }
 }
 
@@ -519,18 +556,35 @@ mod tests {
         let b: IpAddr = "2001:db8:1:2:3:4:5:6".parse().unwrap();
         let b_neighbor: IpAddr = "2001:db8:1:2:ffff::1".parse().unwrap();
         for _ in 0..SOURCE_FAILURE_LIMIT {
-            assert!(limiter.allowed(Some(a), 1_000));
-            limiter.failed(Some(a), 1_000);
-            limiter.failed(Some(b), 1_000);
+            assert!(limiter.attempt(Some(a), 1_000));
+            assert!(limiter.attempt(Some(b), 1_000));
         }
-        assert!(!limiter.allowed(Some(a), 1_001));
+        assert!(!limiter.attempt(Some(a), 1_001));
         // One /64 is one source.
-        assert!(!limiter.allowed(Some(b_neighbor), 1_001));
-        assert!(limiter.allowed(Some("203.0.113.8".parse().unwrap()), 1_001));
+        assert!(!limiter.attempt(Some(b_neighbor), 1_001));
+        assert!(limiter.attempt(Some("203.0.113.8".parse().unwrap()), 1_001));
+        // A success gives its attempt back.
+        limiter.succeeded(Some(a), 1_001);
+        assert!(limiter.attempt(Some(a), 1_001));
+        assert!(!limiter.attempt(Some(a), 1_001));
         // The window passes.
-        assert!(limiter.allowed(Some(a), 1_000 + SOURCE_WINDOW_SECONDS));
-        limiter.failed(Some(a), 1_000 + SOURCE_WINDOW_SECONDS);
-        assert!(limiter.allowed(Some(a), 1_001 + SOURCE_WINDOW_SECONDS));
-        assert!(limiter.allowed(None, 0));
+        assert!(limiter.attempt(Some(a), 1_000 + SOURCE_WINDOW_SECONDS));
+        assert!(limiter.attempt(Some(a), 1_001 + SOURCE_WINDOW_SECONDS));
+        assert!(limiter.attempt(None, 0));
+    }
+
+    #[test]
+    fn unknown_names_lock_like_accounts() {
+        let names = UnknownNames::default();
+        for _ in 1..MAX_FAILED_ATTEMPTS {
+            assert_eq!(names.attempt("nobody", 1_000), Some(0));
+        }
+        assert_eq!(
+            names.attempt("nobody", 1_000),
+            Some(1_000 + LOCKOUT_SECONDS)
+        );
+        assert_eq!(names.attempt("nobody", 1_001), None);
+        assert_eq!(names.attempt("somebody", 1_001), Some(0));
+        assert_eq!(names.attempt("nobody", 1_000 + LOCKOUT_SECONDS), Some(0));
     }
 }

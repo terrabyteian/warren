@@ -287,8 +287,8 @@ organization's identity provider. Either is optional, but not both.
 - **warren's own groups** (`local:<group>` in policy) hold built-in accounts
   and IdP users alike, assigned through the API or declared as code
   (`LocalGroup`). They are how users of an IdP without groups, such as Google,
-  get any: by issuer and subject, or by an invite for a verified email that
-  binds to the first user who signs in with it. IdP groups come from SCIM
+  get any: by issuer and subject, or, in a declared `LocalGroup`, by a
+  verified email that binds to the first user who signs in with it. IdP groups come from SCIM
   provisioning (or token claims where SCIM is unavailable). Membership changes
   from any source apply through the revocation path (G9).
 - **Policy tells the sources apart.** A built-in account is `local:<username>`

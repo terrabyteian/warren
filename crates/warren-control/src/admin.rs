@@ -48,8 +48,6 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("PUT", "/v1/admin/users/{user}/groups"),
     ("GET", "/v1/admin/users/{user}/sessions"),
     ("GET", "/v1/admin/groups"),
-    ("GET", "/v1/admin/invites"),
-    ("PUT", "/v1/admin/invites/{email}"),
     ("POST", "/v1/admin/sessions/{session}/revoke"),
     ("GET", "/v1/admin/devices"),
     ("POST", "/v1/admin/devices/{device}/approve"),
@@ -456,34 +454,6 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
             Ok(json(
                 StatusCode::OK,
                 &groups.into_values().collect::<Vec<_>>(),
-            ))
-        }
-        (Method::GET, ["v1", "admin", "invites"]) => {
-            Ok(json(StatusCode::OK, &app.store.invites().await?))
-        }
-        (Method::PUT, ["v1", "admin", "invites", email]) => {
-            let email = email.to_ascii_lowercase();
-            if !email.contains('@') {
-                return Err(ApiError::bad_request(format!(
-                    "{email} is not an email address"
-                )));
-            }
-            let body: GroupsRequest = read_json(req).await?;
-            let groups = group_names(&body.groups)?;
-            refuse_declared(app, &groups)?;
-            app.store.set_invites(&email, &groups).await?;
-            let mut r = audit::record(
-                Activity::Update,
-                true,
-                &Actor::LocalAdmin,
-                "local group invites set",
-            );
-            r.insert("entity".into(), audit::entity("invite", &email));
-            r.insert("unmapped".into(), json!({ "groups": groups }));
-            app.audit(r);
-            Ok(json(
-                StatusCode::OK,
-                &json!({ "email": email, "groups": groups }),
             ))
         }
         (Method::POST, ["v1", "admin", "users", key, action @ ("disable" | "enable")]) => {

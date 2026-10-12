@@ -264,10 +264,13 @@ impl Browser {
     }
 
     async fn post_from(&mut self, path: &str, fields: &[(&str, &str)], origin: &str) -> Reply {
-        let mut form = form_urlencoded::Serializer::new(String::new());
-        for (k, v) in fields {
-            form.append_pair(k, v);
-        }
+        let body = {
+            let mut form = form_urlencoded::Serializer::new(String::new());
+            for (k, v) in fields {
+                form.append_pair(k, v);
+            }
+            form.finish()
+        };
         let mut headers = vec![
             ("content-type", "application/x-www-form-urlencoded"),
             ("origin", origin),
@@ -282,7 +285,7 @@ impl Browser {
                 Method::POST,
                 &self.url(path),
                 &headers,
-                Some(Bytes::from(form.finish())),
+                Some(Bytes::from(body)),
             )
             .await
             .unwrap();
@@ -572,7 +575,7 @@ async fn the_bootstrap_admin_signs_in_with_a_password_and_an_authenticator() {
         )
         .await;
     assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
-    assert!(text(&wrong).contains("The username or password is incorrect."));
+    assert!(text(&wrong).contains("The username or password is incorrect"));
     let unknown = b
         .post(
             "/v1/auth/password",
@@ -584,7 +587,7 @@ async fn the_bootstrap_admin_signs_in_with_a_password_and_an_authenticator() {
         )
         .await;
     assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
-    assert!(text(&unknown).contains("The username or password is incorrect."));
+    assert!(text(&unknown).contains("The username or password is incorrect"));
 
     // The same form from another site, or from a browser without the
     // cookie, gets nowhere.
@@ -845,13 +848,12 @@ async fn setup_links_lockout_and_resets() {
     assert!(text(&b.get(&setup_url).await).contains("expired"));
 
     // Five wrong passwords in a row lock the account, even against the
-    // right one, until an admin unlocks it.
+    // right one, until an admin unlocks it. The page never says so.
     let (mut b, page, _) = begin(&d, &[]).await;
     let flow = field(&text(&page), "flow");
-    let mut last = String::new();
     for _ in 0..5 {
-        last = text(
-            &b.post(
+        let reply = b
+            .post(
                 "/v1/auth/password",
                 &[
                     ("flow", &flow),
@@ -859,18 +861,17 @@ async fn setup_links_lockout_and_resets() {
                     ("password", "wrong password!"),
                 ],
             )
-            .await,
-        );
+            .await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
     }
-    assert!(last.contains("locked"), "{last}");
     let reply = b
         .post(
             "/v1/auth/password",
             &[("flow", &flow), ("username", "ada"), ("password", PASSWORD)],
         )
         .await;
-    assert_eq!(reply.status, StatusCode::FORBIDDEN);
-    assert!(text(&reply).contains("ask an administrator to unlock it"));
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert!(text(&reply).contains("The username or password is incorrect"));
     assert!(d.user("ada").await["local"]["locked_until"].is_i64());
     let (status, body) = d.admin("POST", "/v1/admin/users/ada/unlock", None).await;
     assert_eq!((status, body["changed"].clone()), (200, json!(true)));
@@ -932,6 +933,139 @@ async fn setup_links_lockout_and_resets() {
             .iter()
             .any(|m| m.starts_with("built-in account credentials reset"))
     );
+    d.cp.shutdown().await;
+}
+
+/// A password attempt in a sign-in of its own: the status and the page,
+/// without what differs between any two sign-ins (the flow and the
+/// username typed back).
+async fn attempt(d: &Deployment, username: &str, password: &str) -> (StatusCode, String) {
+    let (mut b, page, _) = begin(d, &[]).await;
+    let flow = field(&text(&page), "flow");
+    let reply = b
+        .post(
+            "/v1/auth/password",
+            &[
+                ("flow", &flow),
+                ("username", username),
+                ("password", password),
+            ],
+        )
+        .await;
+    let page = text(&reply)
+        .replace(&flow, "")
+        .replace(&format!("value=\"{username}\""), "");
+    (reply.status, page)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_and_locked_usernames_look_the_same() {
+    let d = Deployment::local(None).await;
+    d.create("ada", &[]).await;
+    let first = attempt(&d, "nobody", "wrong password!").await;
+    assert_eq!(first.0, StatusCode::UNAUTHORIZED);
+    assert!(
+        first.1.contains("The username or password is incorrect"),
+        "{}",
+        first.1
+    );
+    for _ in 0..4 {
+        assert_eq!(attempt(&d, "ada", "wrong password!").await, first);
+        assert_eq!(attempt(&d, "nobody", "wrong password!").await, first);
+    }
+    assert_eq!(attempt(&d, "ada", "wrong password!").await, first);
+    // Locked, even against the right password, yet it reads exactly like
+    // an unknown username, which is locked out the same way.
+    assert!(d.user("ada").await["local"]["locked_until"].is_i64());
+    assert_eq!(attempt(&d, "ada", PASSWORD).await, first);
+    assert_eq!(attempt(&d, "nobody", PASSWORD).await, first);
+    assert_eq!(attempt(&d, "nobody-else", PASSWORD).await, first);
+    // Only the audit log tells them apart.
+    let messages = d.audit_messages();
+    for m in [
+        "sign-in refused: unknown username",
+        "sign-in refused: wrong password",
+        "sign-in refused: the username is locked after too many failed sign-ins",
+        "built-in account locked after too many failed sign-ins",
+    ] {
+        assert!(messages.iter().any(|x| x == m), "no audit record {m:?}");
+    }
+    d.cp.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_guesses_cannot_outrun_the_lockout() {
+    let d = Deployment::local(None).await;
+    d.create("ada", &[]).await;
+    let mut flows = Vec::new();
+    for _ in 0..12 {
+        let (b, page, _) = begin(&d, &[]).await;
+        flows.push((b, field(&text(&page), "flow")));
+    }
+    let guesses: Vec<_> = flows
+        .into_iter()
+        .map(|(mut b, flow)| {
+            tokio::spawn(async move {
+                b.post(
+                    "/v1/auth/password",
+                    &[
+                        ("flow", &flow),
+                        ("username", "ada"),
+                        ("password", "wrong password!"),
+                    ],
+                )
+                .await
+                .status
+            })
+        })
+        .collect();
+    for guess in guesses {
+        assert_eq!(guess.await.unwrap(), StatusCode::UNAUTHORIZED);
+    }
+    let messages = d.audit_messages();
+    let checked = messages
+        .iter()
+        .filter(|m| *m == "sign-in refused: wrong password")
+        .count();
+    assert_eq!(checked, 5, "only five guesses were checked");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(
+                |m| *m == "sign-in refused: the username is locked after too many failed sign-ins"
+            )
+            .count(),
+        7
+    );
+    assert!(d.user("ada").await["local"]["locked_until"].is_i64());
+    d.cp.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_ends_sign_ins_in_progress() {
+    let d = Deployment::local(None).await;
+    d.create("ada", &[]).await;
+    // Whoever set the password has reached the authenticator enrollment.
+    let (mut b, page, _) = begin(&d, &[]).await;
+    let flow = field(&text(&page), "flow");
+    let reply = b
+        .post(
+            "/v1/auth/password",
+            &[("flow", &flow), ("username", "ada"), ("password", PASSWORD)],
+        )
+        .await;
+    let secret = enrollment_secret(&text(&reply));
+    let (status, _) = d.admin("POST", "/v1/admin/users/ada/reset", None).await;
+    assert_eq!(status, 200);
+    // After the reset, that sign-in neither enrolls nor finishes.
+    let code = code_at(&secret, totp_step(clock::now_secs()));
+    let reply = b
+        .post("/v1/auth/code", &[("flow", &flow), ("code", &code)])
+        .await;
+    assert!(text(&reply).contains("This sign-in has expired"));
+    let ada = d.user("ada").await;
+    assert_eq!(ada["local"]["authenticator"], false);
+    assert_eq!(ada["local"]["password_set"], false);
     d.cp.shutdown().await;
 }
 
@@ -1201,16 +1335,20 @@ async fn the_google_preset() {
     .await;
     let idp = d.idp.as_ref().unwrap();
 
-    // Google carries no groups: warren's own come from an invite, bound
-    // to the first account that signs in with that verified email.
-    let (status, _) = d
-        .admin(
-            "PUT",
-            "/v1/admin/invites/Ada@Example.com",
-            Some(json!({ "groups": ["admins"] })),
-        )
-        .await;
-    assert_eq!(status, 200);
+    // Google carries no groups: warren's own come from a LocalGroup that
+    // lists a verified email, bound to the first account that signs in
+    // with it.
+    write(
+        &d.dir.path().join("policy/groups.yaml"),
+        "apiVersion: warren.dev/v1alpha1\nkind: LocalGroup\nmetadata: { name: admins }\nspec:\n  members:\n    emails: [Ada@Example.com]\n",
+    );
+    let (status, policy) = d.admin("POST", "/v1/admin/policy/reload", None).await;
+    assert_eq!(status, 200, "{policy}");
+    let (_, groups) = d.admin("GET", "/v1/admin/groups", None).await;
+    assert_eq!(
+        groups[0]["invites"][0]["email"], "ada@example.com",
+        "{groups}"
+    );
 
     // With no built-in accounts, sign-in goes straight to Google, asking
     // for what Google supports.
@@ -1239,10 +1377,10 @@ async fn the_google_preset() {
     // The freshness rule on grafana cannot be met by a Google sign-in, but
     // the app is still listed: entitlements name apps, rules decide flows.
     assert_eq!(client.entitlements().await.apps[0].name, "grafana");
-    let (_, invites) = d.admin("GET", "/v1/admin/invites", None).await;
-    assert_eq!(invites, json!([]));
     let (_, groups) = d.admin("GET", "/v1/admin/groups", None).await;
+    assert_eq!(groups[0]["invites"], json!([]), "{groups}");
     assert_eq!(groups[0]["members"][0]["invited_email"], "ada@example.com");
+    assert_eq!(groups[0]["members"][0]["managed_by"], "config");
 
     // Another account later holding the same email gets nothing.
     set_user(idp, "222", "ada@example.com");
@@ -1290,9 +1428,24 @@ async fn the_google_preset() {
     d.create("ops-admin", &[]).await;
     google_claims(idp, Some("example.com"));
     set_user(idp, "110169484474386276334", "ada@example.com");
-    let (mut b, page, verifier) = begin(&d, &[]).await;
+    let (mut b, page, verifier) = begin(&d, &[("prompt", "login")]).await;
     let html = text(&page);
     assert!(html.contains("Sign in with Google"), "{html}");
+    // A wrong password first keeps the app's request for a fresh sign-in.
+    let flow = field(&html, "flow");
+    let retry = b
+        .post(
+            "/v1/auth/password",
+            &[
+                ("flow", &flow),
+                ("login", &field(&html, "login")),
+                ("username", "ops-admin"),
+                ("password", "wrong password!"),
+            ],
+        )
+        .await;
+    assert_eq!(retry.status, StatusCode::UNAUTHORIZED);
+    let html = text(&retry);
     let start = html.find("href=\"/v1/auth/idp?").unwrap() + 6;
     let href = html[start..]
         .split('"')
@@ -1303,6 +1456,7 @@ async fn the_google_preset() {
     let mut stranger = d.browser();
     assert!(text(&stranger.get(&href).await).contains("expired"));
     let to_google = location(&b.get(&href).await);
+    assert_eq!(query_of(&to_google)["prompt"], "select_account");
     let to_cp = location(&b.get(&to_google).await);
     let reply = b.get(&to_cp).await;
     let mut client = d.client();

@@ -344,9 +344,8 @@ principal. warren's own groups can hold anyone: built-in accounts, and IdP
 users by issuer and subject. They are how users of an IdP without groups, such
 as Google, get any.
 
-Built-in accounts and warren's groups are managed with `warren admin users`,
-`warren admin groups` and `warren admin invites`, or declared in the policy
-directory:
+Built-in accounts and warren's groups are managed with `warren admin users`
+and `warren admin groups`, or declared in the policy directory:
 
 ```yaml
 apiVersion: warren.dev/v1alpha1
@@ -377,8 +376,8 @@ spec:
   Removing a `LocalUser` deletes the account and removing anyone from a group
   takes effect, both through the revocation path (G9). Disabling, resetting
   and unlocking work on every account, since they answer incidents.
-- An email member is an invite: it binds to the first IdP user who signs in
-  with that verified email, by issuer and subject, and stays with that user;
+- An email member, which only the policy directory declares, waits for the
+  first IdP user who signs in with that verified email and binds to them, by issuer and subject, and stays with that user;
   another account later holding the address inherits nothing.
 - Built-in account sign-ins always use a second factor, so `auth.mfa` holds
   for them, and `auth.maxAge` counts from when the code was entered.

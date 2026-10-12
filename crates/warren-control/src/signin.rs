@@ -6,9 +6,11 @@
 //!
 //! Every page is server-rendered HTML with no script. Each step is bound to
 //! the browser that started it by a cookie, moves the sign-in forward at
-//! most once, and is refused from another origin. Failures count against
-//! the account (locking it after `MAX_FAILED_ATTEMPTS` in a row) and
-//! against the source address.
+//! most once, and is refused from another origin. Every attempt counts,
+//! before it is checked, against the source address and the username,
+//! whether or not an account has it (locking it after
+//! `MAX_FAILED_ATTEMPTS` failures in a row); a locked or unknown username
+//! looks exactly like a wrong password, and only the audit log says which.
 
 use std::net::IpAddr;
 
@@ -39,6 +41,10 @@ const FORM_BODY: usize = 16 << 10;
 const STAGE_CODE: &str = "code";
 const STAGE_ENROLL: &str = "enroll";
 const STAGE_ENROLLED: &str = "enrolled";
+
+/// What every failed or refused password step shows.
+const INCORRECT: &str =
+    "The username or password is incorrect, or the account is temporarily locked. Try again later.";
 
 const CSS: &str = "\
 :root{color-scheme:light dark;--fg:#1d1d1f;--muted:#6e6e73;--bg:#f5f5f7;--card:#fff;--line:#d2d2d7;--accent:#2f6f4f;--bad:#b3261e}\
@@ -182,7 +188,7 @@ fn password_page(
     });
     let content = format!(
         "<h1>Sign in to warren</h1><p class=\"muted\">{td}</p>{idp}{error}\
-         <form method=\"post\" action=\"/v1/auth/password\">{flow}\
+         <form method=\"post\" action=\"/v1/auth/password\">{flow}{login}\
          <label for=\"username\">Username</label>\
          <input id=\"username\" name=\"username\" value=\"{username}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" required{focus}>\
          <label for=\"password\">Password</label>\
@@ -192,6 +198,7 @@ fn password_page(
         idp = idp.as_deref().unwrap_or(""),
         error = error_box(error),
         flow = hidden("flow", flow),
+        login = hidden("login", if login { "1" } else { "0" }),
         username = escape_html(username),
         focus = if idp.is_none() { " autofocus" } else { "" },
         secondary = if idp.is_some() {
@@ -416,8 +423,10 @@ fn logon_record(
     r
 }
 
+/// Counts an attempt against its source, refusing it once the source has
+/// made too many.
 fn too_many(app: &App, peer: &Peer) -> Option<Response<Body>> {
-    (!app.limiter.allowed(source(peer), clock::now_secs())).then(|| {
+    (!app.limiter.attempt(source(peer), clock::now_secs())).then(|| {
         notice(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many failed sign-ins",
@@ -426,35 +435,21 @@ fn too_many(app: &App, peer: &Peer) -> Option<Response<Body>> {
     })
 }
 
-fn locked_message(account: &LocalAccount, now: i64) -> Option<String> {
-    (account.locked_until > now).then(|| {
-        let minutes = (account.locked_until - now + 59) / 60;
-        format!(
-            "This account is locked after too many failed sign-ins. Try again in {minutes} minute{}, or ask an administrator to unlock it.",
-            if minutes == 1 { "" } else { "s" }
-        )
-    })
-}
-
-/// Counts a failed step against the source and the account, and audits
-/// it. Returns a message for the page when the account just locked.
-async fn failed(
+/// Audits a failed or refused step, and the lockout of `locked` when this
+/// attempt locked it.
+fn failed(
     app: &App,
     peer: &Peer,
-    account: Option<&LocalAccount>,
     user: Option<&User>,
+    locked: Option<&LocalAccount>,
     message: &str,
     protocol: &str,
-) -> Result<Option<String>, ApiError> {
-    app.limiter.failed(source(peer), clock::now_secs());
+) {
     let actor = user.map(actor).unwrap_or(Actor::Anonymous);
     app.audit(logon_record(false, &actor, message, protocol, peer));
-    let Some(account) = account else {
-        return Ok(None);
+    let Some(account) = locked else {
+        return;
     };
-    if !app.store.record_local_failure(&account.user_id).await? {
-        return Ok(None);
-    }
     let mut r = audit::record(
         Activity::Lock,
         true,
@@ -466,10 +461,6 @@ async fn failed(
         json!({ "uid": account.user_id, "name": account.username }),
     );
     app.audit(r);
-    Ok(Some(format!(
-        "Too many failed attempts: this account is locked for {} minutes.",
-        accounts::LOCKOUT_SECONDS / 60
-    )))
 }
 
 /// `POST /v1/auth/password`: the first step.
@@ -498,25 +489,46 @@ pub(crate) async fn password(
         .trim()
         .to_ascii_lowercase();
     let password = Zeroizing::new(param(&form, "password").unwrap_or("").to_owned());
-    let retry = |error: &str, status: StatusCode| {
-        password_page(app, &f.flow, false, &username, Some(error), status, None)
+    let login = param(&form, "login") == Some("1");
+    let retry = || {
+        password_page(
+            app,
+            &f.flow,
+            login,
+            &username,
+            Some(INCORRECT),
+            StatusCode::UNAUTHORIZED,
+            None,
+        )
     };
     let account = if warren_core::identity::valid_id(&username) {
         app.store.local_account_named(&username).await?
     } else {
         None
     };
-    let now = clock::now_secs();
-    if let Some(message) = account.as_ref().and_then(|a| locked_message(a, now)) {
-        return Ok(retry(&message, StatusCode::FORBIDDEN));
-    }
-    let hash = account.as_ref().and_then(|a| a.password_hash.clone());
-    let has_password = hash.is_some();
-    let ok = app.verify_password(hash.clone(), password.clone()).await?;
     let user = match &account {
         Some(a) => app.store.user(&a.user_id).await?,
         None => None,
     };
+    let now = clock::now_secs();
+    let reserved = match &account {
+        Some(a) => app.store.reserve_local_attempt(&a.user_id, now).await?,
+        None => app.unknown_names.attempt(&username, now),
+    };
+    let Some(lock) = reserved else {
+        failed(
+            app,
+            peer,
+            user.as_ref(),
+            None,
+            "sign-in refused: the username is locked after too many failed sign-ins",
+            "password",
+        );
+        return Ok(retry());
+    };
+    let hash = account.as_ref().and_then(|a| a.password_hash.clone());
+    let has_password = hash.is_some();
+    let ok = app.verify_password(hash.clone(), password.clone()).await?;
     let (Some(account), Some(user)) = (account, user) else {
         failed(
             app,
@@ -525,13 +537,8 @@ pub(crate) async fn password(
             None,
             "sign-in refused: unknown username",
             "password",
-        )
-        .await?;
-        // An unknown username and a wrong password look the same.
-        return Ok(retry(
-            "The username or password is incorrect.",
-            StatusCode::UNAUTHORIZED,
-        ));
+        );
+        return Ok(retry());
     };
     if !ok {
         let why = if has_password {
@@ -539,14 +546,20 @@ pub(crate) async fn password(
         } else {
             "sign-in refused: no password is set yet; the account needs its setup link"
         };
-        let locked = failed(app, peer, Some(&account), Some(&user), why, "password").await?;
-        return Ok(retry(
-            locked
-                .as_deref()
-                .unwrap_or("The username or password is incorrect."),
-            StatusCode::UNAUTHORIZED,
-        ));
+        failed(
+            app,
+            peer,
+            Some(&user),
+            (lock > 0).then_some(&account),
+            why,
+            "password",
+        );
+        return Ok(retry());
     }
+    app.limiter.succeeded(source(peer), now);
+    app.store
+        .refund_local_attempt(&account.user_id, lock)
+        .await?;
     if user.disabled {
         app.audit(logon_record(
             false,
@@ -646,39 +659,44 @@ pub(crate) async fn code(
         .filter(|c| !c.is_whitespace())
         .collect();
 
+    let reserved = app.store.reserve_local_attempt(&user_id, now).await?;
+
     if stage == Some(STAGE_ENROLL) {
         let sealed = f.request.pending_secret.clone().unwrap_or_default();
         let secret = app.kek.open(&totp_aad(&user_id), &sealed)?;
-        if let Some(message) = locked_message(&account, now) {
-            return Ok(enroll_page(
+        let retry = || {
+            enroll_page(
                 app,
                 &f.flow,
                 &account.username,
                 &secret,
-                Some(&message),
-                StatusCode::FORBIDDEN,
-            ));
-        }
-        let Some(step) = accounts::verify_totp(&secret, &typed, now, 0) else {
-            let locked = failed(
+                Some(
+                    "That code did not match, or the account is temporarily locked. Check the time on your phone and enter the newest code.",
+                ),
+                StatusCode::UNAUTHORIZED,
+            )
+        };
+        let Some(lock) = reserved else {
+            failed(
                 app,
                 peer,
-                Some(&account),
                 Some(&user),
+                None,
+                "authenticator enrollment refused: the account is locked after too many failed sign-ins",
+                "password+TOTP",
+            );
+            return Ok(retry());
+        };
+        let Some(step) = accounts::verify_totp(&secret, &typed, now, 0) else {
+            failed(
+                app,
+                peer,
+                Some(&user),
+                (lock > 0).then_some(&account),
                 "authenticator enrollment refused: wrong code",
                 "password+TOTP",
-            )
-            .await?;
-            return Ok(enroll_page(
-                app,
-                &f.flow,
-                &account.username,
-                &secret,
-                Some(locked.as_deref().unwrap_or(
-                    "That code did not match. Check the time on your phone and enter the newest code.",
-                )),
-                StatusCode::UNAUTHORIZED,
-            ));
+            );
+            return Ok(retry());
         };
         let codes = accounts::new_recovery_codes()?;
         let hashes: Vec<String> = codes
@@ -697,6 +715,7 @@ pub(crate) async fn code(
         {
             return Ok(expired());
         }
+        app.limiter.succeeded(source(peer), now);
         let mut r = audit::record(
             Activity::MfaEnable,
             true,
@@ -715,18 +734,28 @@ pub(crate) async fn code(
         ));
     }
 
-    let retry = |error: &str, status: StatusCode| {
+    let retry = || {
         code_page(
             &f.flow,
             &account.username,
-            Some(error),
-            status,
+            Some(
+                "That code is not right or was already used, or the account is temporarily locked. Enter the newest code, or try again later.",
+            ),
+            StatusCode::UNAUTHORIZED,
             &f.request.client_redirect_uri,
         )
     };
-    if let Some(message) = locked_message(&account, now) {
-        return Ok(retry(&message, StatusCode::FORBIDDEN));
-    }
+    let Some(lock) = reserved else {
+        failed(
+            app,
+            peer,
+            Some(&user),
+            None,
+            "sign-in refused: the account is locked after too many failed sign-ins",
+            "password+TOTP",
+        );
+        return Ok(retry());
+    };
     let secret = app.kek.open(
         &totp_aad(&user_id),
         account.totp_secret.as_deref().unwrap_or(""),
@@ -766,22 +795,17 @@ pub(crate) async fn code(
             },
         };
     if !accepted {
-        let locked = failed(
+        failed(
             app,
             peer,
-            Some(&account),
             Some(&user),
+            (lock > 0).then_some(&account),
             "sign-in refused: wrong authenticator or recovery code",
             protocol,
-        )
-        .await?;
-        return Ok(retry(
-            locked
-                .as_deref()
-                .unwrap_or("That code is not right, or was already used. Enter the newest code."),
-            StatusCode::UNAUTHORIZED,
-        ));
+        );
+        return Ok(retry());
     }
+    app.limiter.succeeded(source(peer), now);
     finish(app, &f.key, &user, protocol, peer).await
 }
 

@@ -277,8 +277,9 @@ happens in the user's browser, which only has to reach the control plane.
 
 Google ID tokens carry no groups, so Google users get warren's own: assign them
 after a first sign-in (`warren admin users groups <email> --group ops`), or
-invite their address beforehand (`warren admin invites set ada@example.com
---group ops`), which binds to the first account that signs in with it. Google
+list their address beforehand under `members.emails` of a `LocalGroup` in the
+policy directory ([policy.md](policy.md#51-users-and-groups)), which binds to
+the first account that signs in with it. Google
 reports neither MFA nor when the user signed in, so rules with `auth.mfa` or
 `auth.maxAge` never match Google sign-ins; enforce two-step verification in
 Google Workspace, and give apps that need such rules to built-in accounts or an

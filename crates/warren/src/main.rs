@@ -202,20 +202,6 @@ fn admin_command() -> Command {
                 .subcommand(Command::new("list").about("List local groups with their members and invites")),
         )
         .subcommand(
-            Command::new("invites")
-                .about("Local group memberships waiting for an IdP user's verified email")
-                .subcommand_required(true)
-                .subcommand(Command::new("list").about("List pending invites"))
-                .subcommand(
-                    action(
-                        "set",
-                        "Set the local groups an email is invited to (no --group: none)",
-                        id("email", "The verified email the invite binds to"),
-                    )
-                    .arg(group_arg()),
-                ),
-        )
-        .subcommand(
             Command::new("sessions")
                 .about("Sign-in sessions")
                 .subcommand_required(true)
@@ -578,12 +564,6 @@ fn admin_request(m: &ArgMatches) -> Result<(&'static str, String, Option<String>
             None,
         ),
         ("groups", "list") => ("GET", "/v1/admin/groups".into(), None),
-        ("invites", "list") => ("GET", "/v1/admin/invites".into(), None),
-        ("invites", "set") => (
-            "PUT",
-            format!("/v1/admin/invites/{}", arg("email")?),
-            Some(serde_json::json!({ "groups": groups() }).to_string()),
-        ),
         ("sessions", "revoke") => (
             "POST",
             format!("/v1/admin/sessions/{}/revoke", arg("session")?),
@@ -911,13 +891,6 @@ mod tests {
                 Some(r#"{"groups":[]}"#),
             ),
             (&["groups", "list"], "GET", "/v1/admin/groups", None),
-            (&["invites", "list"], "GET", "/v1/admin/invites", None),
-            (
-                &["invites", "set", "bob@example.com", "--group", "ops"],
-                "PUT",
-                "/v1/admin/invites/bob@example.com",
-                Some(r#"{"groups":["ops"]}"#),
-            ),
         ];
         for (args, method, path, body) in cases {
             let argv: Vec<&str> = ["warren", "admin"]
