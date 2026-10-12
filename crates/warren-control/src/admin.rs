@@ -1,10 +1,11 @@
 //! The admin API, served on a local Unix socket created mode 0600.
 //!
-//! In M1 the admin API is reachable only from the control plane's own host
-//! (or pod), where an operator already holds everything the socket could
-//! grant, keys included. Remote admin access, authenticated with a recent
-//! MFA sign-in at the IdP (threat model T5), arrives with the console in M3.
-//! The endpoints are versioned and described in `docs/api/openapi.yaml`.
+//! The admin API is reachable only from the control plane's own host (or
+//! pod), where an operator already holds everything the socket could grant,
+//! keys included. The web console (`crate::console`) offers a few of its
+//! changes remotely, to admins with a recent MFA sign-in at the IdP (threat
+//! model T5), through `set_user_disabled` and `device_action` here. The
+//! endpoints are versioned and described in `docs/api/openapi.yaml`.
 
 use std::sync::Arc;
 
@@ -134,37 +135,9 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
             Ok(json(StatusCode::OK, &users))
         }
         (Method::POST, ["v1", "admin", "users", key, action @ ("disable" | "enable")]) => {
-            let user = app
-                .store
-                .find_user(key)
-                .await?
-                .ok_or_else(|| ApiError::not_found(format!("no user {key}")))?;
-            let disable = *action == "disable";
-            let (did, event) = app.store.set_user_disabled(&user.id, disable).await?;
-            app.announce(event.as_ref());
-            if did {
-                let mut r = audit::record(
-                    if disable {
-                        Activity::Disable
-                    } else {
-                        Activity::Enable
-                    },
-                    true,
-                    &Actor::LocalAdmin,
-                    if disable {
-                        "user disabled"
-                    } else {
-                        "user enabled"
-                    },
-                );
-                r.insert(
-                    "user".into(),
-                    json!({ "uid": user.id, "email_addr": user.email }),
-                );
-                app.audit(r);
-                app.request_publish();
-            }
-            Ok(changed("user", &user.id, did))
+            let (id, did) =
+                set_user_disabled(app, key, *action == "disable", &Actor::LocalAdmin).await?;
+            Ok(changed("user", &id, did))
         }
         (Method::GET, ["v1", "admin", "users", key, "sessions"]) => {
             let user = app
@@ -234,75 +207,8 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
                 action @ ("approve" | "enable" | "disable" | "revoke"),
             ],
         ) => {
-            let device = app
-                .store
-                .device(id)
-                .await?
-                .ok_or_else(|| ApiError::not_found(format!("no device {id}")))?;
-            let (transition, done, activity, message) = match *action {
-                "approve" => (
-                    DeviceAction::Approve,
-                    DeviceStatus::Approved,
-                    Activity::Activate,
-                    "device approved",
-                ),
-                "enable" => (
-                    DeviceAction::Enable,
-                    DeviceStatus::Approved,
-                    Activity::Activate,
-                    "device enabled",
-                ),
-                "disable" => (
-                    DeviceAction::Disable,
-                    DeviceStatus::Disabled,
-                    Activity::Suspend,
-                    "device disabled",
-                ),
-                _ => (
-                    DeviceAction::Revoke,
-                    DeviceStatus::Revoked,
-                    Activity::Unenroll,
-                    "device revoked",
-                ),
-            };
-            let (status, event) = app.store.transition_device(id, transition).await?;
-            app.announce(event.as_ref());
-            match status {
-                Some(status) => {
-                    let mut r = audit::record(activity, true, &Actor::LocalAdmin, message);
-                    r.insert("entity".into(), audit::entity("device", id));
-                    r.insert("unmapped".into(), json!({ "status": status.as_str() }));
-                    app.audit(r);
-                    app.request_publish();
-                    Ok(changed("device", id, true))
-                }
-                // Already where the action leads: nothing to do.
-                None if device.status == done => Ok(changed("device", id, false)),
-                None => {
-                    let current = app
-                        .store
-                        .device(id)
-                        .await?
-                        .map(|d| d.status)
-                        .unwrap_or(device.status);
-                    let mut r = audit::record(
-                        activity,
-                        false,
-                        &Actor::LocalAdmin,
-                        &format!("refused: the device is {}", current.as_str()),
-                    );
-                    r.insert("entity".into(), audit::entity("device", id));
-                    app.audit(r);
-                    Err(ApiError::new(
-                        StatusCode::CONFLICT,
-                        "conflict",
-                        format!(
-                            "device {id} is {}; it cannot be {action}d",
-                            current.as_str()
-                        ),
-                    ))
-                }
-            }
+            let did = device_action(app, id, action, &Actor::LocalAdmin).await?;
+            Ok(changed("device", id, did))
         }
         (Method::POST, ["v1", "admin", "certificates", serial, "revoke"]) => {
             let serial = serial.to_ascii_lowercase();
@@ -472,6 +378,129 @@ async fn route(app: &App, req: Request<Incoming>) -> Result<Response<Body>, ApiE
             }),
         )),
         _ => Err(ApiError::not_found(format!("no admin endpoint {path}"))),
+    }
+}
+
+/// Disables or enables the user `key` (an ID, email or IdP subject) on
+/// behalf of `actor`. Disabling pushes a revocation that cuts the user's
+/// live access. Returns the user's ID and whether anything changed.
+pub(crate) async fn set_user_disabled(
+    app: &App,
+    key: &str,
+    disable: bool,
+    actor: &Actor,
+) -> Result<(String, bool), ApiError> {
+    let user = app
+        .store
+        .find_user(key)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no user {key}")))?;
+    let (did, event) = app.store.set_user_disabled(&user.id, disable).await?;
+    app.announce(event.as_ref());
+    if did {
+        let mut r = audit::record(
+            if disable {
+                Activity::Disable
+            } else {
+                Activity::Enable
+            },
+            true,
+            actor,
+            if disable {
+                "user disabled"
+            } else {
+                "user enabled"
+            },
+        );
+        r.insert(
+            "user".into(),
+            json!({ "uid": user.id, "email_addr": user.email }),
+        );
+        app.audit(r);
+        app.request_publish();
+    }
+    Ok((user.id, did))
+}
+
+/// Applies `action` (`approve`, `enable`, `disable` or `revoke`) to device
+/// `id` on behalf of `actor`. Disabling and revoking push a revocation that
+/// cuts the device's live connections. Returns whether anything changed; an
+/// action the device's state does not allow is refused with a conflict.
+pub(crate) async fn device_action(
+    app: &App,
+    id: &str,
+    action: &str,
+    actor: &Actor,
+) -> Result<bool, ApiError> {
+    let device = app
+        .store
+        .device(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no device {id}")))?;
+    let (transition, done, activity, message) = match action {
+        "approve" => (
+            DeviceAction::Approve,
+            DeviceStatus::Approved,
+            Activity::Activate,
+            "device approved",
+        ),
+        "enable" => (
+            DeviceAction::Enable,
+            DeviceStatus::Approved,
+            Activity::Activate,
+            "device enabled",
+        ),
+        "disable" => (
+            DeviceAction::Disable,
+            DeviceStatus::Disabled,
+            Activity::Suspend,
+            "device disabled",
+        ),
+        "revoke" => (
+            DeviceAction::Revoke,
+            DeviceStatus::Revoked,
+            Activity::Unenroll,
+            "device revoked",
+        ),
+        _ => return Err(ApiError::not_found(format!("no device action {action}"))),
+    };
+    let (status, event) = app.store.transition_device(id, transition).await?;
+    app.announce(event.as_ref());
+    match status {
+        Some(status) => {
+            let mut r = audit::record(activity, true, actor, message);
+            r.insert("entity".into(), audit::entity("device", id));
+            r.insert("unmapped".into(), json!({ "status": status.as_str() }));
+            app.audit(r);
+            app.request_publish();
+            Ok(true)
+        }
+        // Already where the action leads: nothing to do.
+        None if device.status == done => Ok(false),
+        None => {
+            let current = app
+                .store
+                .device(id)
+                .await?
+                .map(|d| d.status)
+                .unwrap_or(device.status);
+            let mut r = audit::record(
+                activity,
+                false,
+                actor,
+                &format!("refused: the device is {}", current.as_str()),
+            );
+            r.insert("entity".into(), audit::entity("device", id));
+            app.audit(r);
+            Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "conflict",
+                format!(
+                    "device {id} is {}; it cannot be {action}d",
+                    current.as_str()
+                ),
+            ))
+        }
     }
 }
 

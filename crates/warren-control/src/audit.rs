@@ -7,6 +7,7 @@
 //! flow records connectors send it, after checking their shape and stamping
 //! which node reported them.
 
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -118,6 +119,8 @@ impl Class {
 pub enum Activity {
     /// Authentication: Logon.
     Logon,
+    /// Authentication: Logoff.
+    Logoff,
     /// Account Change: Enable.
     Enable,
     /// Account Change: Disable.
@@ -141,7 +144,7 @@ pub enum Activity {
 impl Activity {
     fn class(self) -> Class {
         match self {
-            Activity::Logon => Class::Authentication,
+            Activity::Logon | Activity::Logoff => Class::Authentication,
             Activity::Enable | Activity::Disable => Class::AccountChange,
             _ => Class::EntityManagement,
         }
@@ -150,6 +153,7 @@ impl Activity {
     fn id_and_name(self) -> (u32, &'static str) {
         match self {
             Activity::Logon => (1, "Logon"),
+            Activity::Logoff => (2, "Logoff"),
             Activity::Enable => (2, "Enable"),
             Activity::Disable => (5, "Disable"),
             Activity::Create => (1, "Create"),
@@ -177,6 +181,13 @@ pub enum Actor {
         /// Email, if known.
         email: String,
     },
+    /// A user acting in the web console.
+    Console {
+        /// User ID.
+        id: String,
+        /// Email, if known.
+        email: String,
+    },
     /// A relay or connector.
     Node {
         /// Node ID.
@@ -192,6 +203,10 @@ impl Actor {
             Actor::System => json!({ "app_name": "warren control plane" }),
             Actor::LocalAdmin => json!({ "app_name": "warren admin API (local socket)" }),
             Actor::User { id, email } => json!({ "user": { "uid": id, "email_addr": email } }),
+            Actor::Console { id, email } => json!({
+                "user": { "uid": id, "email_addr": email },
+                "app_name": "warren console",
+            }),
             Actor::Node { id } => json!({ "app_name": "warren node", "app_uid": id }),
             Actor::Anonymous => json!({ "app_name": "unauthenticated" }),
         }
@@ -241,6 +256,64 @@ pub fn record(
 /// The OCSF entity object for something the control plane manages.
 pub fn entity(kind: &str, uid: &str) -> Value {
     json!({ "type": kind, "uid": uid })
+}
+
+/// The access decisions connectors reported most recently, kept in memory
+/// for the console. The audit sink keeps every record; this is only the
+/// newest few, and starts empty when the control plane does.
+pub struct Recent {
+    records: Mutex<VecDeque<Value>>,
+    capacity: usize,
+}
+
+impl Recent {
+    /// Keeps the newest `capacity` decisions.
+    pub fn new(capacity: usize) -> Recent {
+        Recent {
+            records: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+        }
+    }
+
+    /// How many decisions are kept at most.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Keeps `record` if it is an access decision (OCSF Network Activity
+    /// with a warren decision ID); flow records are not kept.
+    pub fn remember(&self, record: &Value) {
+        if decision_id(record).is_none() || record["class_uid"] != 4001 {
+            return;
+        }
+        if let Ok(mut records) = self.records.lock() {
+            if records.len() == self.capacity {
+                records.pop_front();
+            }
+            records.push_back(record.clone());
+        }
+    }
+
+    /// The decisions kept, newest first.
+    pub fn newest_first(&self) -> Vec<Value> {
+        self.records
+            .lock()
+            .map(|r| r.iter().rev().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The newest decision with ID `id`.
+    pub fn find(&self, id: &str) -> Option<Value> {
+        self.records
+            .lock()
+            .ok()
+            .and_then(|r| r.iter().rev().find(|v| decision_id(v) == Some(id)).cloned())
+    }
+}
+
+/// The warren decision ID of an access-decision record.
+pub fn decision_id(record: &Value) -> Option<&str> {
+    record["unmapped"]["warren"]["decision_id"].as_str()
 }
 
 /// The largest single record accepted from a node.
@@ -309,6 +382,27 @@ mod tests {
         let r = record(Activity::Disable, false, &Actor::LocalAdmin, "x");
         assert_eq!(r["type_uid"], 300_105);
         assert_eq!(r["status"], "Failure");
+    }
+
+    #[test]
+    fn recent_decisions_keep_the_newest() {
+        let recent = Recent::new(2);
+        let decision = |id: &str| json!({ "class_uid": 4001, "activity_id": 5, "unmapped": { "warren": { "decision_id": id } } });
+        recent.remember(&decision("a"));
+        recent.remember(&json!({ "class_uid": 4001, "activity_id": 2 }));
+        recent.remember(
+            &json!({ "class_uid": 3002, "unmapped": { "warren": { "decision_id": "x" } } }),
+        );
+        recent.remember(&decision("b"));
+        recent.remember(&decision("c"));
+        let ids: Vec<String> = recent
+            .newest_first()
+            .iter()
+            .map(|v| decision_id(v).unwrap().to_owned())
+            .collect();
+        assert_eq!(ids, ["c", "b"]);
+        assert!(recent.find("b").is_some());
+        assert!(recent.find("a").is_none());
     }
 
     #[test]

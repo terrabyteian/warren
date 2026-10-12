@@ -375,7 +375,7 @@ fn location(reply: &Reply) -> String {
     reply.headers["location"].to_str().unwrap().to_owned()
 }
 
-fn query_of(url: &str) -> HashMap<String, String> {
+pub fn query_of(url: &str) -> HashMap<String, String> {
     let q = url.split_once('?').map(|(_, q)| q).unwrap_or("");
     form_urlencoded::parse(q.as_bytes()).into_owned().collect()
 }

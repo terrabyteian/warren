@@ -13,6 +13,7 @@ pub mod app;
 pub mod audit;
 pub mod authority;
 pub mod config;
+pub mod console;
 pub mod log;
 pub mod oidc;
 pub mod store;

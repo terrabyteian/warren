@@ -2779,9 +2779,6 @@ dependencies = [
 [[package]]
 name = "warren-console"
 version = "0.0.0"
-dependencies = [
- "warren-policy",
-]
 
 [[package]]
 name = "warren-control"
