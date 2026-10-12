@@ -37,6 +37,7 @@ and what the dependency closure measures today.
 | [`vendor/`](../vendor) and [`.cargo/config.toml`](../.cargo/config.toml) | Vendored sources; cargo is pointed at them instead of crates.io. |
 | [`scripts/check-deps.sh`](../scripts/check-deps.sh) | Fails on any direct dependency (normal, build or dev) that is not allowlisted for that workspace crate, not pinned with `=`, not from crates.io, or a path outside the workspace; also on unused allowlist entries. |
 | [`scripts/check-closure.sh`](../scripts/check-closure.sh) | Prints the per-binary closure report and fails if any closure differs from its baseline in [`deps/closure/`](../deps/closure), or if a data-path build reaches a crate in [`deps/data-path-forbidden.txt`](../deps/data-path-forbidden.txt). |
+| [`scripts/closure-sbom.sh`](../scripts/closure-sbom.sh) | Turns a closure baseline into the SPDX SBOM the release attests to each container image; CI checks it lists exactly the baseline's crates. |
 | [`scripts/check-vendor.sh`](../scripts/check-vendor.sh) | Re-runs `cargo vendor` and fails if `vendor/` differs from what `Cargo.lock` produces. |
 | [`deny.toml`](../deny.toml) | cargo-deny: advisories, license allowlist, banned crates, crates.io as the only source. |
 | [`supply-chain/`](../supply-chain) | cargo-vet: criteria, imported audit sets, audits, trust entries. |

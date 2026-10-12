@@ -35,8 +35,13 @@ from vendored sources without network access, and the binaries are compiled
 natively or cross-compiled, never under emulation. The release workflow
 signs each image with cosign and publishes two SBOMs for it: one of the
 image's packages, attached by the build with a provenance attestation, and
-an SPDX SBOM of the crates in `Cargo.lock` that the binaries are built from,
-attested with cosign. To check the signature and read both:
+an SPDX SBOM of the crates its binary is built from, attested with cosign.
+That one comes from the binary's closure in [deps/closure/](../deps/closure),
+which CI keeps equal to what cargo compiles in across warren's release
+targets ([dependencies.md](dependencies.md)): `warren.txt` for `warren`, and
+`warren-datapath.txt` for `warren-relay` and `warren-connector`, so the
+data-path images' SBOM lists no control-plane or console crates. To check
+the signature and read both:
 
 ```sh
 id=https://github.com/terrabyteian/warren/.github/workflows/release.yml@refs/tags/vX.Y.Z

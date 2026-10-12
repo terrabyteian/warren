@@ -212,6 +212,19 @@ jobs:
         run: scripts/check-deps.sh
       - name: per-binary closure report and growth gate
         run: scripts/check-closure.sh
+      - name: the images' crate SBOMs list exactly their binaries' closures
+        run: |
+          for closure in deps/closure/warren.txt deps/closure/warren-datapath.txt; do
+            scripts/closure-sbom.sh "$closure" test 0.0.0 >"$RUNNER_TEMP/sbom.json"
+            jq -e --rawfile closure "$closure" '
+              ([$closure | split("\n")[] | select(length > 0 and (startswith("#") | not))
+                | split(" ") | "pkg:cargo/\(.[0])@\(.[1] | ltrimstr("v"))"] | sort) as $want
+              | .spdxVersion == "SPDX-2.3" and .SPDXID == "SPDXRef-DOCUMENT"
+              and ([.packages[].externalRefs[].referenceLocator] | sort) == $want
+              and (.packages | map(.SPDXID) | unique | length) == ($want | length)
+              and ([.relationships[].relatedSpdxElement] | sort) == (.packages | map(.SPDXID) | sort)
+            ' "$RUNNER_TEMP/sbom.json" >/dev/null || { echo "error: bad SBOM for $closure" >&2; exit 1; }
+          done
       - name: vendor/ matches Cargo.lock
         run: scripts/check-vendor.sh
       - name: cargo deny (advisories, licenses, bans, sources)
