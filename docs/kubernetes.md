@@ -40,8 +40,11 @@ That one comes from the binary's closure in [deps/closure/](../deps/closure),
 which CI keeps equal to what cargo compiles in across warren's release
 targets ([dependencies.md](dependencies.md)): `warren.txt` for `warren`, and
 `warren-datapath.txt` for `warren-relay` and `warren-connector`, so the
-data-path images' SBOM lists no control-plane or console crates. To check
-the signature and read both:
+data-path images' SBOM lists no control-plane or console crates. The
+`warren` image's SBOM is a superset: since `warren.txt` spans every release
+target, it also lists five macOS-only crates (`bitflags`, `core-foundation`,
+`core-foundation-sys`, `security-framework`, `security-framework-sys`) that
+the Linux image does not contain. To check the signature and read both:
 
 ```sh
 id=https://github.com/terrabyteian/warren/.github/workflows/release.yml@refs/tags/vX.Y.Z
