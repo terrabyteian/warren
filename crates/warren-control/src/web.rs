@@ -116,6 +116,24 @@ fn redirect_with(status: StatusCode, location: &str) -> Response<Body> {
     }
 }
 
+/// Whether a form post came from a page of `public_url`, as far as the
+/// browser says: its `Origin`, when sent, is that origin (browsers leave the
+/// default port out), and its `Sec-Fetch-Site`, when sent, is
+/// `same-origin`. Every browser form warren serves posts back to itself.
+pub fn from_origin(public_url: &str, headers: &http::HeaderMap) -> bool {
+    let ours = public_url.trim_end_matches(":443");
+    let origin_ok = match headers.get(http::header::ORIGIN) {
+        None => true,
+        Some(o) => o
+            .to_str()
+            .is_ok_and(|o| o.trim_end_matches(":443").eq_ignore_ascii_case(ours)),
+    };
+    let site_ok = headers
+        .get("sec-fetch-site")
+        .is_none_or(|s| s.as_bytes() == b"same-origin");
+    origin_ok && site_ok
+}
+
 /// Escapes text for HTML.
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

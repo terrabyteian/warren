@@ -1,21 +1,23 @@
 //! The web console (docs/console.md): server-rendered pages under
-//! `/console` on the HTTPS listener, signed in through the IdP like the
-//! warren app.
+//! `/console` on the HTTPS listener, signed in through the IdP or with a
+//! built-in account, like the warren app.
 //!
-//! A browser signs in through the same callback as the warren app; the
-//! auth request it starts is marked [`REDIRECT`] and bound to the browser
-//! by a short-lived cookie, so a sign-in started elsewhere cannot finish
-//! here. A successful sign-in sets a host-only, `Secure`, `HttpOnly`
-//! session cookie whose token is stored only as a hash. Every page checks
-//! the session and the user on each request, so disabling a user or
-//! signing out takes effect at once. Every POST carries a form token
-//! derived from the session token and must come from this origin.
+//! A browser signs in through the IdP with the same callback as the warren
+//! app, or with a built-in account through the same password, code and
+//! enrollment steps (signin.rs). Either way the auth request is marked
+//! [`REDIRECT`] and bound to the browser by a short-lived cookie, so a
+//! sign-in started elsewhere cannot finish here. A successful sign-in sets
+//! a host-only, `Secure`, `HttpOnly` session cookie whose token is stored
+//! only as a hash. Every page checks the session and the user on each
+//! request, so disabling a user or signing out takes effect at once. Every
+//! POST carries a form token and must come from this origin: derived from
+//! the session token, or before sign-in from the sign-in cookie.
 //!
 //! Admin pages are open to the users and groups `console.admins` names.
-//! Changes need a sign-in the IdP reported as multi-factor, authenticated
-//! within `console.changeMaxAge` (threat model T5), and go through the
-//! same code as the admin API. Everyone signed in sees the apps open to
-//! them.
+//! Changes need a multi-factor sign-in (one the IdP reported as such, or a
+//! built-in account's, which always is) authenticated within
+//! `console.changeMaxAge` (threat model T5), and go through the same code
+//! as the admin API. Everyone signed in sees the apps open to them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -39,8 +41,9 @@ use crate::api::{IdpSignIn, finish_idp_sign_in, s256};
 use crate::app::{App, new_secret, secret_hash};
 use crate::audit::{self, Activity, Actor};
 use crate::oidc::Provider;
-use crate::store::{AuthRequest, ConsoleSession, Device, User, new_id};
-use crate::web::{self, ApiError, Body, param, query, read_body};
+use crate::signin::{self, PasswordCheck};
+use crate::store::{AuthRequest, ConsoleSession, Device, LocalAccount, User, new_id};
+use crate::web::{self, ApiError, Body, Peer, param, query, read_body};
 
 /// The `client_redirect_uri` that marks an auth request as a console
 /// sign-in. It is no URI, so no native client can name it.
@@ -51,7 +54,7 @@ pub const REDIRECT: &str = "warren-console:";
 pub const SESSION_COOKIE: &str = "__Host-warren-console";
 
 /// The cookie that binds a sign-in in flight to the browser that started
-/// it.
+/// it, and the sign-in page's form to the browser it was shown in.
 pub const LOGIN_COOKIE: &str = "__Host-warren-login";
 
 /// How long a sign-in may take at the IdP.
@@ -84,7 +87,10 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/console/devices/{device}/approve"),
     ("POST", "/console/devices/{device}/revoke"),
     ("GET", "/console/login"),
+    ("POST", "/console/login"),
     ("GET", "/console/login/start"),
+    ("GET", "/console/step-up"),
+    ("POST", "/console/step-up"),
     ("POST", "/console/logout"),
     ("GET", "/console/assets/console.css"),
     ("GET", "/console/assets/console.js"),
@@ -206,6 +212,14 @@ fn csrf_token(session_token: &str) -> String {
     ))
 }
 
+/// The sign-in form's token: a hash of the browser's sign-in cookie, the
+/// same way, so a page of another site cannot post the form either.
+fn login_token(binding: &str) -> String {
+    b64url(&sha256(
+        format!("warren-console-login\0{binding}").as_bytes(),
+    ))
+}
+
 fn display_name(u: &User) -> String {
     if u.email.is_empty() {
         u.subject.clone()
@@ -214,14 +228,19 @@ fn display_name(u: &User) -> String {
     }
 }
 
-/// Whether `user` is named by `console.admins`.
+/// Whether `user` is named by `console.admins`. A built-in account's
+/// subject is `local:<username>`, as in policy, so no IdP subject matches
+/// it, and emails name IdP users only.
 pub fn is_admin(app: &App, user: &User) -> bool {
     let c = &app.config.console;
+    let subject = App::user_entity(user).subject;
     c.admin_groups.iter().any(|g| user.groups.contains(g))
         || c.admin_users.iter().any(|u| {
             *u == user.id
-                || *u == user.subject
-                || (!user.email.is_empty() && u.eq_ignore_ascii_case(&user.email))
+                || *u == subject
+                || (!user.is_local()
+                    && !user.email.is_empty()
+                    && u.eq_ignore_ascii_case(&user.email))
         })
 }
 
@@ -232,6 +251,9 @@ struct Signed {
     session: ConsoleSession,
     user: User,
     viewer: Viewer,
+    /// The built-in account whose authenticator code can step this sign-in
+    /// up, when it needs one and has one.
+    step_up: Option<LocalAccount>,
 }
 
 /// Where to return after signing in during `req`: the page itself for a
@@ -289,11 +311,29 @@ async fn signed_in<B>(app: &App, req: &Request<B>) -> Result<Signed, Stop> {
         return Err(Box::new(resp));
     }
     let admin = is_admin(app, &user);
+    let mut changes = may_change(app, admin, &session, now);
+    // An IdP sign-in that reports no MFA or no `auth_time` may get a second
+    // factor from the authenticator of the built-in account with the user's
+    // verified email, while built-in accounts are enabled.
+    let unreported = changes == Changes::NeedMfa
+        || (changes == Changes::NeedRecentSignIn && session.auth_time == AUTH_TIME_UNKNOWN as i64);
+    let step_up = if unreported && !user.is_local() && app.config.local_accounts.enabled {
+        app.store
+            .step_up_account(&user.email)
+            .await
+            .map_err(internal)?
+    } else {
+        None
+    };
+    if step_up.is_some() {
+        changes = Changes::NeedStepUp;
+    }
     let viewer = Viewer {
         user_id: user.id.clone(),
         name: display_name(&user),
         admin,
-        changes: may_change(app, admin, &session, now),
+        local: user.is_local(),
+        changes,
         csrf: csrf_token(&token),
         now,
     };
@@ -301,19 +341,24 @@ async fn signed_in<B>(app: &App, req: &Request<B>) -> Result<Signed, Stop> {
         session,
         user,
         viewer,
+        step_up,
     })
 }
 
 /// Whether a sign-in may make admin changes: the one check every change
-/// passes. An admin needs a sign-in the IdP reported as multi-factor
-/// (threat model T5) that authenticated them within
-/// `console.changeMaxAge`.
+/// passes. An admin needs a multi-factor authentication (threat model T5)
+/// within `console.changeMaxAge`: a sign-in the IdP reported as such, a
+/// built-in account's sign-in, which always is, or a step-up with a
+/// built-in account's authenticator code.
 fn may_change(app: &App, admin: bool, session: &ConsoleSession, now: i64) -> Changes {
+    let max_age = app.config.console.change_max_age.as_secs() as i64;
     if !admin {
         Changes::NotAdmin
+    } else if session.step_up_at.is_some_and(|t| now - t <= max_age) {
+        Changes::Allowed
     } else if !session.mfa {
         Changes::NeedMfa
-    } else if now - session.auth_time > app.config.console.change_max_age.as_secs() as i64 {
+    } else if now - session.auth_time > max_age {
         Changes::NeedRecentSignIn
     } else {
         Changes::Allowed
@@ -352,19 +397,7 @@ async fn check_post(
             pages::message(Some(&s.viewer), "Request refused", why, None),
         ))
     };
-    let origin = app
-        .config
-        .public_url
-        .trim_end_matches(":443")
-        .to_ascii_lowercase();
-    if let Some(o) = req.headers().get(http::header::ORIGIN)
-        && o.to_str().map(|o| o.to_ascii_lowercase()).ok() != Some(origin)
-    {
-        return Err(refuse("The request came from another site."));
-    }
-    if let Some(site) = req.headers().get("sec-fetch-site")
-        && site.as_bytes() != b"same-origin"
-    {
+    if !web::from_origin(&app.config.public_url, req.headers()) {
         return Err(refuse("The request came from another site."));
     }
     let body = read_body(req, MAX_FORM)
@@ -405,7 +438,8 @@ async fn login_page<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Ap
     let q = query(req)?;
     let next = safe_next(param(&q, "next"));
     let why = param(&q, "why");
-    if why.is_none() && signed_in(app, req).await.is_ok() {
+    let reauth = param(&q, "reauth") == Some("1");
+    if why.is_none() && !reauth && signed_in(app, req).await.is_ok() {
         return Ok(see_other(&next));
     }
     let status = match why {
@@ -414,7 +448,106 @@ async fn login_page<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Ap
         }
         _ => StatusCode::OK,
     };
-    Ok(html(status, pages::sign_in(&next, why_text(why), false)))
+    let kept = read_cookie(req, LOGIN_COOKIE);
+    sign_in_page(app, kept, status, &next, why_text(why), reauth, "").await
+}
+
+/// The sign-in page, with the built-in account form when built-in accounts
+/// can sign in. The form's token is bound to a cookie this page sets, or
+/// keeps if the browser already has one (`kept`).
+async fn sign_in_page(
+    app: &App,
+    kept: Option<String>,
+    status: StatusCode,
+    next: &str,
+    message: Option<&str>,
+    reauth: bool,
+    username: &str,
+) -> Result<Response<Body>, ApiError> {
+    let binding = if signin::offers_local(app).await? {
+        let kept = kept.filter(|b| {
+            b.len() == 43
+                && b.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        });
+        Some(match kept {
+            Some(b) => b,
+            None => new_secret()?,
+        })
+    } else {
+        None
+    };
+    let page = SignIn {
+        next: next.to_owned(),
+        message: message.map(str::to_owned),
+        idp: app.idp.as_ref().map(|i| i.config().display_name.clone()),
+        reauth,
+        local: binding.as_ref().map(|b| LocalSignIn {
+            csrf: login_token(b),
+            username: username.to_owned(),
+        }),
+    };
+    let mut resp = html(status, pages::sign_in(&page));
+    if let Some(b) = &binding {
+        set_cookie(&mut resp, LOGIN_COOKIE, b, LOGIN_LIFETIME);
+    }
+    Ok(resp)
+}
+
+/// `POST /console/login`: a built-in account's username and password,
+/// checked exactly as `POST /v1/auth/password` checks them. The
+/// authenticator code (or enrolling an authenticator) follows on the same
+/// pages as for the warren app, and ends in a console session.
+async fn login_password(
+    app: &App,
+    req: Request<Incoming>,
+    peer: &Peer,
+) -> Result<Response<Body>, ApiError> {
+    if !signin::offers_local(app).await? {
+        return Err(ApiError::not_found(
+            "This deployment's console signs in through its identity provider.",
+        ));
+    }
+    let binding = read_cookie(&req, LOGIN_COOKIE);
+    let headers = req.headers().clone();
+    let same_origin = web::from_origin(&app.config.public_url, &headers);
+    let body = read_body(req, MAX_FORM).await?;
+    let form: Vec<(String, String)> = form_urlencoded::parse(&body).into_owned().collect();
+    let next = safe_next(param(&form, "next"));
+    let typed = param(&form, "username").unwrap_or("").trim().to_owned();
+    let token = param(&form, "csrf").unwrap_or("");
+    let bound = binding.as_deref().is_some_and(|b| {
+        aws_lc_rs::constant_time::verify_slices_are_equal(
+            token.as_bytes(),
+            login_token(b).as_bytes(),
+        )
+        .is_ok()
+    });
+    let (status, message) = if !same_origin {
+        (
+            StatusCode::FORBIDDEN,
+            "The sign-in form came from another site. Sign in here.",
+        )
+    } else if !bound {
+        (
+            StatusCode::FORBIDDEN,
+            "The sign-in form expired. Enter your username and password again.",
+        )
+    } else {
+        let password = zeroize::Zeroizing::new(param(&form, "password").unwrap_or("").to_owned());
+        match signin::check_password(app, &signin::username(&typed), password, peer).await? {
+            PasswordCheck::TooMany => (StatusCode::TOO_MANY_REQUESTS, signin::TOO_MANY),
+            PasswordCheck::Incorrect | PasswordCheck::Stale => {
+                (StatusCode::UNAUTHORIZED, signin::INCORRECT)
+            }
+            PasswordCheck::Passed(passed) => {
+                let mut resp = signin::begin_console(app, &next, &passed).await?;
+                set_cookie(&mut resp, LOGIN_COOKIE, "", 0);
+                return Ok(resp);
+            }
+        }
+    };
+    sign_in_page(app, binding, status, &next, Some(message), false, &typed).await
 }
 
 async fn login_start<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiError> {
@@ -422,15 +555,13 @@ async fn login_start<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, A
     let next = safe_next(param(&q, "next"));
     let reauth = param(&q, "reauth") == Some("1");
     let Some(idp) = &app.idp else {
-        return Ok(html(
-            StatusCode::NOT_FOUND,
-            pages::message(
-                None,
-                "Sign-in is unavailable",
-                "The console signs in through an identity provider, and this deployment has none.",
-                None,
-            ),
-        ));
+        // Built-in accounts sign in on the sign-in page itself.
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        ser.append_pair("next", &next);
+        if reauth {
+            ser.append_pair("reauth", "1");
+        }
+        return Ok(see_other(&format!("/console/login?{}", ser.finish())));
     };
     // Signing in again is for changes, so ask the IdP for a sign-in recent
     // enough for them too.
@@ -502,13 +633,7 @@ pub(crate) async fn finish_sign_in<B>(
     pending: &AuthRequest,
 ) -> Result<Response<Body>, ApiError> {
     let next = safe_next(Some(&pending.client_state));
-    let back = |why: &str| {
-        let mut ser = form_urlencoded::Serializer::new(String::new());
-        ser.append_pair("next", &next).append_pair("why", why);
-        let mut resp = see_other(&format!("/console/login?{}", ser.finish()));
-        set_cookie(&mut resp, LOGIN_COOKIE, "", 0);
-        Ok(resp)
-    };
+    let back = |why: &str| Ok(back_to_sign_in(&next, why));
     let bound = read_cookie(req, LOGIN_COOKIE).is_some_and(|b| {
         aws_lc_rs::constant_time::verify_slices_are_equal(
             secret_hash(&b).as_bytes(),
@@ -547,6 +672,47 @@ pub(crate) async fn finish_sign_in<B>(
             (user, auth_time, mfa)
         }
     };
+    let mut r = audit::record(
+        Activity::Logon,
+        true,
+        &actor(&user),
+        "signed in to the console",
+    );
+    r.insert("auth_protocol".into(), "OIDC".into());
+    r.insert("is_mfa".into(), mfa.into());
+    open_session(app, &user, auth_time, mfa, r, &next).await
+}
+
+/// Who a console session acts as, in audit records.
+pub(crate) fn actor(user: &User) -> Actor {
+    Actor::Console {
+        id: user.id.clone(),
+        email: user.email.clone(),
+    }
+}
+
+/// Back to the sign-in page after a sign-in that did not finish, saying
+/// `why`.
+pub(crate) fn back_to_sign_in(next: &str, why: &str) -> Response<Body> {
+    let mut ser = form_urlencoded::Serializer::new(String::new());
+    ser.append_pair("next", &safe_next(Some(next)))
+        .append_pair("why", why);
+    let mut resp = see_other(&format!("/console/login?{}", ser.finish()));
+    set_cookie(&mut resp, LOGIN_COOKIE, "", 0);
+    resp
+}
+
+/// Opens a console session for `user` after a sign-in through the IdP or
+/// with a built-in account, audits it with the Logon record `r` the sign-in
+/// prepared, and sends the browser on to `next`.
+pub(crate) async fn open_session(
+    app: &App,
+    user: &User,
+    auth_time: i64,
+    mfa: bool,
+    mut r: serde_json::Map<String, Value>,
+    next: &str,
+) -> Result<Response<Body>, ApiError> {
     let token = new_secret()?;
     let lifetime = app.config.console.session_lifetime.as_secs() as i64;
     let session = ConsoleSession {
@@ -554,32 +720,166 @@ pub(crate) async fn finish_sign_in<B>(
         user_id: user.id.clone(),
         auth_time,
         mfa,
+        step_up_at: None,
         expires_at: clock::now_secs() + lifetime,
         ended_at: None,
     };
     app.store
         .insert_console_session(&session, &secret_hash(&token))
         .await?;
-    let mut r = audit::record(
-        Activity::Logon,
-        true,
-        &Actor::Console {
-            id: user.id.clone(),
-            email: user.email.clone(),
-        },
-        "signed in to the console",
-    );
-    r.insert("auth_protocol".into(), "OIDC".into());
-    r.insert("is_mfa".into(), mfa.into());
     r.insert(
         "entity".into(),
         audit::entity("console-session", &session.id),
     );
     app.audit(r);
-    let mut resp = see_other(&next);
+    let mut resp = see_other(&safe_next(Some(next)));
     set_cookie(&mut resp, SESSION_COOKIE, &token, lifetime);
     set_cookie(&mut resp, LOGIN_COOKIE, "", 0);
     Ok(resp)
+}
+
+// Step-up.
+
+/// The step-up page's answer when the sign-in cannot step up: it may make
+/// changes already, or no built-in account can step it up.
+fn no_step_up(app: &App, s: &Signed, next: &str) -> Response<Body> {
+    if s.viewer.changes == Changes::Allowed {
+        return see_other(next);
+    }
+    let text = if s.viewer.local {
+        "A step-up is for sign-ins through an identity provider. Sign in again with your warren account instead."
+    } else if s.viewer.changes == Changes::NeedRecentSignIn
+        && s.session.auth_time != AUTH_TIME_UNKNOWN as i64
+    {
+        "Your identity provider reported a second factor, but too long ago. Sign in again."
+    } else if !app.config.local_accounts.enabled {
+        "Built-in accounts are turned off, so no authenticator code can confirm this sign-in. Sign in again with a second factor your identity provider reports."
+    } else {
+        "To confirm with an authenticator code, you need a warren account with your email address and an authenticator app; ask an administrator. Until then, sign in again with a second factor your identity provider reports."
+    };
+    let again = warren_console::html!(
+        "<p><a class=\"btn primary\" href=\"{}\">Sign in again</a></p>",
+        pages::again_url(&s.viewer, next)
+    );
+    html(
+        StatusCode::FORBIDDEN,
+        pages::message(Some(&s.viewer), "No step-up available", text, Some(again)),
+    )
+}
+
+/// How long a step-up allows changes, in words.
+fn change_window(app: &App) -> String {
+    duration_words(app.config.console.change_max_age.as_secs() as i64)
+}
+
+/// `GET /console/step-up`: the authenticator code form, for an admin whose
+/// IdP sign-in needs a second factor for changes.
+async fn step_up_page<B>(app: &App, req: &Request<B>) -> Response<Body> {
+    let s = match signed_in(app, req).await {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = require_admin(&s) {
+        return *resp;
+    }
+    let q = match query(req) {
+        Ok(q) => q,
+        Err(e) => return error_page(Some(&s.viewer), &e),
+    };
+    let next = safe_next(param(&q, "next"));
+    match &s.step_up {
+        Some(account) => html(
+            StatusCode::OK,
+            pages::step_up(
+                &s.viewer,
+                &next,
+                &account.username,
+                &change_window(app),
+                None,
+            ),
+        ),
+        None => no_step_up(app, &s, &next),
+    }
+}
+
+/// `POST /console/step-up`: checks the authenticator code of the built-in
+/// account bound to this IdP sign-in by its verified email, with the same
+/// limits as a sign-in, and records the step-up on the console session.
+async fn step_up(app: &App, req: Request<Incoming>, peer: &Peer) -> Response<Body> {
+    let s = match signed_in(app, &req).await {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = require_admin(&s) {
+        return *resp;
+    }
+    let form = match check_post(app, &s, req).await {
+        Ok(form) => form,
+        Err(resp) => return *resp,
+    };
+    let next = safe_next(param(&form, "next"));
+    let Some(account) = &s.step_up else {
+        return no_step_up(app, &s, &next);
+    };
+    if signin::too_many(app, peer).is_some() {
+        return html(
+            StatusCode::TOO_MANY_REQUESTS,
+            pages::message(
+                Some(&s.viewer),
+                "Too many failed attempts",
+                signin::TOO_MANY,
+                None,
+            ),
+        );
+    }
+    let typed: String = param(&form, "code")
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let who = actor(&s.user);
+    let passed =
+        match signin::check_code(app, account, &who, &typed, signin::Purpose::StepUp, peer).await {
+            Ok(p) => p,
+            Err(e) => return error_page(Some(&s.viewer), &e),
+        };
+    let Some(protocol) = passed else {
+        return html(
+            StatusCode::UNAUTHORIZED,
+            pages::step_up(
+                &s.viewer,
+                &next,
+                &account.username,
+                &change_window(app),
+                Some(
+                    "That code is not right or was already used, or the account is temporarily locked. Enter the newest code, or try again later.",
+                ),
+            ),
+        );
+    };
+    let now = clock::now_secs();
+    match app.store.step_up_console_session(&s.session.id, now).await {
+        Ok(true) => {}
+        Ok(false) => return back_to_sign_in(&next, "expired"),
+        Err(e) => return error_page(Some(&s.viewer), &e.into()),
+    }
+    let mut r = signin::logon_record(
+        true,
+        &who,
+        "stepped up a console sign-in with a built-in account's authenticator code",
+        protocol,
+        peer,
+    );
+    r.insert(
+        "user".into(),
+        serde_json::json!({ "uid": account.user_id, "name": account.username }),
+    );
+    r.insert(
+        "entity".into(),
+        audit::entity("console-session", &s.session.id),
+    );
+    app.audit(r);
+    see_other(&next)
 }
 
 async fn logout(app: &App, req: Request<Incoming>) -> Response<Body> {
@@ -619,7 +919,7 @@ async fn logout(app: &App, req: Request<Incoming>) -> Response<Body> {
 // Routing.
 
 /// Answers one console request.
-pub async fn route(app: &Arc<App>, req: Request<Incoming>) -> Response<Body> {
+pub async fn route(app: &Arc<App>, req: Request<Incoming>, peer: &Peer) -> Response<Body> {
     let path = req.uri().path().to_owned();
     let method = req.method().clone();
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -632,7 +932,10 @@ pub async fn route(app: &Arc<App>, req: Request<Incoming>) -> Response<Body> {
             Ok(asset("text/javascript; charset=utf-8", warren_console::JS))
         }
         (&Method::GET, ["console", "login"]) => login_page(app, &req).await,
+        (&Method::POST, ["console", "login"]) => login_password(app, req, peer).await,
         (&Method::GET, ["console", "login", "start"]) => login_start(app, &req).await,
+        (&Method::GET, ["console", "step-up"]) => Ok(step_up_page(app, &req).await),
+        (&Method::POST, ["console", "step-up"]) => Ok(step_up(app, req, peer).await),
         (&Method::POST, ["console", "logout"]) => Ok(logout(app, req).await),
         (&Method::GET, _) => Ok(get_page(app, &req, &segments).await),
         (&Method::POST, ["console", "users", id, action @ ("disable" | "enable")]) => {
@@ -749,10 +1052,25 @@ async fn change_request(app: &App, req: Request<Incoming>) -> Result<Signed, Sto
                 duration_words(app.config.console.change_max_age.as_secs() as i64)
             ),
         ),
+        Changes::NeedStepUp => {
+            let confirm = warren_console::html!(
+                "<p><a class=\"btn primary\" href=\"{}\">Confirm with your authenticator code</a></p>",
+                pages::step_up_url(&return_to(&req))
+            );
+            return Err(Box::new(html(
+                StatusCode::FORBIDDEN,
+                pages::message(
+                    Some(&s.viewer),
+                    "Confirm it's you to make changes",
+                    &format!("{} Nothing was changed.", pages::NEED_STEP_UP),
+                    Some(confirm),
+                ),
+            )));
+        }
     };
     let again = warren_console::html!(
         "<p><a class=\"btn primary\" href=\"{}\">Sign in again</a></p>",
-        pages::start_url(&return_to(&req), true)
+        pages::again_url(&s.viewer, &return_to(&req))
     );
     Err(Box::new(html(
         StatusCode::FORBIDDEN,
@@ -761,10 +1079,7 @@ async fn change_request(app: &App, req: Request<Incoming>) -> Result<Signed, Sto
 }
 
 fn console_actor(s: &Signed) -> Actor {
-    Actor::Console {
-        id: s.user.id.clone(),
-        email: s.user.email.clone(),
-    }
+    actor(&s.user)
 }
 
 fn after_action(page: &str, done: &str, id: &str) -> Response<Body> {

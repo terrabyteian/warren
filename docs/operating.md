@@ -197,10 +197,12 @@ localAccounts:
     groups: [admins]                         # default [admins]; local:admins in policy
 ```
 
-The admin signs in from the warren app with that password and is asked to set
-up an authenticator app (any TOTP app) at once; the recovery codes shown then
-are the way back in if the phone is lost. Policy grants the admin access like
-anyone else, for example with `who: { groups: ["local:admins"] }`.
+The admin signs in from the warren app or the web console with that password
+and is asked to set up an authenticator app (any TOTP app) at once; the
+recovery codes shown then are the way back in if the phone is lost. Policy
+grants the admin access like anyone else, for example with
+`who: { groups: ["local:admins"] }`, and `console.admins` makes them a
+console admin the same way ([console.md](console.md#setting-it-up)).
 
 **On a host,** write the password with no other content, readable only by the
 control plane's user, and remove it after the first sign-in:

@@ -25,7 +25,7 @@ use warren_core::keys::sha256;
 use zeroize::Zeroizing;
 
 use crate::accounts;
-use crate::api::{AUTH_CODE_LIFETIME, with_query};
+use crate::api::{AUTH_CODE_LIFETIME, AUTH_REQUEST_LIFETIME, with_query};
 use crate::app::{App, new_secret, secret_hash};
 use crate::audit::{self, Activity, Actor};
 use crate::store::{AuthCode, AuthRequest, LocalAccount, User};
@@ -43,8 +43,11 @@ const STAGE_ENROLL: &str = "enroll";
 const STAGE_ENROLLED: &str = "enrolled";
 
 /// What every failed or refused password step shows.
-const INCORRECT: &str =
+pub(crate) const INCORRECT: &str =
     "The username or password is incorrect, or the account is temporarily locked. Try again later.";
+/// What a source that failed too often is told.
+pub(crate) const TOO_MANY: &str =
+    "There have been too many failed sign-ins from your network. Wait 15 minutes and try again.";
 
 const CSS: &str = "\
 :root{color-scheme:light dark;--fg:#1d1d1f;--muted:#6e6e73;--bg:#f5f5f7;--card:#fff;--line:#d2d2d7;--accent:#2f6f4f;--bad:#b3261e}\
@@ -103,7 +106,10 @@ fn html(
         escape_html(title),
     );
     let mut resp = crate::web::body(status, "text/html; charset=utf-8", page);
-    let form_action = match redirect_uri.and_then(form_action_source) {
+    let form_action = match redirect_uri
+        .filter(|r| *r != crate::console::REDIRECT)
+        .and_then(form_action_source)
+    {
         Some(source) => format!("'self' {source}"),
         None => "'self'".into(),
     };
@@ -117,14 +123,19 @@ fn html(
     }
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
-    if let Some(value) = cookie
-        && let Ok(v) = HeaderValue::from_str(&format!(
-            "{COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=600"
-        ))
-    {
-        headers.insert("set-cookie", v);
+    if let Some(value) = cookie {
+        bind_browser(&mut resp, value);
     }
     resp
+}
+
+/// Sets the cookie that binds a sign-in to this browser.
+fn bind_browser(resp: &mut Response<Body>, value: &str) {
+    if let Ok(v) = HeaderValue::from_str(&format!(
+        "{COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=600"
+    )) {
+        resp.headers_mut().insert("set-cookie", v);
+    }
 }
 
 /// A page that only says something went wrong and what to do.
@@ -146,7 +157,7 @@ fn expired() -> Response<Body> {
     notice(
         StatusCode::BAD_REQUEST,
         "This sign-in has expired",
-        "It was already finished, is too old, or was started in another browser. Start sign-in again from the warren app.",
+        "It was already finished, is too old, or was started in another browser. Start sign-in again.",
     )
 }
 
@@ -345,14 +356,7 @@ fn cookie(headers: &HeaderMap) -> Option<String> {
 
 /// Refuses a form posted from a page of another origin.
 fn same_origin(app: &App, headers: &HeaderMap) -> bool {
-    // Browsers leave the default port out of an origin.
-    let ours = app.config.public_url.trim_end_matches(":443");
-    match headers.get(http::header::ORIGIN) {
-        None => true,
-        Some(origin) => origin
-            .to_str()
-            .is_ok_and(|o| o.trim_end_matches(":443").eq_ignore_ascii_case(ours)),
-    }
+    crate::web::from_origin(&app.config.public_url, headers)
 }
 
 /// Whether a sign-in in flight belongs to the browser that sent `headers`.
@@ -407,7 +411,7 @@ fn actor(user: &User) -> Actor {
     }
 }
 
-fn logon_record(
+pub(crate) fn logon_record(
     success: bool,
     actor: &Actor,
     message: &str,
@@ -425,14 +429,16 @@ fn logon_record(
 
 /// Counts an attempt against its source, refusing it once the source has
 /// made too many.
-fn too_many(app: &App, peer: &Peer) -> Option<Response<Body>> {
-    (!app.limiter.attempt(source(peer), clock::now_secs())).then(|| {
-        notice(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many failed sign-ins",
-            "There have been too many failed sign-ins from your network. Wait 15 minutes and try again.",
-        )
-    })
+pub(crate) fn too_many(app: &App, peer: &Peer) -> Option<Response<Body>> {
+    (!app.limiter.attempt(source(peer), clock::now_secs())).then(too_many_page)
+}
+
+fn too_many_page() -> Response<Body> {
+    notice(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many failed sign-ins",
+        TOO_MANY,
+    )
 }
 
 /// Audits a failed or refused step, and the lockout of `locked` when this
@@ -440,13 +446,12 @@ fn too_many(app: &App, peer: &Peer) -> Option<Response<Body>> {
 fn failed(
     app: &App,
     peer: &Peer,
-    user: Option<&User>,
+    who: &Actor,
     locked: Option<&LocalAccount>,
     message: &str,
     protocol: &str,
 ) {
-    let actor = user.map(actor).unwrap_or(Actor::Anonymous);
-    app.audit(logon_record(false, &actor, message, protocol, peer));
+    app.audit(logon_record(false, who, message, protocol, peer));
     let Some(account) = locked else {
         return;
     };
@@ -481,17 +486,12 @@ pub(crate) async fn password(
     if f.request.local_stage.is_some() {
         return Ok(expired());
     }
-    if let Some(page) = too_many(app, peer) {
-        return Ok(page);
-    }
-    let username = param(&form, "username")
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
+    let username = username(param(&form, "username").unwrap_or(""));
     let password = Zeroizing::new(param(&form, "password").unwrap_or("").to_owned());
     let login = param(&form, "login") == Some("1");
-    let retry = || {
-        password_page(
+    match check_password(app, &username, password, peer).await? {
+        PasswordCheck::TooMany => Ok(too_many_page()),
+        PasswordCheck::Incorrect => Ok(password_page(
             app,
             &f.flow,
             login,
@@ -499,10 +499,61 @@ pub(crate) async fn password(
             Some(INCORRECT),
             StatusCode::UNAUTHORIZED,
             None,
-        )
-    };
-    let account = if warren_core::identity::valid_id(&username) {
-        app.store.local_account_named(&username).await?
+        )),
+        PasswordCheck::Stale => Ok(expired()),
+        PasswordCheck::Passed(passed) => {
+            after_password(
+                app,
+                &f.flow,
+                &f.key,
+                &passed,
+                &f.request.client_redirect_uri,
+            )
+            .await
+        }
+    }
+}
+
+/// A username as typed, the way accounts store it.
+pub(crate) fn username(typed: &str) -> String {
+    typed.trim().to_ascii_lowercase()
+}
+
+/// How a password check ended.
+pub(crate) enum PasswordCheck {
+    /// The source has failed too often.
+    TooMany,
+    /// The username or password is wrong, the username is locked or
+    /// unknown, or the account is disabled: one answer for all of them.
+    Incorrect,
+    /// The password changed while it was being checked.
+    Stale,
+    /// The password checked out: the second factor comes next.
+    Passed(Passed),
+}
+
+/// An account whose password checked out.
+pub(crate) struct Passed {
+    account: LocalAccount,
+    /// The password hash checked, so a reset in between ends the sign-in.
+    verified: String,
+}
+
+/// Checks a built-in account's username and password, the one check every
+/// sign-in with a built-in account starts with: the attempt counts against
+/// its source and its username before it is checked, and every failure is
+/// audited.
+pub(crate) async fn check_password(
+    app: &App,
+    username: &str,
+    password: Zeroizing<String>,
+    peer: &Peer,
+) -> Result<PasswordCheck, ApiError> {
+    if !app.limiter.attempt(source(peer), clock::now_secs()) {
+        return Ok(PasswordCheck::TooMany);
+    }
+    let account = if warren_core::identity::valid_id(username) {
+        app.store.local_account_named(username).await?
     } else {
         None
     };
@@ -513,7 +564,7 @@ pub(crate) async fn password(
     let now = clock::now_secs();
     let reserved = match &account {
         Some(a) => app.store.reserve_local_attempt(&a.user_id, now).await?,
-        None => app.unknown_names.attempt(&username, now),
+        None => app.unknown_names.attempt(username, now),
     };
     let hash = account.as_ref().and_then(|a| a.password_hash.clone());
     let has_password = hash.is_some();
@@ -524,23 +575,23 @@ pub(crate) async fn password(
         failed(
             app,
             peer,
-            user.as_ref(),
+            &user.as_ref().map(actor).unwrap_or(Actor::Anonymous),
             None,
             "sign-in refused: the username is locked after too many failed sign-ins",
             "password",
         );
-        return Ok(retry());
+        return Ok(PasswordCheck::Incorrect);
     };
     let (Some(account), Some(user)) = (account, user) else {
         failed(
             app,
             peer,
-            None,
+            &Actor::Anonymous,
             None,
             "sign-in refused: unknown username",
             "password",
         );
-        return Ok(retry());
+        return Ok(PasswordCheck::Incorrect);
     };
     // A disabled account fails like a wrong password, so the page never
     // confirms its password; only the audit log says why.
@@ -557,12 +608,12 @@ pub(crate) async fn password(
         failed(
             app,
             peer,
-            Some(&user),
+            &actor(&user),
             (lock > 0).then_some(&account),
             why,
             "password",
         );
-        return Ok(retry());
+        return Ok(PasswordCheck::Incorrect);
     }
     app.limiter.succeeded(source(peer), now);
     app.store
@@ -576,21 +627,35 @@ pub(crate) async fn password(
             .set_password_hash(&account.user_id, &verified, &rehashed)
             .await?
         {
-            return Ok(expired());
+            return Ok(PasswordCheck::Stale);
         }
         verified = rehashed;
     }
+    Ok(PasswordCheck::Passed(Passed { account, verified }))
+}
+
+/// Moves the sign-in `flow` past its password to the second factor: the
+/// authenticator code, or enrolling an authenticator if the account has
+/// none.
+async fn after_password(
+    app: &App,
+    flow: &str,
+    key: &str,
+    passed: &Passed,
+    redirect_uri: &str,
+) -> Result<Response<Body>, ApiError> {
+    let Passed { account, verified } = passed;
     if account.totp_secret.is_none() {
         let secret = accounts::new_totp_secret()?;
         let sealed = app.kek.seal(&totp_aad(&account.user_id), &secret)?;
         if !app
             .store
             .advance_auth_request(
-                &f.key,
+                key,
                 None,
                 STAGE_ENROLL,
                 &account.user_id,
-                &verified,
+                verified,
                 Some(&sealed),
             )
             .await?
@@ -599,7 +664,7 @@ pub(crate) async fn password(
         }
         return Ok(enroll_page(
             app,
-            &f.flow,
+            flow,
             &account.username,
             &secret,
             None,
@@ -608,18 +673,49 @@ pub(crate) async fn password(
     }
     if !app
         .store
-        .advance_auth_request(&f.key, None, STAGE_CODE, &account.user_id, &verified, None)
+        .advance_auth_request(key, None, STAGE_CODE, &account.user_id, verified, None)
         .await?
     {
         return Ok(expired());
     }
     Ok(code_page(
-        &f.flow,
+        flow,
         &account.username,
         None,
         StatusCode::OK,
-        &f.request.client_redirect_uri,
+        redirect_uri,
     ))
+}
+
+/// Starts a console sign-in for an account whose password checked out on
+/// the console's sign-in page: a sign-in bound to this browser, as one the
+/// warren app starts is, that ends in a console session at `next` instead
+/// of a code for a client. Its second factor goes through the same pages.
+pub(crate) async fn begin_console(
+    app: &App,
+    next: &str,
+    passed: &Passed,
+) -> Result<Response<Body>, ApiError> {
+    let flow = new_secret()?;
+    let browser = new_secret()?;
+    let key = secret_hash(&flow);
+    let now = clock::now_secs();
+    app.store
+        .insert_auth_request(
+            &key,
+            &AuthRequest {
+                client_redirect_uri: crate::console::REDIRECT.into(),
+                client_state: next.into(),
+                created_at: now,
+                browser_hash: Some(secret_hash(&browser)),
+                ..AuthRequest::default()
+            },
+            now + AUTH_REQUEST_LIFETIME,
+        )
+        .await?;
+    let mut resp = after_password(app, &flow, &key, passed, crate::console::REDIRECT).await?;
+    bind_browser(&mut resp, &browser);
+    Ok(resp)
 }
 
 /// What an authenticator secret is sealed to: the account it belongs to.
@@ -664,9 +760,8 @@ pub(crate) async fn code(
         .filter(|c| !c.is_whitespace())
         .collect();
 
-    let reserved = app.store.reserve_local_attempt(&user_id, now).await?;
-
     if stage == Some(STAGE_ENROLL) {
+        let reserved = app.store.reserve_local_attempt(&user_id, now).await?;
         let sealed = f.request.pending_secret.clone().unwrap_or_default();
         let secret = app.kek.open(&totp_aad(&user_id), &sealed)?;
         let retry = || {
@@ -685,7 +780,7 @@ pub(crate) async fn code(
             failed(
                 app,
                 peer,
-                Some(&user),
+                &actor(&user),
                 None,
                 "authenticator enrollment refused: the account is locked after too many failed sign-ins",
                 "password+TOTP",
@@ -696,7 +791,7 @@ pub(crate) async fn code(
             failed(
                 app,
                 peer,
-                Some(&user),
+                &actor(&user),
                 (lock > 0).then_some(&account),
                 "authenticator enrollment refused: wrong code",
                 "password+TOTP",
@@ -757,44 +852,95 @@ pub(crate) async fn code(
             &f.request.client_redirect_uri,
         )
     };
-    let Some(lock) = reserved else {
+    match check_code(app, &account, &actor(&user), &typed, Purpose::SignIn, peer).await? {
+        Some(protocol) => finish(app, &f.key, &user, protocol, peer).await,
+        None => Ok(retry()),
+    }
+}
+
+/// What an authenticator code is checked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    /// The second step of a sign-in: an authenticator or recovery code.
+    SignIn,
+    /// A console step-up for an IdP sign-in: an authenticator code only.
+    StepUp,
+}
+
+impl Purpose {
+    fn what(self) -> &'static str {
+        match self {
+            Purpose::SignIn => "sign-in",
+            Purpose::StepUp => "console step-up",
+        }
+    }
+
+    fn totp(self) -> &'static str {
+        match self {
+            Purpose::SignIn => "password+TOTP",
+            Purpose::StepUp => "TOTP",
+        }
+    }
+}
+
+/// Checks a code typed for `account`, the one check of a built-in account's
+/// second factor: the attempt counts against the account before it is
+/// checked (locking it after `MAX_FAILED_ATTEMPTS` failures in a row), an
+/// authenticator code's time step is accepted once, a recovery code (for a
+/// sign-in) once, and every failure is audited as `who`. Returns the
+/// protocol it passed with, or `None`. The caller counts the attempt
+/// against its source first.
+pub(crate) async fn check_code(
+    app: &App,
+    account: &LocalAccount,
+    who: &Actor,
+    typed: &str,
+    purpose: Purpose,
+    peer: &Peer,
+) -> Result<Option<&'static str>, ApiError> {
+    let user_id = &account.user_id;
+    let now = clock::now_secs();
+    let Some(lock) = app.store.reserve_local_attempt(user_id, now).await? else {
         failed(
             app,
             peer,
-            Some(&user),
+            who,
             None,
-            "sign-in refused: the account is locked after too many failed sign-ins",
-            "password+TOTP",
+            &format!(
+                "{} refused: the account is locked after too many failed sign-ins",
+                purpose.what()
+            ),
+            purpose.totp(),
         );
-        return Ok(retry());
+        return Ok(None);
     };
     let secret = app.kek.open(
-        &totp_aad(&user_id),
+        &totp_aad(user_id),
         account.totp_secret.as_deref().unwrap_or(""),
     )?;
+    let recovery = match purpose {
+        Purpose::SignIn => accounts::normalize_recovery_code(typed),
+        Purpose::StepUp => None,
+    };
     let (accepted, protocol) =
-        match accounts::verify_totp(&secret, &typed, now, account.totp_last_step) {
+        match accounts::verify_totp(&secret, typed, now, account.totp_last_step) {
             Some(step) => (
                 app.store
-                    .record_local_success(&user_id, Some(step), now)
+                    .record_local_success(user_id, Some(step), now)
                     .await?,
-                "password+TOTP",
+                purpose.totp(),
             ),
-            None => match accounts::normalize_recovery_code(&typed) {
+            None => match recovery {
                 Some(code) => {
                     let left = app
                         .store
-                        .use_recovery_code(&user_id, &accounts::recovery_code_hash(&code))
+                        .use_recovery_code(user_id, &accounts::recovery_code_hash(&code))
                         .await?;
                     match left {
                         Some(left) => {
-                            app.store.record_local_success(&user_id, None, now).await?;
-                            let mut r = audit::record(
-                                Activity::Update,
-                                true,
-                                &actor(&user),
-                                "recovery code used",
-                            );
+                            app.store.record_local_success(user_id, None, now).await?;
+                            let mut r =
+                                audit::record(Activity::Update, true, who, "recovery code used");
                             r.insert("entity".into(), audit::entity("recovery-code", ""));
                             r.insert("unmapped".into(), json!({ "recovery_codes_left": left }));
                             app.audit(r);
@@ -803,22 +949,26 @@ pub(crate) async fn code(
                         None => (false, "password+recovery code"),
                     }
                 }
-                None => (false, "password+TOTP"),
+                None => (false, purpose.totp()),
             },
         };
     if !accepted {
+        let codes = match purpose {
+            Purpose::SignIn => "authenticator or recovery code",
+            Purpose::StepUp => "authenticator code",
+        };
         failed(
             app,
             peer,
-            Some(&user),
-            (lock > 0).then_some(&account),
-            "sign-in refused: wrong authenticator or recovery code",
+            who,
+            (lock > 0).then_some(account),
+            &format!("{} refused: wrong {codes}", purpose.what()),
             protocol,
         );
-        return Ok(retry());
+        return Ok(None);
     }
     app.limiter.succeeded(source(peer), now);
-    finish(app, &f.key, &user, protocol, peer).await
+    Ok(Some(protocol))
 }
 
 /// `POST /v1/auth/continue`: after the recovery codes were shown.
@@ -856,6 +1006,37 @@ async fn finish(
     let Some(pending) = app.store.take_auth_request(key).await? else {
         return Ok(expired());
     };
+    if pending.client_redirect_uri == crate::console::REDIRECT {
+        if user.disabled {
+            app.audit(logon_record(
+                false,
+                &actor(user),
+                "console sign-in refused: the user is disabled",
+                protocol,
+                peer,
+            ));
+            return Ok(crate::console::back_to_sign_in(
+                &pending.client_state,
+                "disabled",
+            ));
+        }
+        let r = logon_record(
+            true,
+            &crate::console::actor(user),
+            "signed in to the console with a built-in account",
+            protocol,
+            peer,
+        );
+        return crate::console::open_session(
+            app,
+            user,
+            clock::now_secs(),
+            true,
+            r,
+            &pending.client_state,
+        )
+        .await;
+    }
     let back = |pairs: &[(&str, &str)]| {
         let mut all = pairs.to_vec();
         all.push(("state", pending.client_state.as_str()));

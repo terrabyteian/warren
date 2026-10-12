@@ -341,6 +341,9 @@ pub struct ConsoleSession {
     pub auth_time: i64,
     /// Whether the sign-in used MFA.
     pub mfa: bool,
+    /// When the user last stepped up with a built-in account's
+    /// authenticator code, Unix seconds.
+    pub step_up_at: Option<i64>,
     /// When the session ends, Unix seconds.
     pub expires_at: i64,
     /// When the user signed out, if they did.
@@ -428,6 +431,13 @@ fn migrator() -> Migrator {
             "accounts".into(),
             MigrationType::Simple,
             include_str!("../migrations/0003_accounts.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            4,
+            "console step-up".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0004_console_step_up.sql").into_sql_str(),
             false,
         ),
     ])
@@ -1001,6 +1011,28 @@ impl Store {
             .await
             .map_err(db)?;
         rows.iter().map(Self::local_account_from_row).collect()
+    }
+
+    /// The built-in account an IdP user with the verified `email` steps up
+    /// with in the console: the one enabled, not deleted, with an
+    /// authenticator, whose email is `email` in any case. `None` when there
+    /// is none, or more than one.
+    pub async fn step_up_account(&self, email: &str) -> Result<Option<LocalAccount>, Error> {
+        if email.is_empty() {
+            return Ok(None);
+        }
+        let rows = sqlx::query(local_account_select!(
+            "WHERE u.deleted_at IS NULL AND u.disabled = FALSE AND a.totp_secret IS NOT NULL \
+             AND u.email <> '' AND LOWER(u.email) = LOWER(?) LIMIT 2"
+        ))
+        .bind(email)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        match rows.as_slice() {
+            [row] => Ok(Some(Self::local_account_from_row(row)?)),
+            _ => Ok(None),
+        }
     }
 
     /// Whether any built-in account exists.
@@ -2098,11 +2130,26 @@ impl Store {
                     user_id: row.try_get("user_id").map_err(db)?,
                     auth_time: row.try_get("auth_time").map_err(db)?,
                     mfa: row.try_get("mfa").map_err(db)?,
+                    step_up_at: row.try_get("step_up_at").map_err(db)?,
                     expires_at: row.try_get("expires_at").map_err(db)?,
                     ended_at: row.try_get("ended_at").map_err(db)?,
                 })
             })
             .transpose()
+    }
+
+    /// Records a step-up on an open console session at `at`. Returns
+    /// whether the session was open.
+    pub async fn step_up_console_session(&self, id: &str, at: i64) -> Result<bool, Error> {
+        let r = sqlx::query(
+            "UPDATE console_sessions SET step_up_at = ? WHERE id = ? AND ended_at IS NULL",
+        )
+        .bind(at)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(r.rows_affected() == 1)
     }
 
     /// Ends a console session (sign-out). Returns whether it was open.

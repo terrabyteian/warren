@@ -26,7 +26,9 @@ Without controlPlane.tls, add --fingerprint with the root fingerprint that
 warren admin deployment prints.
 {{- end }}
 
-There is no web console yet. Administer the control plane with warren admin:
+The web console is at {{ .Values.controlPlane.publicUrl }}/console/ for the admins
+named in controlPlane.config.console.admins (docs/console.md). For everything
+else, administer the control plane with warren admin:
 
   kubectl -n {{ .Release.Namespace }} exec {{ $full }}-control-plane-0 -- warren admin deployment
 {{- if not (or .Values.relay.enabled .Values.connector.enabled) }}
