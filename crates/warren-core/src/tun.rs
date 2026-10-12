@@ -202,10 +202,10 @@ pub fn enable_nat(tun: &str, sources: &[IpNet]) -> io::Result<()> {
         .map(ToString::to_string)
         .collect();
     if !v4.is_empty() {
-        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+        enable_forwarding("/proc/sys/net/ipv4/ip_forward")?;
     }
     if !v6.is_empty() {
-        std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")?;
+        enable_forwarding("/proc/sys/net/ipv6/conf/all/forwarding")?;
     }
     disable_nat();
     let mut rules = String::new();
@@ -221,9 +221,43 @@ pub fn enable_nat(tun: &str, sources: &[IpNet]) -> io::Result<()> {
     run("nft", &["-f", "-"], Some(&rules))
 }
 
+/// Turns a forwarding sysctl on, leaving it alone when it already is: in a
+/// container `/proc/sys` is read-only, so forwarding is turned on before
+/// the connector starts (on Kubernetes, by a privileged init container).
+fn enable_forwarding(path: &str) -> io::Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|v| v.trim() == "1") {
+        return Ok(());
+    }
+    std::fs::write(path, "1").map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))
+}
+
 /// Removes warren's NAT table, ignoring a missing one.
 pub fn disable_nat() {
     for family in ["ip", "ip6"] {
         let _ = run("nft", &["delete", "table", family, NAT_TABLE], None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::enable_forwarding;
+
+    #[test]
+    fn forwarding_already_on_is_not_written() {
+        let dir = std::env::temp_dir().join(format!("warren-sysctl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = dir.join("on");
+        std::fs::write(&on, "1\n").unwrap();
+        // Read-only, as /proc/sys is in a container.
+        std::fs::set_permissions(&on, std::fs::Permissions::from_mode(0o444)).unwrap();
+        enable_forwarding(on.to_str().unwrap()).unwrap();
+
+        let off = dir.join("off");
+        std::fs::write(&off, "0\n").unwrap();
+        enable_forwarding(off.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(&off).unwrap(), "1");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

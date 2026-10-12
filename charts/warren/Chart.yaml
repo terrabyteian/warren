@@ -1,0 +1,16 @@
+apiVersion: v2
+name: warren
+description: Zero-trust private access. The warren control plane, relay and kernel-mode connector.
+type: application
+# The release workflow sets both versions from the tag.
+version: 0.0.0
+appVersion: "0.0.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/terrabyteian/warren
+sources:
+  - https://github.com/terrabyteian/warren
+keywords:
+  - zero-trust
+  - private-access
+annotations:
+  licenses: Apache-2.0
