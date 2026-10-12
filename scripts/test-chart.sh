@@ -22,9 +22,11 @@ fail() {
 }
 
 # YAML documents on stdin to a JSON array of them on stdout.
+# shellcheck disable=SC2016 # $stdin is Ruby's, not the shell's
 yaml2json() { ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load_stream($stdin.read).compact)'; }
 
 # The release is "t", so every object is named t-warren-<role>.
+# shellcheck disable=SC2016 # the $ parameters are jq's
 defs='
 def obj($kind; $name): .[] | select(.kind == $kind and .metadata.name == ("t-warren-" + $name));
 def pod($kind; $name): obj($kind; $name) | .spec.template.spec;
@@ -159,6 +161,7 @@ check nodes 'cp.image == "ghcr.io/terrabyteian/warren:0.0.0"' "only the control 
 check nodes 'relay.securityContext.runAsNonRoot == true and pod("Deployment"; "relay").securityContext.runAsUser == 65532' \
   "the relay runs as nonroot"
 for role in relay connector; do
+  # shellcheck disable=SC2016 # $(WARREN_JOIN_TOKEN) is Kubernetes' env syntax, kept literal
   check nodes "$role"' | (.args | index("--join-token=$(WARREN_JOIN_TOKEN)") != null)
     and .env == [{name: "WARREN_JOIN_TOKEN", valueFrom: {secretKeyRef: {name: "'"$role"'-join", key: "token"}}}]' \
     "the $role's join token comes from its Secret through the environment"
