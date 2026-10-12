@@ -2,7 +2,7 @@
 //! loading policy, publishing bundles, announcing events, and recognizing
 //! sessions and nodes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -42,6 +42,67 @@ pub struct PolicyStatus {
     pub warnings: Vec<String>,
 }
 
+/// Which relays and connectors have their revocation event stream open:
+/// the control plane's view of their health. Kept in memory, so it starts
+/// empty when the control plane does.
+#[derive(Default)]
+pub struct Presence {
+    nodes: std::sync::Mutex<HashMap<String, NodePresence>>,
+}
+
+/// One node's event streams.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodePresence {
+    /// Streams open now.
+    pub open: usize,
+    /// When the oldest open stream started, Unix seconds.
+    pub since: i64,
+    /// When a stream last ended, Unix seconds; 0 if none has.
+    pub last_seen: i64,
+}
+
+impl Presence {
+    /// Counts a stream for `node` as open until the guard is dropped.
+    pub fn connect(self: &Arc<Self>, node: &str) -> PresenceGuard {
+        if let Ok(mut nodes) = self.nodes.lock() {
+            let p = nodes.entry(node.to_owned()).or_default();
+            if p.open == 0 {
+                p.since = clock::now_secs();
+            }
+            p.open += 1;
+        }
+        PresenceGuard {
+            presence: self.clone(),
+            node: node.to_owned(),
+        }
+    }
+
+    /// Every node seen since the control plane started.
+    pub fn snapshot(&self) -> HashMap<String, NodePresence> {
+        self.nodes.lock().map(|n| n.clone()).unwrap_or_default()
+    }
+}
+
+/// An open event stream; see [`Presence::connect`].
+pub struct PresenceGuard {
+    presence: Arc<Presence>,
+    node: String,
+}
+
+impl Drop for PresenceGuard {
+    fn drop(&mut self) {
+        if let Ok(mut nodes) = self.presence.nodes.lock()
+            && let Some(p) = nodes.get_mut(&self.node)
+        {
+            p.open = p.open.saturating_sub(1);
+            p.last_seen = clock::now_secs();
+        }
+    }
+}
+
+/// How many recent access decisions the console can show.
+pub const RECENT_DECISIONS: usize = 2000;
+
 /// Shared state.
 pub struct App {
     /// Configuration.
@@ -56,6 +117,10 @@ pub struct App {
     pub audit: audit::Sink,
     /// The control plane's own node ID.
     pub id: String,
+    /// The newest access decisions, for the console.
+    pub recent: audit::Recent,
+    /// Which nodes are connected.
+    pub presence: Arc<Presence>,
     policy: RwLock<PolicyStatus>,
     events: watch::Sender<u64>,
     publish_wanted: Notify,
@@ -92,6 +157,8 @@ impl App {
             idp,
             audit,
             id,
+            recent: audit::Recent::new(RECENT_DECISIONS),
+            presence: Arc::default(),
             policy: RwLock::new(PolicyStatus::default()),
             events: watch::Sender::new(latest_seq),
             publish_wanted: Notify::new(),

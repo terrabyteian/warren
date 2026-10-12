@@ -191,6 +191,11 @@ pub struct AuthRequest {
     pub nonce: String,
     /// The control plane's own PKCE verifier toward the IdP.
     pub idp_verifier: String,
+    /// When it was created, Unix seconds.
+    pub created_at: i64,
+    /// Whether the IdP was asked to authenticate the user afresh
+    /// (`prompt=login`).
+    pub login: bool,
 }
 
 /// A one-time sign-in code.
@@ -206,6 +211,36 @@ pub struct AuthCode {
     pub auth_time: i64,
     /// Whether the sign-in used MFA.
     pub mfa: bool,
+}
+
+/// A browser's sign-in to the web console.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleSession {
+    /// The session ID.
+    pub id: String,
+    /// The user.
+    pub user_id: String,
+    /// IdP authentication time, Unix seconds.
+    pub auth_time: i64,
+    /// Whether the sign-in used MFA.
+    pub mfa: bool,
+    /// When the session ends, Unix seconds.
+    pub expires_at: i64,
+    /// When the user signed out, if they did.
+    pub ended_at: Option<i64>,
+}
+
+/// The newest certificate still in force for one subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentCertificate {
+    /// `client` or `node`.
+    pub kind: String,
+    /// The device or node.
+    pub subject_id: String,
+    /// The user, for client certificates.
+    pub user_id: Option<String>,
+    /// When the newest one expires, Unix seconds.
+    pub not_after: i64,
 }
 
 /// What a bundle is built from, read in the transaction that stores it.
@@ -256,13 +291,22 @@ pub struct Store {
 }
 
 fn migrator() -> Migrator {
-    Migrator::with_migrations(vec![Migration::new(
-        1,
-        "initial".into(),
-        MigrationType::Simple,
-        include_str!("../migrations/0001_initial.sql").into_sql_str(),
-        false,
-    )])
+    Migrator::with_migrations(vec![
+        Migration::new(
+            1,
+            "initial".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0001_initial.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            2,
+            "console".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0002_console.sql").into_sql_str(),
+            false,
+        ),
+    ])
 }
 
 impl Store {
@@ -628,6 +672,7 @@ impl Store {
         for sql in [
             "DELETE FROM auth_requests WHERE expires_at <= ?",
             "DELETE FROM auth_codes WHERE expires_at <= ?",
+            "DELETE FROM console_sessions WHERE expires_at <= ?",
         ] {
             sqlx::query(sql)
                 .bind(now)
@@ -690,8 +735,8 @@ impl Store {
         expires_at: i64,
     ) -> Result<(), Error> {
         sqlx::query(
-            "INSERT INTO auth_requests (state_hash, client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO auth_requests (state_hash, client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, created_at, login, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(state_hash)
         .bind(&r.client_redirect_uri)
@@ -699,6 +744,8 @@ impl Store {
         .bind(&r.client_challenge)
         .bind(&r.nonce)
         .bind(&r.idp_verifier)
+        .bind(r.created_at)
+        .bind(r.login)
         .bind(expires_at)
         .execute(&self.pool)
         .await
@@ -709,9 +756,9 @@ impl Store {
     /// Takes (and deletes) an unexpired sign-in in flight: each one is
     /// usable once.
     pub async fn take_auth_request(&self, state_hash: &str) -> Result<Option<AuthRequest>, Error> {
-        let row: Option<(String, String, String, String, String)> = sqlx::query_as(
+        let row: Option<(String, String, String, String, String, i64, bool)> = sqlx::query_as(
             "DELETE FROM auth_requests WHERE state_hash = ? AND expires_at > ? \
-             RETURNING client_redirect_uri, client_state, client_challenge, nonce, idp_verifier",
+             RETURNING client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, created_at, login",
         )
         .bind(state_hash)
         .bind(clock::now_secs())
@@ -724,14 +771,22 @@ impl Store {
             .await
             .map_err(db)?;
         Ok(row.map(
-            |(client_redirect_uri, client_state, client_challenge, nonce, idp_verifier)| {
-                AuthRequest {
-                    client_redirect_uri,
-                    client_state,
-                    client_challenge,
-                    nonce,
-                    idp_verifier,
-                }
+            |(
+                client_redirect_uri,
+                client_state,
+                client_challenge,
+                nonce,
+                idp_verifier,
+                created_at,
+                login,
+            )| AuthRequest {
+                client_redirect_uri,
+                client_state,
+                client_challenge,
+                nonce,
+                idp_verifier,
+                created_at,
+                login,
             },
         ))
     }
@@ -866,6 +921,65 @@ impl Store {
         };
         tx.commit().await.map_err(db)?;
         Ok(event)
+    }
+
+    // Console sessions.
+
+    /// Creates a console session.
+    pub async fn insert_console_session(
+        &self,
+        s: &ConsoleSession,
+        token_hash: &str,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO console_sessions (id, token_hash, user_id, auth_time, mfa, created_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&s.id)
+        .bind(token_hash)
+        .bind(&s.user_id)
+        .bind(s.auth_time)
+        .bind(s.mfa)
+        .bind(clock::now_secs())
+        .bind(s.expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// A console session by its token's hash.
+    pub async fn console_session(&self, token_hash: &str) -> Result<Option<ConsoleSession>, Error> {
+        let row = sqlx::query("SELECT * FROM console_sessions WHERE token_hash = ?")
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        row.as_ref()
+            .map(|row| {
+                Ok(ConsoleSession {
+                    id: row.try_get("id").map_err(db)?,
+                    user_id: row.try_get("user_id").map_err(db)?,
+                    auth_time: row.try_get("auth_time").map_err(db)?,
+                    mfa: row.try_get("mfa").map_err(db)?,
+                    expires_at: row.try_get("expires_at").map_err(db)?,
+                    ended_at: row.try_get("ended_at").map_err(db)?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Ends a console session (sign-out). Returns whether it was open.
+    pub async fn end_console_session(&self, id: &str) -> Result<bool, Error> {
+        let r = sqlx::query(
+            "UPDATE console_sessions SET ended_at = ? WHERE id = ? AND ended_at IS NULL",
+        )
+        .bind(clock::now_secs())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(r.rows_affected() == 1)
     }
 
     // Devices.
@@ -1119,6 +1233,39 @@ impl Store {
         .await
         .map_err(db)?;
         Ok(())
+    }
+
+    /// For each device (and user) and each node, its newest certificate
+    /// that is neither expired nor revoked.
+    pub async fn current_certificates(&self) -> Result<Vec<CurrentCertificate>, Error> {
+        let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT kind, subject_id, user_id, MAX(not_after) FROM certificates \
+             WHERE revoked_at IS NULL AND not_after > ? \
+             GROUP BY kind, subject_id, user_id ORDER BY subject_id",
+        )
+        .bind(clock::now_secs())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(kind, subject_id, user_id, not_after)| CurrentCertificate {
+                    kind,
+                    subject_id,
+                    user_id,
+                    not_after,
+                },
+            )
+            .collect())
+    }
+
+    /// When each node last acknowledged an event, Unix milliseconds.
+    pub async fn node_last_acks(&self) -> Result<Vec<(String, i64)>, Error> {
+        sqlx::query_as("SELECT node_id, MAX(received_at_ms) FROM event_acks GROUP BY node_id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)
     }
 
     /// Whether a certificate has been revoked.

@@ -62,6 +62,36 @@ pub struct TlsFiles {
     pub key_file: PathBuf,
 }
 
+/// Who may use the web console's admin pages, and how recently they must
+/// have signed in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Console {
+    /// Admins by email (compared without case), IdP subject or warren user
+    /// ID.
+    pub admin_users: Vec<String>,
+    /// Admins by IdP group.
+    pub admin_groups: Vec<String>,
+    /// How long a console sign-in lasts.
+    pub session_lifetime: Duration,
+    /// How recently an admin must have authenticated at the IdP to make a
+    /// change: approve or revoke a device, disable or enable a user.
+    pub change_max_age: Duration,
+}
+
+impl Default for Console {
+    fn default() -> Console {
+        Console {
+            admin_users: Vec::new(),
+            admin_groups: Vec::new(),
+            session_lifetime: Duration::from_secs(12 * 3600),
+            change_max_age: Duration::from_secs(3600),
+        }
+    }
+}
+
+/// The longest console sign-in a deployment may configure.
+const CONSOLE_SESSION_BOUND: Duration = Duration::from_secs(86_400);
+
 /// The control plane's configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -113,6 +143,8 @@ pub struct Config {
     pub audit_file: Option<PathBuf>,
     /// More names no app may claim, such as relay host names.
     pub reserved_names: Vec<String>,
+    /// The web console.
+    pub console: Console,
 }
 
 /// The longest sign-in session a deployment may configure.
@@ -136,6 +168,7 @@ const KEYS: &[&str] = &[
     "certificates",
     "audit",
     "reservedNames",
+    "console",
 ];
 
 struct Reader {
@@ -476,6 +509,10 @@ impl Config {
             .map(|n| r.host_names(n, "reservedNames"))
             .unwrap_or_default();
 
+        let console = get(&f, "console")
+            .map(|n| parse_console(&mut r, n))
+            .unwrap_or_default();
+
         if !r.errors.is_empty() {
             return Err(r.errors.join("; "));
         }
@@ -503,6 +540,7 @@ impl Config {
             clock_skew,
             audit_file,
             reserved_names,
+            console,
         })
     }
 
@@ -591,6 +629,44 @@ impl Config {
         names.extend(self.reserved_names.iter().cloned());
         names
     }
+}
+
+fn parse_console(r: &mut Reader, node: &Node) -> Console {
+    let mut console = Console::default();
+    let f = r.map(
+        node,
+        "console",
+        &["admins", "sessionLifetime", "changeMaxAge"],
+    );
+    if let Some(a) = get(&f, "admins") {
+        let af = r.map(a, "console.admins", &["users", "groups"]);
+        if let Some(u) = get(&af, "users") {
+            console.admin_users = r.strings(u, "console.admins.users");
+        }
+        if let Some(g) = get(&af, "groups") {
+            console.admin_groups = r.strings(g, "console.admins.groups");
+        }
+    }
+    if let Some(d) =
+        get(&f, "sessionLifetime").and_then(|d| r.duration(d, "console.sessionLifetime"))
+    {
+        if d > CONSOLE_SESSION_BOUND {
+            r.err(node, "console.sessionLifetime may be at most 24h");
+        } else {
+            console.session_lifetime = d;
+        }
+    }
+    if let Some(d) = get(&f, "changeMaxAge").and_then(|d| r.duration(d, "console.changeMaxAge")) {
+        if d > console.session_lifetime {
+            r.err(
+                node,
+                "console.changeMaxAge may be at most console.sessionLifetime",
+            );
+        } else {
+            console.change_max_age = d;
+        }
+    }
+    console
 }
 
 fn parse_idp(r: &mut Reader, node: &Node) -> Option<Idp> {
@@ -817,6 +893,29 @@ mod tests {
         ))
         .unwrap_err();
         assert!(e.contains("chain"), "{e}");
+    }
+
+    #[test]
+    fn console_settings() {
+        let c = Config::parse(MINIMAL).unwrap();
+        assert_eq!(c.console, Console::default());
+        let c = Config::parse(&format!(
+            "{MINIMAL}console:\n  admins:\n    users: [ada@example.com]\n    groups: [warren-admins]\n  sessionLifetime: 8h\n  changeMaxAge: 30m\n"
+        ))
+        .unwrap();
+        assert_eq!(c.console.admin_users, ["ada@example.com"]);
+        assert_eq!(c.console.admin_groups, ["warren-admins"]);
+        assert_eq!(c.console.session_lifetime, Duration::from_secs(8 * 3600));
+        assert_eq!(c.console.change_max_age, Duration::from_secs(1800));
+        for (bad, why) in [
+            ("console:\n  requireMfa: false\n", "requireMfa"),
+            ("console:\n  sessionLifetime: 2d\n", "24h"),
+            ("console:\n  changeMaxAge: 13h\n", "changeMaxAge"),
+            ("console:\n  admins:\n    roles: [x]\n", "roles"),
+        ] {
+            let e = Config::parse(&format!("{MINIMAL}{bad}")).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
     }
 
     #[test]

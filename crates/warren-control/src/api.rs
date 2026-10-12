@@ -84,9 +84,13 @@ async fn route(
 ) -> Result<Response<Body>, ApiError> {
     check_protocol(&req)?;
     let path = req.uri().path().to_owned();
+    if crate::console::is_console_path(&path) {
+        return Ok(crate::console::route(&app, req).await);
+    }
     let method = req.method().clone();
-    // The operator's certificate serves sign-in and enrollment only; every
-    // other call goes where the trust bundle verifies the control plane.
+    // Besides the console, the operator's certificate serves sign-in and
+    // enrollment only; every other call goes where the trust bundle verifies
+    // the control plane.
     let pinned_only = !matches!(
         path.as_str(),
         "/.well-known/warren"
@@ -174,7 +178,7 @@ fn pkce_value_ok(v: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~'))
 }
 
-fn s256(verifier: &str) -> String {
+pub(crate) fn s256(verifier: &str) -> String {
     b64url(&sha256(verifier.as_bytes()))
 }
 
@@ -235,6 +239,8 @@ async fn authorize<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Api
                 client_challenge: challenge.into(),
                 nonce: nonce.clone(),
                 idp_verifier: verifier.clone(),
+                created_at: clock::now_secs(),
+                login,
             },
             clock::now_secs() + AUTH_REQUEST_LIFETIME,
         )
@@ -257,44 +263,49 @@ async fn authorize<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Api
     }
 }
 
-async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiError> {
-    let q = query(req)?;
-    let Some(pending) = app
-        .store
-        .take_auth_request(&secret_hash(param(&q, "state").unwrap_or("")))
-        .await?
-    else {
-        return Ok(page(
-            StatusCode::BAD_REQUEST,
-            "This sign-in link has expired",
-            "It was already used or is too old. Start sign-in again from the warren app.",
-        ));
-    };
-    let back = |pairs: &[(&str, &str)]| {
-        let mut all = pairs.to_vec();
-        all.push(("state", pending.client_state.as_str()));
-        Ok(redirect(&with_query(&pending.client_redirect_uri, &all)))
-    };
+/// How a sign-in at the IdP ended, once its callback arrived.
+pub(crate) enum IdpSignIn {
+    /// The IdP refused it or the user cancelled.
+    Refused,
+    /// The IdP's answer could not be verified.
+    Unverified,
+    /// The user is disabled in warren.
+    Disabled,
+    /// Signed in.
+    Done {
+        /// The user, as the IdP now describes them.
+        user: crate::store::User,
+        /// IdP authentication time, Unix seconds.
+        auth_time: i64,
+        /// When the IdP issued the ID token, Unix seconds.
+        issued_at: i64,
+        /// Whether the sign-in used MFA.
+        mfa: bool,
+    },
+}
+
+/// Finishes a sign-in at the IdP for `pending`: verifies the IdP's answer
+/// in the callback query `q`, records the user, and audits every refusal.
+/// The caller audits success, since what was signed in to differs.
+pub(crate) async fn finish_idp_sign_in(
+    app: &App,
+    q: &[(String, String)],
+    pending: &AuthRequest,
+) -> Result<IdpSignIn, ApiError> {
     let fail = |message: &str| {
         let mut r = audit::record(Activity::Logon, false, &Actor::Anonymous, message);
         r.insert("auth_protocol".into(), "OIDC".into());
         app.audit(r);
     };
-    if let Some(error) = param(&q, "error") {
+    if let Some(error) = param(q, "error") {
         fail(&format!("the IdP refused the sign-in: {error}"));
-        return back(&[
-            ("error", "access_denied"),
-            (
-                "error_description",
-                "Your identity provider did not complete the sign-in.",
-            ),
-        ]);
+        return Ok(IdpSignIn::Refused);
     }
     let callback = format!("{}/v1/auth/callback", app.config.public_url);
     let signin = match app
         .idp
         .exchange(
-            param(&q, "code").unwrap_or(""),
+            param(q, "code").unwrap_or(""),
             &pending.idp_verifier,
             &callback,
             &pending.nonce,
@@ -305,13 +316,7 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
         Err(e) => {
             crate::log::error("idp", &e.to_string());
             fail("the IdP's answer could not be verified");
-            return back(&[
-                ("error", "server_error"),
-                (
-                    "error_description",
-                    "warren could not verify the sign-in with your identity provider.",
-                ),
-            ]);
+            return Ok(IdpSignIn::Unverified);
         }
     };
     let auth_time = signin.auth_time.unwrap_or_else(|| {
@@ -334,27 +339,88 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
     if changed {
         app.request_publish();
     }
-    let actor = Actor::User {
-        id: user.id.clone(),
-        email: user.email.clone(),
-    };
     if user.disabled {
         let mut r = audit::record(
             Activity::Logon,
             false,
-            &actor,
+            &Actor::User {
+                id: user.id.clone(),
+                email: user.email.clone(),
+            },
             "sign-in refused: the user is disabled",
         );
         r.insert("auth_protocol".into(), "OIDC".into());
         app.audit(r);
-        return back(&[
-            ("error", "access_denied"),
-            (
-                "error_description",
-                "Your warren account is disabled. Contact your administrator.",
-            ),
-        ]);
+        return Ok(IdpSignIn::Disabled);
     }
+    Ok(IdpSignIn::Done {
+        user,
+        auth_time,
+        issued_at: signin.issued_at,
+        mfa: signin.mfa,
+    })
+}
+
+async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiError> {
+    let q = query(req)?;
+    let Some(pending) = app
+        .store
+        .take_auth_request(&secret_hash(param(&q, "state").unwrap_or("")))
+        .await?
+    else {
+        return Ok(page(
+            StatusCode::BAD_REQUEST,
+            "This sign-in link has expired",
+            "It was already used or is too old. Start sign-in again from the warren app.",
+        ));
+    };
+    if pending.client_redirect_uri == crate::console::REDIRECT {
+        return crate::console::finish_sign_in(app, req, &q, &pending).await;
+    }
+    let back = |pairs: &[(&str, &str)]| {
+        let mut all = pairs.to_vec();
+        all.push(("state", pending.client_state.as_str()));
+        Ok(redirect(&with_query(&pending.client_redirect_uri, &all)))
+    };
+    let (user, auth_time, mfa) = match finish_idp_sign_in(app, &q, &pending).await? {
+        IdpSignIn::Refused => {
+            return back(&[
+                ("error", "access_denied"),
+                (
+                    "error_description",
+                    "Your identity provider did not complete the sign-in.",
+                ),
+            ]);
+        }
+        IdpSignIn::Unverified => {
+            return back(&[
+                ("error", "server_error"),
+                (
+                    "error_description",
+                    "warren could not verify the sign-in with your identity provider.",
+                ),
+            ]);
+        }
+        IdpSignIn::Disabled => {
+            return back(&[
+                ("error", "access_denied"),
+                (
+                    "error_description",
+                    "Your warren account is disabled. Contact your administrator.",
+                ),
+            ]);
+        }
+        IdpSignIn::Done {
+            user,
+            auth_time,
+            mfa,
+            ..
+        } => (user, auth_time, mfa),
+    };
+    let actor = Actor::User {
+        id: user.id.clone(),
+        email: user.email.clone(),
+    };
     let code = new_secret()?;
     app.store
         .insert_auth_code(
@@ -364,14 +430,14 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
                 client_challenge: pending.client_challenge.clone(),
                 client_redirect_uri: pending.client_redirect_uri.clone(),
                 auth_time,
-                mfa: signin.mfa,
+                mfa,
             },
             clock::now_secs() + AUTH_CODE_LIFETIME,
         )
         .await?;
     let mut r = audit::record(Activity::Logon, true, &actor, "signed in at the IdP");
     r.insert("auth_protocol".into(), "OIDC".into());
-    r.insert("is_mfa".into(), signin.mfa.into());
+    r.insert("is_mfa".into(), mfa.into());
     r.insert(
         "user".into(),
         json!({ "uid": user.id, "email_addr": user.email, "groups": user.groups.iter().map(|g| json!({ "name": g })).collect::<Vec<_>>() }),
@@ -1108,6 +1174,7 @@ async fn node_audit(
         audit::accept_node_records(&body, &reporter, &node.role).map_err(ApiError::bad_request)?;
     for r in &records {
         app.audit.write(r);
+        app.recent.remember(r);
     }
     Ok(json(
         StatusCode::ACCEPTED,

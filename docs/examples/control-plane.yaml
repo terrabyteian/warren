@@ -83,3 +83,13 @@ audit:
 
 # Names no app may claim besides the control plane, the IdP and the relays.
 reservedNames: []
+
+# The web console at https://warren.example.com/console/ (see
+# docs/console.md). Everyone who signs in sees their own apps; the admin
+# pages are for the users and groups named here.
+console:
+  admins:
+    users: [ada@example.com]   # by email, IdP subject or warren user ID
+    groups: [warren-admins]    # by IdP group
+  sessionLifetime: 12h         # at most 24h
+  changeMaxAge: 1h             # changes need an IdP sign-in this recent

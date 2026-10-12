@@ -12,7 +12,8 @@ through outbound-only connectors and self-hosted relays.
 > [docs/benchmarks.md](docs/benchmarks.md)). The control plane runs too:
 > sign-in through any OpenID Connect IdP, device enrollment and approval,
 > short-lived user+device certificates, policy compiled to Cedar and
-> published as signed bundles, the revocation push channel, and audit. Until
+> published as signed bundles, the revocation push channel, and audit, with
+> a basic web console for admins and users ([docs/console.md](docs/console.md)). Until
 > relays and connectors consume the control plane's bundles, they read policy
 > from a static bundle file. The macOS client runs as a command-line tool:
 > `warren login` signs in through the browser with a Secure Enclave device

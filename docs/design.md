@@ -547,7 +547,7 @@ through it; clients re-establish sessions on another replica automatically.
 | `warren-relay` | Relay role | M1 |
 | `warren-connector` | Connector role | M1 |
 | `warren-control` | Control plane role | M1 |
-| `warren-console` | Web console (never in data-path builds) | M3 |
+| `warren-console` | Web console (never in data-path builds) | M1 (basic), M3 |
 | `warren-operator` | Kubernetes operator, its own binary (never in data-path builds) | M2 |
 | `warren-harness` | Test client, test PKI, stand-in apps and benchmarks; never shipped | M1 |
 

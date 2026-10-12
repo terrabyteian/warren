@@ -67,6 +67,8 @@ async fn run(
     tx: mpsc::Sender<Bytes>,
 ) -> Result<(), crate::Error> {
     let not_after = cert.not_after;
+    // The node counts as connected while this stream is open.
+    let _presence = app.presence.connect(&node.id);
     let mut changes = app.subscribe();
     let (latest, oldest) = app.store.event_bounds().await?;
     let mut last = match after {

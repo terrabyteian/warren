@@ -174,11 +174,17 @@ make it hard, visible and recoverable.
 
 - **Hard.** Minimal exposed surface; admin actions require an authenticated,
   recently MFA'd admin identity from the IdP; CA and signing keys are encrypted
-  at rest, with an offline root possible (G16, G18). Until the console brings
-  remote admin access (M3), the admin API listens only on a local Unix socket
-  on the control-plane host, mode 0600, which grants nothing an operator of
-  that host does not already hold. Policy from Git or CRDs is
-  reviewed outside warren before it applies (G19).
+  at rest, with an offline root possible (G16, G18). The admin API listens
+  only on a local Unix socket on the control-plane host, mode 0600, which
+  grants nothing an operator of that host does not already hold. The web
+  console is the only remote admin surface: its admin pages may be read by
+  the admins the configuration names, and it makes only device approval and
+  revocation and user disable and enable, each needing a sign-in the IdP
+  reported as MFA and an IdP authentication within the last hour by default
+  (for IdPs that do not report MFA, a step-up with warren's own TOTP once
+  built-in accounts land), behind form tokens, origin checks and a strict
+  content security policy ([console.md](console.md#security)). Policy from Git or CRDs is reviewed
+  outside warren before it applies (G19).
 - **Visible.** Every change and every decision is audited and can be streamed
   off-box as it happens to sinks the control plane cannot rewrite (G13).
 - **Limited.** The control plane never sees application traffic (G5), and the

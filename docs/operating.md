@@ -22,10 +22,11 @@ relays and connectors (link E). It has two certificates for them.
 With `tls` set, the control plane chooses by the name the peer asks for
 (TLS SNI): the names in `dnsNames` get its own certificate, and every other
 name, `publicUrl`'s host included, gets the operator's. The operator's
-certificate serves browser sign-in and enrollment only (discovery,
-`/v1/auth/*` and `/v1/devices`); every other call made at `publicUrl`'s host
-is refused with `421 misdirected_request`. So `tls` needs at least one name
-in `dnsNames` besides `publicUrl`'s host that reaches the control plane from
+certificate serves the web console ([console.md](console.md)), browser
+sign-in and enrollment only (discovery, `/v1/auth/*` and `/v1/devices`);
+every other call made at `publicUrl`'s host is refused with
+`421 misdirected_request`. So `tls` needs at least one name in `dnsNames`
+besides `publicUrl`'s host that reaches the control plane from
 everywhere clients and nodes run. The first such name in the list is the
 internal name: it is the `api_base` enrolled clients are given, the
 `control_plane` URL join tokens come with, and where `421` refusals send

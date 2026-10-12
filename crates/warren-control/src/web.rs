@@ -754,7 +754,6 @@ pub async fn serve_tls<H: Handler>(
     let mut connections = tokio::task::JoinSet::new();
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let sources = Sources::default();
-    let options = Arc::new(options);
     loop {
         let accepted = tokio::select! {
             a = listener.accept() => a,
@@ -769,26 +768,38 @@ pub async fn serve_tls<H: Handler>(
             drop(tcp);
             continue;
         };
+        let proxied = options
+            .trusted_proxies
+            .iter()
+            .any(|p| p.contains(addr.ip().to_canonical()));
+        let count = {
+            let sources = sources.clone();
+            let limit = options.max_per_source;
+            move |ip: IpAddr| match limit {
+                0 => Some(None),
+                limit => sources.acquire(ip, limit).map(Some),
+            }
+        };
+        // A direct connection is counted here, in the order connections
+        // arrive, so a source over its cap has its newest connection closed
+        // at once; a proxied one once its header names the source.
+        let mut counted = None;
+        if !proxied {
+            let Some(c) = count(addr.ip()) else {
+                drop(tcp);
+                continue;
+            };
+            counted = c;
+        }
         let acceptor = acceptor.clone();
         let handler = handler.clone();
-        let sources = sources.clone();
-        let options = options.clone();
         connections.spawn(async move {
             let _slot = slot;
             let authenticate = async {
-                let proxied = options
-                    .trusted_proxies
-                    .iter()
-                    .any(|p| p.contains(addr.ip().to_canonical()));
-                let count = |ip: IpAddr| match options.max_per_source {
-                    0 => Some(None),
-                    limit => sources.acquire(ip, limit).map(Some),
-                };
                 let (source, counted) = if proxied {
                     let source = read_proxy_header(&mut tcp, addr).await?;
                     (source, count(source.ip())?)
                 } else {
-                    let counted = count(addr.ip())?;
                     let mut first = [0u8; 12];
                     if tcp.peek(&mut first).await.ok()? == first.len() && first == PROXY_SIGNATURE {
                         crate::log::warn_with(

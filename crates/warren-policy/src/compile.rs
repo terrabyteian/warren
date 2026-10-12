@@ -1283,7 +1283,9 @@ fn who_matches(who: &Who, user: &UserEntity) -> bool {
         })
 }
 
-fn what_matches(what: &crate::model::What, app: &App) -> bool {
+/// Whether a rule's `what` names `app`, by name or by its labels: the
+/// matching [`Compiled::entitlements`] uses.
+pub fn what_matches(what: &crate::model::What, app: &App) -> bool {
     what.apps.contains(&app.meta.name)
         || (!what.match_labels.is_empty() && labels_match(&what.match_labels, &app.meta.labels))
 }
