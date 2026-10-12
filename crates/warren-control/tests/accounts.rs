@@ -154,6 +154,7 @@ impl Deployment {
             base: self.base.clone(),
             http: Client::new(Client::roots_from_pem(&roots).unwrap(), None).unwrap(),
             cookie: None,
+            referrer_policy: None,
         }
     }
 
@@ -219,11 +220,13 @@ impl Deployment {
 }
 
 /// A scripted browser that keeps the sign-in cookie and posts forms the
-/// way a browser does, from the control plane's own origin.
+/// way a browser does: with the Origin the last page's Referrer-Policy
+/// allows (`null` under `no-referrer`, per the Fetch spec).
 struct Browser {
     base: String,
     http: Client,
     cookie: Option<String>,
+    referrer_policy: Option<String>,
 }
 
 impl Browser {
@@ -239,6 +242,9 @@ impl Browser {
         if let Some(v) = reply.headers.get("set-cookie") {
             let pair = v.to_str().unwrap().split(';').next().unwrap().to_owned();
             self.cookie = Some(pair);
+        }
+        if let Some(v) = reply.headers.get("referrer-policy") {
+            self.referrer_policy = Some(v.to_str().unwrap().to_owned());
         }
     }
 
@@ -260,7 +266,11 @@ impl Browser {
     }
 
     async fn post(&mut self, path: &str, fields: &[(&str, &str)]) -> Reply {
-        self.post_from(path, fields, &self.base.clone()).await
+        let origin = match self.referrer_policy.as_deref() {
+            Some("no-referrer") => "null".to_owned(),
+            _ => self.base.clone(),
+        };
+        self.post_from(path, fields, &origin).await
     }
 
     async fn post_from(&mut self, path: &str, fields: &[(&str, &str)], origin: &str) -> Reply {

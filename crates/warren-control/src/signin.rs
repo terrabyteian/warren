@@ -116,7 +116,7 @@ fn html(
         headers.insert("content-security-policy", v);
     }
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
     if let Some(value) = cookie
         && let Ok(v) = HeaderValue::from_str(&format!(
             "{COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=600"
