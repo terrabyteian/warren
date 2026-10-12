@@ -835,7 +835,7 @@ defaults are initial and may change with measurement.
 | `SESSION_MAX_LIFETIME` | deployment setting | Maximum time between browser sign-ins |
 | `PASSWORD_KDF` | PBKDF2-HMAC-SHA256, 600,000 iterations, 16-byte salt | Built-in account password hashes; each records its iteration count and is rehashed at sign-in when it falls behind |
 | `ACCOUNT_LOCKOUT` | 5 failures in a row, 15 min | Lockout of a built-in account after failed passwords or codes |
-| `SOURCE_FAILURE_LIMIT` | 20 failures per 15 min | Failed built-in account sign-ins per source address |
+| `SOURCE_FAILURE_LIMIT` | 20 failures per 15 min by default (`localAccounts.maxFailuresPerSource`; 0 turns it off) | Failed built-in account sign-ins per source address |
 | `SETUP_LINK_LIFETIME` | 72 h, single use | One-time link that sets a built-in account's password |
 | `RECOVERY_CODES` | 10, 50 bits each, single use | Issued when an authenticator is enrolled |
 | `TUNNEL_MTU` | 1280 | Initial tunnel MTU |

@@ -105,10 +105,19 @@ NAT, or a load balancer that hides client addresses. Raise
 `connections.maxPerSource` for a large office behind one address, or set it
 to 0 to turn the limit off.
 
+Built-in account sign-ins have a limit of their own per source:
+`localAccounts.maxFailuresPerSource` failed passwords and codes per 15
+minutes, 20 by default, after which the source is refused until the window
+ends; each account's own lockout applies regardless. Raise it for a large
+office behind one address, or set it to 0 where every client shares one, so
+a few mistyped passwords do not lock everyone out.
+
 ```yaml
 connections:
   maxPerSource: 64           # 0: no limit
   trustedProxies: [192.0.2.10, 192.0.2.11]   # the load balancer's own addresses
+localAccounts:
+  maxFailuresPerSource: 20   # 0: no per-source limit
 ```
 
 ### Behind a load balancer
@@ -144,8 +153,8 @@ client's can be the balancer's own.
 - **It sees some other address**, such as a node's, because something
   between the balancer and the control plane rewrites the source. Neither
   of the above holds: do not turn PROXY protocol on. Without it the
-  per-source limit would see every peer as that address, so set
-  `connections.maxPerSource` to 0.
+  per-source limits would see every peer as that address, so set
+  `connections.maxPerSource` and `localAccounts.maxFailuresPerSource` to 0.
 
 Never turn PROXY protocol on at a balancer whose connections arrive from
 client or node addresses, and never list node, pod or office ranges in
@@ -201,27 +210,9 @@ install -m 0600 -o warren /dev/null /etc/warren/admin-password
 openssl rand -base64 24 > /etc/warren/admin-password   # or a passphrase you choose
 ```
 
-**On Kubernetes,** keep the password in a Secret and mount it as a file:
-
-```sh
-kubectl -n warren create secret generic warren-admin-password \
-  --from-literal=password="$(openssl rand -base64 24)"
-```
-
-```yaml
-# In the control plane's pod spec:
-volumes:
-  - name: admin-password
-    secret: { secretName: warren-admin-password, defaultMode: 0400 }
-containers:
-  - name: control-plane
-    volumeMounts:
-      - { name: admin-password, mountPath: /etc/warren/admin-password, subPath: password, readOnly: true }
-```
-
-Read it back once with `kubectl -n warren get secret warren-admin-password -o
-jsonpath='{.data.password}' | base64 -d`, and delete the Secret after the first
-sign-in.
+**On Kubernetes,** keep the password in a Secret and name it in the chart's
+`controlPlane.bootstrapAdmin.existingSecret`, which mounts it and sets
+`localAccounts.bootstrapAdmin` ([kubernetes.md](kubernetes.md#the-first-admin)).
 
 ### Managing built-in accounts
 

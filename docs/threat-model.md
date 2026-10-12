@@ -409,7 +409,8 @@ extend access past the other's view (G4, G9).
 - **Guessing and stuffing.** A password alone never signs in (G20), so a
   guessed or leaked password is not enough. Five failures in a row (passwords
   or codes) lock the account for 15 minutes, failures from one source address
-  are limited across all accounts, and both count each attempt before checking
+  are limited across all accounts (20 per 15 minutes by default; an operator
+  whose users share one address can raise it or turn it off), and both count each attempt before checking
   it, so concurrent attempts cannot exceed either bound. Usernames that are not
   accounts are counted and locked the same way, and an unknown username, a
   locked account and a wrong password get the same answer after the same work,

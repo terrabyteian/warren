@@ -59,7 +59,8 @@ pub const MAX_FAILED_ATTEMPTS: i64 = 5;
 /// How long a locked account stays locked, seconds.
 pub const LOCKOUT_SECONDS: i64 = 15 * 60;
 /// Failed sign-ins one source address may make per window, across every
-/// account, before it is refused for the rest of the window.
+/// account, before it is refused for the rest of the window: the default
+/// for `localAccounts.maxFailuresPerSource`.
 pub const SOURCE_FAILURE_LIMIT: u32 = 20;
 /// The window for [`SOURCE_FAILURE_LIMIT`], seconds.
 pub const SOURCE_WINDOW_SECONDS: i64 = 15 * 60;
@@ -332,8 +333,8 @@ pub fn recovery_code_hash(normalized: &str) -> String {
 /// passwords across many accounts. IPv6 sources count per /64, since one
 /// host can hold a whole /64. Kept in memory: a restart forgets it, and
 /// each account's own lockout still holds.
-#[derive(Default)]
 pub struct SourceLimiter {
+    limit: u32,
     failures: Mutex<HashMap<IpAddr, (i64, u32)>>,
 }
 
@@ -352,12 +353,24 @@ fn source_key(ip: IpAddr) -> IpAddr {
 }
 
 impl SourceLimiter {
+    /// A limiter allowing `limit` failures per source per window; 0 turns
+    /// the limit off.
+    pub fn new(limit: u32) -> SourceLimiter {
+        SourceLimiter {
+            limit,
+            failures: Mutex::default(),
+        }
+    }
+
     /// Counts a sign-in attempt from `source` at `now` before it is
     /// checked, refusing it (false) once the window's limit is reached, so
     /// concurrent attempts cannot outrun the limit. Sources without an
-    /// address (the local socket) are not limited.
+    /// address (the local socket) are not limited, nor is any source when
+    /// the limit is off.
     pub fn attempt(&self, source: Option<IpAddr>, now: i64) -> bool {
-        let Some(ip) = source else { return true };
+        let Some(ip) = source.filter(|_| self.limit > 0) else {
+            return true;
+        };
         let Ok(mut map) = self.failures.lock() else {
             return false;
         };
@@ -368,7 +381,7 @@ impl SourceLimiter {
         if now - entry.0 >= SOURCE_WINDOW_SECONDS {
             *entry = (now, 0);
         }
-        if entry.1 >= SOURCE_FAILURE_LIMIT {
+        if entry.1 >= self.limit {
             return false;
         }
         entry.1 += 1;
@@ -551,7 +564,7 @@ mod tests {
 
     #[test]
     fn sources_are_limited_per_window() {
-        let limiter = SourceLimiter::default();
+        let limiter = SourceLimiter::new(SOURCE_FAILURE_LIMIT);
         let a: IpAddr = "203.0.113.7".parse().unwrap();
         let b: IpAddr = "2001:db8:1:2:3:4:5:6".parse().unwrap();
         let b_neighbor: IpAddr = "2001:db8:1:2:ffff::1".parse().unwrap();
@@ -571,6 +584,16 @@ mod tests {
         assert!(limiter.attempt(Some(a), 1_000 + SOURCE_WINDOW_SECONDS));
         assert!(limiter.attempt(Some(a), 1_001 + SOURCE_WINDOW_SECONDS));
         assert!(limiter.attempt(None, 0));
+
+        let limiter = SourceLimiter::new(2);
+        assert!(limiter.attempt(Some(a), 1_000));
+        assert!(limiter.attempt(Some(a), 1_000));
+        assert!(!limiter.attempt(Some(a), 1_000));
+        // Off.
+        let limiter = SourceLimiter::new(0);
+        for _ in 0..1_000 {
+            assert!(limiter.attempt(Some(a), 1_000));
+        }
     }
 
     #[test]

@@ -969,6 +969,27 @@ async fn attempt(d: &Deployment, username: &str, password: &str) -> (StatusCode,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_source_limit_is_configured() {
+    for (limit, refused_after) in [(3, Some(3)), (0, None)] {
+        let d = Deployment::start(TempDir::new("source-limit"), "", None, |c| {
+            c.local_accounts.max_failures_per_source = limit;
+        })
+        .await;
+        let mut first_refused = None;
+        for i in 0..25 {
+            let (status, _) = attempt(&d, &format!("nobody-{i}"), "wrong password!").await;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                first_refused = Some(i);
+                break;
+            }
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(first_refused, refused_after, "limit {limit}");
+        d.cp.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_and_locked_usernames_look_the_same() {
     let d = Deployment::local(None).await;
     d.create("ada", &[]).await;

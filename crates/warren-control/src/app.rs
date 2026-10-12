@@ -166,12 +166,12 @@ impl App {
         latest_seq: u64,
     ) -> App {
         App {
+            limiter: SourceLimiter::new(config.local_accounts.max_failures_per_source),
             config,
             store,
             authority,
             idp,
             kek,
-            limiter: SourceLimiter::default(),
             unknown_names: UnknownNames::default(),
             kdf: Semaphore::new(4),
             audit,

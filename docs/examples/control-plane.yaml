@@ -65,6 +65,7 @@ localAccounts:
     username: admin
     passwordFile: /etc/warren/admin-password
     groups: [admins]          # local:admins in policy
+  maxFailuresPerSource: 20    # failed sign-ins per source per 15 minutes; 0: no limit
 
 # An identity provider, optional when built-in accounts are on. Any OpenID
 # Connect provider; register warren with the redirect URI

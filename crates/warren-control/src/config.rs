@@ -120,6 +120,9 @@ pub struct LocalAccounts {
     pub enabled: bool,
     /// The first admin, if one is to be created.
     pub bootstrap_admin: Option<BootstrapAdmin>,
+    /// Failed sign-ins one source address may make per 15 minutes before
+    /// it is refused for the rest of them; 0 turns the limit off.
+    pub max_failures_per_source: u32,
 }
 
 /// A certificate the operator supplies for the public host, from WebPKI or
@@ -488,6 +491,7 @@ impl Config {
         let mut local_accounts = LocalAccounts {
             enabled: true,
             bootstrap_admin: None,
+            max_failures_per_source: crate::accounts::SOURCE_FAILURE_LIMIT,
         };
         if let Some(n) = get(&f, "localAccounts") {
             parse_local_accounts(&mut r, n, &mut local_accounts);
@@ -918,7 +922,24 @@ fn parse_idp(r: &mut Reader, node: &Node) -> Option<Idp> {
 }
 
 fn parse_local_accounts(r: &mut Reader, node: &Node, out: &mut LocalAccounts) {
-    let f = r.map(node, "localAccounts", &["enabled", "bootstrapAdmin"]);
+    let f = r.map(
+        node,
+        "localAccounts",
+        &["enabled", "bootstrapAdmin", "maxFailuresPerSource"],
+    );
+    if let Some(n) = get(&f, "maxFailuresPerSource") {
+        match r
+            .string(n, "localAccounts.maxFailuresPerSource")
+            .map(|t| t.parse::<u32>())
+        {
+            Some(Ok(limit)) => out.max_failures_per_source = limit,
+            Some(Err(_)) => r.err(
+                n,
+                "localAccounts.maxFailuresPerSource must be a whole number; 0 means no limit",
+            ),
+            None => {}
+        }
+    }
     if let Some(n) = get(&f, "enabled") {
         match r.string(n, "localAccounts.enabled").as_deref() {
             Some("true") => out.enabled = true,
@@ -1233,7 +1254,20 @@ mod tests {
         let c = Config::parse(base).unwrap();
         assert!(c.idp.is_none());
         assert!(c.local_accounts.enabled);
+        assert_eq!(c.local_accounts.max_failures_per_source, 20);
         assert_eq!(c.reserved(), ["warren.example.com"]);
+        for (value, limit) in [("0", 0), ("200", 200)] {
+            let c = Config::parse(&format!(
+                "{base}localAccounts:\n  maxFailuresPerSource: {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(c.local_accounts.max_failures_per_source, limit);
+        }
+        let e = Config::parse(&format!(
+            "{base}localAccounts:\n  maxFailuresPerSource: -1\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("maxFailuresPerSource"), "{e}");
         let e = Config::parse(&format!("{base}localAccounts:\n  enabled: false\n")).unwrap_err();
         assert!(e.contains("nobody could sign in"), "{e}");
 

@@ -47,10 +47,11 @@ controlPlane:
   # from everywhere they run (docs/operating.md).
   dnsNames: []
 
-  # Required by this release: the OpenID Connect identity provider, as the
-  # idp section of the configuration (issuer, clientId, scopes, groupsClaim,
-  # mfaAmrValues, ...). Register https://<publicUrl host>/v1/auth/callback as
-  # its redirect URI. clientSecretFile is set by idpClientSecret below.
+  # Optional: an identity provider, as the idp section of the configuration
+  # (type, issuer, clientId, scopes, groupsClaim, mfaAmrValues, ...).
+  # Register https://<publicUrl host>/v1/auth/callback as its redirect URI.
+  # clientSecretFile is set by idpClientSecret below. Built-in accounts sign
+  # in with or without one.
   idp: {}
   #   issuer: https://accounts.google.com
   #   clientId: 1234-abcd.apps.googleusercontent.com
@@ -61,6 +62,17 @@ controlPlane:
   idpClientSecret:
     existingSecret: ""
     key: client-secret
+
+  # The first admin, a built-in account created on the first start that
+  # finds none: an existing Secret whose key holds its password (at least 12
+  # characters), mounted read-only at /etc/warren/admin/<key>. The admin
+  # enrolls an authenticator app at the first sign-in; delete the Secret
+  # after it. Empty: no first admin is created.
+  bootstrapAdmin:
+    existingSecret: ""
+    key: password
+    username: admin
+    groups: [admins]
 
   # An existing kubernetes.io/tls Secret (tls.crt, tls.key) for the
   # organization URL, from a public CA, the organization's own CA or a
