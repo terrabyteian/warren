@@ -25,7 +25,7 @@ The console needs nothing beyond a running control plane, plus:
 ```yaml
 console:
   admins:
-    users: [ada@example.com]      # by email (any case), IdP subject, "local:<username>" for a built-in account, or warren user ID
+    users: [ada@example.com]      # by IdP email (any case), IdP subject, "local:<username>" for a built-in account, or warren user ID
     groups: [warren-admins, "local:admins"]  # by IdP group, or local:<group> for warren's own groups
   sessionLifetime: 12h            # default 12h, at most 24h
   changeMaxAge: 1h                # default 1h: how recent a sign-in changes need
@@ -34,7 +34,10 @@ console:
 A built-in account is `local:<username>` in `console.admins.users`, as in
 policy: a plain entry never matches a built-in account's username, and
 `local:` never matches an IdP subject, so an IdP user named like a built-in
-account (or the reverse) is not an admin by that entry.
+account (or the reverse) is not an admin by that entry. Emails name IdP
+users only: a built-in account with an admin's email is not an admin by
+it, and is one only through `local:<username>`, a `local:<group>` in
+`groups`, or its warren user ID.
 
 Open `https://<publicUrl>/` in a browser and sign in.
 
@@ -103,8 +106,7 @@ lockout after five failures in a row (which also stops the account's
 sign-ins), and `localAccounts.maxFailuresPerSource`.
 
 **Trust.** The binding is the built-in account's email, which an admin set
-and warren does not verify, the same trust `console.admins.users` already
-places in email addresses. Whoever can set a built-in account's email
+and warren does not verify. Whoever can set a built-in account's email
 (through the admin socket, or the policy directory) can choose whose IdP
 sign-ins its authenticator steps up, so treat those as admin powers
 ([threat model T5](threat-model.md#t5-control-plane-compromise)).

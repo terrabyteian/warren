@@ -799,6 +799,35 @@ async fn admin_names_tell_built_in_accounts_from_idp_subjects() {
 }
 
 #[tokio::test]
+async fn admin_emails_name_idp_users_only() {
+    // The bootstrap admin, in no admin group, has the email an admin entry
+    // names, as a step-up account does: it is still no admin, while the IdP
+    // user with that email is one.
+    let d = Deployment::start_with_admins(
+        true,
+        "[Grace@Example.com]",
+        "localAccounts:\n  bootstrapAdmin:\n    passwordFile: {dir}/admin-password\n    email: grace@example.com\n    groups: [ops]\n",
+    )
+    .await;
+    let mut own = d.browser();
+    own.local_sign_in("/console/login", "admin", None).await;
+    assert_eq!(
+        own.get("/console/users").await.status,
+        StatusCode::FORBIDDEN
+    );
+    let mut idp = d
+        .signed_in(IdpUser {
+            sub: "00u-grace".into(),
+            email: "grace@example.com".into(),
+            groups: vec![],
+            amr: vec!["mfa".into()],
+        })
+        .await;
+    assert_eq!(idp.get("/console/users").await.status, StatusCode::OK);
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
 async fn users_see_only_their_own_apps() {
     let d = Deployment::start().await;
     let mut b = d.signed_in(plain_user()).await;

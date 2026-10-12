@@ -229,7 +229,8 @@ fn display_name(u: &User) -> String {
 }
 
 /// Whether `user` is named by `console.admins`. A built-in account's
-/// subject is `local:<username>`, as in policy, so no IdP subject matches it.
+/// subject is `local:<username>`, as in policy, so no IdP subject matches
+/// it, and emails name IdP users only.
 pub fn is_admin(app: &App, user: &User) -> bool {
     let c = &app.config.console;
     let subject = App::user_entity(user).subject;
@@ -237,7 +238,9 @@ pub fn is_admin(app: &App, user: &User) -> bool {
         || c.admin_users.iter().any(|u| {
             *u == user.id
                 || *u == subject
-                || (!user.email.is_empty() && u.eq_ignore_ascii_case(&user.email))
+                || (!user.is_local()
+                    && !user.email.is_empty()
+                    && u.eq_ignore_ascii_case(&user.email))
         })
 }
 

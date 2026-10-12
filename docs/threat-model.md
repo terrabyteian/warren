@@ -193,9 +193,9 @@ make it hard, visible and recoverable.
   one enabled built-in account whose email is the IdP's verified email,
   under the same lockout, per-source limit and one-use-per-step rules; it
   allows changes for the same hour. That binding is an email an admin set
-  on the built-in account and warren does not verify, as trusted as the
-  emails `console.admins` names: whoever can set it (the admin socket, or
-  Git) can pick whose IdP sign-ins the account's authenticator steps up, so
+  on the built-in account and warren does not verify, and that makes the
+  account no console admin (`console.admins` emails name IdP users only):
+  whoever can set it (the admin socket, or Git) can pick whose IdP sign-ins the account's authenticator steps up, so
   a step-up needs both that IdP sign-in and that authenticator, and nothing
   more proves they belong to one person. Every console form, the sign-in and
   step-up forms included,
