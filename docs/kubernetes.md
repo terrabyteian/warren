@@ -30,9 +30,9 @@ linux/arm64. The chart's default image tag is its own version.
   `iproute2` and `nftables`, because kernel-mode forwarding runs `ip` and
   `nft` to set up its TUN device, routes and NAT table.
 
-All three are built from the [Dockerfile](../Dockerfile) with pinned base images,
-from vendored sources without network access, and the binaries are compiled
-natively or cross-compiled, never under emulation. The release workflow
+All three are built from the [Dockerfile](../Dockerfile) with pinned base
+images, from vendored sources without network access, and the binaries are
+compiled natively or cross-compiled, never under emulation. The release workflow
 signs each image with cosign and publishes two SBOMs for it: one of the
 image's packages, attached by the build with a provenance attestation, and
 an SPDX SBOM of the crates its binary is built from, attested with cosign.
@@ -211,8 +211,8 @@ kubectl -n warren exec warren-control-plane-0 -- warren admin devices approve <d
 ```
 
 Policy files come from `controlPlane.policy`, mounted at
-`/etc/warren/policy`. After a `helm upgrade` that changes them, Kubernetes updates the mounted files
-within a minute or so; then load them:
+`/etc/warren/policy`. After a `helm upgrade` that changes them, Kubernetes
+updates the mounted files within a minute or so; then load them:
 
 ```sh
 kubectl -n warren exec warren-control-plane-0 -- warren admin policy reload
@@ -373,8 +373,9 @@ value. The ones most installs set:
 [scripts/test-chart.sh](../scripts/test-chart.sh) lints the chart, parses
 renders of chosen values and checks each object's fields, and checks
 refusals of incomplete values, on every pull request. CI checks that the
-relay and connector images offer no control-plane role. [scripts/e2e-kind.sh](../scripts/e2e-kind.sh) installs the images
-CI just built on a kind cluster: the control plane, join tokens created with
+relay and connector images offer no control-plane role.
+[scripts/e2e-kind.sh](../scripts/e2e-kind.sh) installs the images CI just
+built on a kind cluster: the control plane, join tokens created with
 `warren admin`, then the relay and a kernel-mode connector, checking that
 both join, that the connector creates its TUN device and NAT table and
 attaches to the relay, and that a restarted connector comes back on the
