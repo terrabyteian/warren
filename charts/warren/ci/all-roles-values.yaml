@@ -10,7 +10,6 @@ controlPlane:
   idpClientSecret: { existingSecret: warren-idp }
   tls: { existingSecret: warren-tls }
   keyEncryptionKey: { existingSecret: warren-kek }
-  bootstrapAdmin: { existingSecret: warren-admin }
   service: { type: LoadBalancer }
 nodes:
   bundle:

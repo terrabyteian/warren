@@ -2,8 +2,8 @@
 # docs/operating.md and docs/examples/control-plane.yaml describe every
 # control-plane setting.
 
-# The image for the control plane and the relay: the warren binary on a
-# distroless base.
+# The image for the control plane: the full warren binary on a distroless
+# base.
 image:
   repository: ghcr.io/terrabyteian/warren
   # Defaults to the chart's appVersion. A digest (sha256:...) pins it exactly.
@@ -11,8 +11,16 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 
-# The image for the connector: the same binary with iproute2 and nftables,
-# which kernel-mode forwarding needs.
+# The image for the relay: the data-path build (relay and connector only),
+# which carries no control-plane or console code, on a distroless base.
+relayImage:
+  repository: ghcr.io/terrabyteian/warren-relay
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# The image for the connector: the data-path build with iproute2 and
+# nftables, which kernel-mode forwarding needs.
 connectorImage:
   repository: ghcr.io/terrabyteian/warren-connector
   tag: ""
@@ -60,12 +68,6 @@ controlPlane:
   # seconds when it changes. Empty: the organization URL presents the
   # control plane's own certificate, which browsers do not trust.
   tls:
-    existingSecret: ""
-
-  # An existing Secret holding the first admin, created at install, mounted
-  # read-only at /etc/warren/bootstrap-admin. Point the control plane's
-  # first-admin setting at it through config below.
-  bootstrapAdmin:
     existingSecret: ""
 
   # The key-encryption key that seals the CA and signing keys in the

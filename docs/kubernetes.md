@@ -8,29 +8,34 @@ publishing apps by annotating a Service come with milestone M2
 
 | What | Where |
 | --- | --- |
-| Control plane and relay image | `ghcr.io/terrabyteian/warren:X.Y.Z` |
+| Control plane image | `ghcr.io/terrabyteian/warren:X.Y.Z` |
+| Relay image | `ghcr.io/terrabyteian/warren-relay:X.Y.Z` |
 | Kernel-mode connector image | `ghcr.io/terrabyteian/warren-connector:X.Y.Z` |
 | Helm chart | `oci://ghcr.io/terrabyteian/charts/warren`, version `X.Y.Z` |
 
-Each release tag `vX.Y.Z` publishes all three, for linux/amd64 and
+Each release tag `vX.Y.Z` publishes all four, for linux/amd64 and
 linux/arm64. The chart's default image tag is its own version.
 
 ## Images
 
-- **`warren`** is the `warren` binary (control plane, relay and connector
-  roles, plus `warren admin`) on a distroless base: CA certificates and the C
-  runtime, no shell, running as the nonroot user (UID 65532). The control
-  plane and the relay run it.
-- **`warren-connector`** is the same binary on Debian slim with `iproute2`
-  and `nftables`, because kernel-mode forwarding runs `ip` and `nft` to set
-  up its TUN device, routes and NAT table.
+- **`warren`** is the full `warren` binary (control plane, relay and
+  connector roles, plus `warren admin`) on a distroless base: CA
+  certificates and the C runtime, no shell, running as the nonroot user
+  (UID 65532). The control plane runs it.
+- **`warren-relay`** is the data-path build of the binary (the relay and
+  connector roles only, `--no-default-features --features relay,connector`)
+  on the same distroless base. It links no control-plane, console or
+  Kubernetes crates ([dependencies.md](dependencies.md)). The relay runs it.
+- **`warren-connector`** is the same data-path build on Debian slim with
+  `iproute2` and `nftables`, because kernel-mode forwarding runs `ip` and
+  `nft` to set up its TUN device, routes and NAT table.
 
-Both are built from the [Dockerfile](../Dockerfile) with pinned base images,
-from vendored sources without network access, and the binary is compiled
+All three are built from the [Dockerfile](../Dockerfile) with pinned base images,
+from vendored sources without network access, and the binaries are compiled
 natively or cross-compiled, never under emulation. The release workflow
 signs each image with cosign and publishes two SBOMs for it: one of the
 image's packages, attached by the build with a provenance attestation, and
-an SPDX SBOM of the crates in `Cargo.lock` that the binary is built from,
+an SPDX SBOM of the crates in `Cargo.lock` that the binaries are built from,
 attested with cosign. To check the signature and read both:
 
 ```sh
@@ -48,6 +53,7 @@ ghcr.io/terrabyteian/charts/warren:X.Y.Z ...`). To build the images yourself:
 
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64 -t warren .
+docker buildx build --target warren-relay -t warren-relay .
 docker buildx build --target warren-connector -t warren-connector .
 ```
 
@@ -146,13 +152,13 @@ terminates TLS (no Ingress that decrypts), since relays, connectors and
 enrolled clients authenticate with certificates. Behind a load balancer that
 hides client addresses, read [Behind a load balancer](operating.md#behind-a-load-balancer).
 
-## 2. Reach the console and sign in
+## 2. Reach the control plane and sign in
 
-The control plane serves the web console and browser sign-in at the
-organization URL, for example `https://warren.home.example`. Open it in a
-browser once its DNS name resolves to the control plane Service's address.
-Without `controlPlane.tls`, the browser warns that it does not trust the
-certificate (it comes from the deployment's own CA).
+The organization URL, for example `https://warren.home.example`, is where
+clients sign in and enroll, once its DNS name resolves to the control plane
+Service's address. Without `controlPlane.tls`, it presents a certificate
+from the deployment's own CA, which clients pin by its root fingerprint
+(`warren admin deployment` prints it).
 
 Without a load balancer address, forward the Service to your workstation on
 port 443, so the URL and the IdP's redirect URI stay the same, and resolve
@@ -163,7 +169,15 @@ echo "127.0.0.1 warren.home.example" | sudo tee -a /etc/hosts
 sudo kubectl -n warren port-forward svc/warren-control-plane 443:443
 ```
 
-Sign in through the identity provider. Administer the deployment with
+Sign in from a Mac with the warren client ([macos.md](macos.md#sign-in)),
+which opens the identity provider in the browser and enrolls the Mac;
+without `controlPlane.tls`, add `--fingerprint` with the root fingerprint:
+
+```sh
+warren login https://warren.home.example
+```
+
+This release has no web console yet. Administer the deployment with
 `warren admin` inside the control plane's pod, which talks to its local admin
 socket:
 
@@ -186,12 +200,6 @@ Other configuration changes (`controlPlane.config` and the settings above it)
 restart the control plane. Every setting is described in
 [examples/control-plane.yaml](examples/control-plane.yaml); the chart sets
 `listen`, `dataDir`, `policyDir`, `tls` and `keyEncryptionKeyFile` itself.
-
-**The first admin.** Control planes with built-in accounts create the first
-admin at install from a mounted Secret: name it in
-`controlPlane.bootstrapAdmin.existingSecret`, which the chart mounts read-only
-at `/etc/warren/bootstrap-admin`, and point the control plane's first-admin
-setting at it through `controlPlane.config`.
 
 ## 3. Add a relay
 
@@ -301,7 +309,6 @@ value. The ones most installs set:
 | `controlPlane.idpClientSecret.existingSecret` | `""` | Secret with the IdP client secret (key `client-secret`). |
 | `controlPlane.tls.existingSecret` | `""` | `kubernetes.io/tls` Secret for the organization URL. |
 | `controlPlane.keyEncryptionKey.existingSecret` | `""` | Secret with the key-encryption key (key `kek`); empty keeps it on the data volume. |
-| `controlPlane.bootstrapAdmin.existingSecret` | `""` | Secret mounted at `/etc/warren/bootstrap-admin` for the first admin. |
 | `controlPlane.config` | `{}` | More configuration merged into the control plane's file. |
 | `controlPlane.policy` / `policyConfigMap` | `{}` / `""` | Policy files by name, or an existing ConfigMap of them. |
 | `controlPlane.persistence.size` | `1Gi` | The database volume. |
@@ -316,7 +323,7 @@ value. The ones most installs set:
 | `connector.joinToken.existingSecret` | `""` | Secret with the connector's join token (key `token`). |
 | `connector.nat` | `masquerade` | `none` leaves NAT to you. |
 | `connector.forwardingInit` | `true` | The privileged init container that turns on IP forwarding. |
-| `image.tag`, `connectorImage.tag` | the chart version | Or `image.digest` and `connectorImage.digest` to pin by digest. |
+| `image.tag`, `relayImage.tag`, `connectorImage.tag` | the chart version | The control plane's, relay's and connector's images; or `*.digest` to pin by digest. |
 
 ## Upgrades, backups and removal
 
@@ -341,9 +348,10 @@ value. The ones most installs set:
 
 ## How it is tested
 
-[scripts/test-chart.sh](../scripts/test-chart.sh) lints the chart and checks
-renders of chosen values, and refusals of incomplete ones, on every pull
-request. [scripts/e2e-kind.sh](../scripts/e2e-kind.sh) installs the images
+[scripts/test-chart.sh](../scripts/test-chart.sh) lints the chart, parses
+renders of chosen values and checks each object's fields, and checks
+refusals of incomplete values, on every pull request. CI checks that the
+relay and connector images offer no control-plane role. [scripts/e2e-kind.sh](../scripts/e2e-kind.sh) installs the images
 CI just built on a kind cluster: the control plane, join tokens created with
 `warren admin`, then the relay and a kernel-mode connector, checking that
 both join, that the connector creates its TUN device and NAT table and

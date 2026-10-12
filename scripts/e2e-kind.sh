@@ -7,20 +7,21 @@
 # back on the credentials it kept instead of its spent token.
 #
 # Needs docker, kind, kubectl, helm and jq. The images must exist locally
-# (`docker build` of the Dockerfile's two targets).
-# Usage: scripts/e2e-kind.sh IMAGE CONNECTOR_IMAGE
+# (`docker build` of the Dockerfile's three targets).
+# Usage: scripts/e2e-kind.sh IMAGE RELAY_IMAGE CONNECTOR_IMAGE
 #   KIND_CLUSTER=name   the cluster to create (default warren-e2e)
 #   KEEP_CLUSTER=1      leave the cluster running afterwards
 set -euo pipefail
 
-if [ $# -ne 2 ]; then
-  echo "usage: $0 IMAGE CONNECTOR_IMAGE" >&2
+if [ $# -ne 3 ]; then
+  echo "usage: $0 IMAGE RELAY_IMAGE CONNECTOR_IMAGE" >&2
   exit 2
 fi
 cd "$(dirname "$0")/.."
 
 image=$1
-connector_image=$2
+relay_image=$2
+connector_image=$3
 cluster=${KIND_CLUSTER:-warren-e2e}
 ns=warren
 release=e2e
@@ -74,7 +75,7 @@ metric() {
 attached() { [ "$(metric relay warren_relay_attachments)" -ge 1 ]; }
 
 kind create cluster --name "$cluster" --wait 120s
-kind load docker-image --name "$cluster" "$image" "$connector_image"
+kind load docker-image --name "$cluster" "$image" "$relay_image" "$connector_image"
 kubectl create namespace "$ns"
 # The connector needs NET_ADMIN, a hostPath TUN device and a privileged init
 # container.
@@ -83,6 +84,7 @@ kubectl label namespace "$ns" pod-security.kubernetes.io/enforce=privileged
 # 1. The control plane, at its in-cluster Service name.
 cat >"$work/values.yaml" <<EOF
 image: { repository: "${image%:*}", tag: "${image##*:}", pullPolicy: Never }
+relayImage: { repository: "${relay_image%:*}", tag: "${relay_image##*:}", pullPolicy: Never }
 connectorImage: { repository: "${connector_image%:*}", tag: "${connector_image##*:}", pullPolicy: Never }
 controlPlane:
   trustDomain: lab.test

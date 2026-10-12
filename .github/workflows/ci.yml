@@ -167,21 +167,33 @@ jobs:
         with:
           platforms: arm64
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: both images for linux/amd64 and linux/arm64, not pushed
+      - name: every image for linux/amd64 and linux/arm64, not pushed
         run: |
-          for target in warren warren-connector; do
+          for target in warren warren-relay warren-connector; do
             docker buildx build --platform linux/amd64,linux/arm64 --target "$target" .
           done
       - name: load the linux/amd64 images for kind
         run: |
-          docker buildx build --load --target warren -t warren:ci .
-          docker buildx build --load --target warren-connector -t warren-connector:ci .
+          for target in warren warren-relay warren-connector; do
+            docker buildx build --load --target "$target" -t "$target:ci" .
+          done
+      - name: the relay and connector images run the data-path build
+        run: |
+          docker run --rm warren:ci control-plane --help >/dev/null
+          for image in warren-relay:ci warren-connector:ci; do
+            docker run --rm "$image" relay --help >/dev/null
+            docker run --rm "$image" connector --help >/dev/null
+            if docker run --rm "$image" control-plane --help >/dev/null 2>&1; then
+              echo "error: $image offers the control-plane role" >&2
+              exit 1
+            fi
+          done
       - name: install pinned Helm and kind (CI-only tools, digest-verified)
         run: |
           scripts/install-kube-tools.sh "$RUNNER_TEMP/kube-tools"
           echo "$RUNNER_TEMP/kube-tools" >> "$GITHUB_PATH"
       - name: control plane, relay and kernel-mode connector from the chart on kind
-        run: scripts/e2e-kind.sh warren:ci warren-connector:ci
+        run: scripts/e2e-kind.sh warren:ci warren-relay:ci warren-connector:ci
 
   deps:
     name: dependency policy

@@ -92,8 +92,8 @@ spec:
       {{- include "warren.scheduling" (dict "v" $r) | nindent 6 }}
       containers:
         - name: relay
-          image: {{ include "warren.image" (dict "image" .Values.image "root" .) }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: {{ include "warren.image" (dict "image" .Values.relayImage "root" .) }}
+          imagePullPolicy: {{ .Values.relayImage.pullPolicy }}
           args:
             - relay
             - --listen=[::]:8443

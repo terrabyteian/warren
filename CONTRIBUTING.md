@@ -104,15 +104,16 @@ scripts/check-closure.sh
 scripts/check-vendor.sh        # needs network access to crates.io
 cargo deny --locked check      # needs cargo-deny
 cargo vet --locked             # needs cargo-vet
-scripts/test-chart.sh          # needs helm
+scripts/test-chart.sh          # needs helm, jq and ruby
 docker buildx build --platform linux/amd64,linux/arm64 --target warren .
+docker buildx build --platform linux/amd64,linux/arm64 --target warren-relay .
 docker buildx build --platform linux/amd64,linux/arm64 --target warren-connector .
-scripts/e2e-kind.sh warren:ci warren-connector:ci   # needs docker, kind, kubectl, helm
+scripts/e2e-kind.sh warren:ci warren-relay:ci warren-connector:ci   # needs docker, kind, kubectl, helm
 ```
 
 [docs/dependencies.md](docs/dependencies.md#2-how-it-is-enforced) says how to
 install cargo-deny and cargo-vet; `scripts/install-kube-tools.sh DIR`
-installs the pinned Helm and kind. `scripts/e2e-kind.sh` takes the two
+installs the pinned Helm and kind. `scripts/e2e-kind.sh` takes the three
 images, built with `--load` under those tags
 ([docs/kubernetes.md](docs/kubernetes.md#how-it-is-tested)). Clippy runs on
 macOS too, since the utun device, the Secure Enclave and privilege separation compile only there, and

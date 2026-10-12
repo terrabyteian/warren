@@ -1,15 +1,27 @@
 {{- $full := include "warren.fullname" . -}}
 warren {{ .Chart.AppVersion }} is installed in {{ .Release.Namespace }}.
 {{- if .Values.controlPlane.enabled }}
+{{- $url := urlParse .Values.controlPlane.publicUrl }}
 
-The console and sign-in are at {{ .Values.controlPlane.publicUrl }}, served by the
-Service {{ $full }}-control-plane ({{ .Values.controlPlane.service.type }}, port {{ .Values.controlPlane.service.port }}).
-That host name must resolve to the Service's address; from a workstation without
-one, forward it:
+The organization URL {{ .Values.controlPlane.publicUrl }} is served by the Service
+{{ $full }}-control-plane ({{ .Values.controlPlane.service.type }}, port {{ .Values.controlPlane.service.port }}).
+Its host name must resolve to the Service's address. From a workstation without
+one, forward the Service on the URL's own port and resolve the name locally, so
+the URL and the identity provider's redirect URI stay the same:
 
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }}-control-plane 8443:{{ .Values.controlPlane.service.port }}
+  echo "127.0.0.1 {{ $url.hostname }}" | sudo tee -a /etc/hosts
+  sudo kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }}-control-plane {{ $url.host | trimPrefix $url.hostname | trimPrefix ":" | default "443" }}:{{ .Values.controlPlane.service.port }}
 
-Administer the control plane:
+Sign in and enroll a Mac with the warren client (docs/macos.md):
+
+  warren login {{ .Values.controlPlane.publicUrl }}
+{{- if not .Values.controlPlane.tls.existingSecret }}
+
+Without controlPlane.tls, add --fingerprint with the root fingerprint that
+warren admin deployment prints.
+{{- end }}
+
+There is no web console yet. Administer the control plane with warren admin:
 
   kubectl -n {{ .Release.Namespace }} exec {{ $full }}-control-plane-0 -- warren admin deployment
 {{- if not (or .Values.relay.enabled .Values.connector.enabled) }}

@@ -109,9 +109,10 @@ The APIs are described in [docs/api/openapi.yaml](docs/api/openapi.yaml).
 ## Running warren on Kubernetes
 
 Each release publishes multi-architecture images
-(`ghcr.io/terrabyteian/warren` and `ghcr.io/terrabyteian/warren-connector`)
-and a Helm chart for the control plane, a relay and a kernel-mode connector,
-all signed with cosign:
+(`ghcr.io/terrabyteian/warren` for the control plane, and the data-path
+`ghcr.io/terrabyteian/warren-relay` and
+`ghcr.io/terrabyteian/warren-connector`) and a Helm chart for the control
+plane, a relay and a kernel-mode connector, all signed with cosign:
 
 ```sh
 helm install warren oci://ghcr.io/terrabyteian/charts/warren --version X.Y.Z \
@@ -119,7 +120,8 @@ helm install warren oci://ghcr.io/terrabyteian/charts/warren --version X.Y.Z \
 ```
 
 [docs/kubernetes.md](docs/kubernetes.md) walks through the install, reaching
-the console, joining a relay and a connector, and every value.
+the control plane and signing in, joining a relay and a connector, and
+every value.
 
 ## Contributing and security
 

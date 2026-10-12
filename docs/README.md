@@ -8,7 +8,7 @@
 | [policy.md](policy.md) | The policy schema (connector groups, apps, posture profiles, access rules, just-in-time access) and how it compiles to Cedar, with examples. |
 | [macos.md](macos.md) | The macOS client: installing it, signing in, `sudo warren up`, the device key in the Secure Enclave and its software fallback, what M1 leaves out, the menu-bar app and system extension, and how it is tested. |
 | [operating.md](operating.md) | Running the control plane: TLS certificates for the organization URL and for relays and connectors, and the HTTPS listener's connection limits. |
-| [kubernetes.md](kubernetes.md) | Running warren on Kubernetes: the container images and their signatures, the Helm chart, installing the control plane, reaching the console, adding a relay and a kernel-mode connector, and the chart's values. |
+| [kubernetes.md](kubernetes.md) | Running warren on Kubernetes: the container images and their signatures, the Helm chart, installing the control plane, reaching it and signing in, adding a relay and a kernel-mode connector, and the chart's values. |
 | [dependencies.md](dependencies.md) | The dependency policy, how CI enforces it, and the measured dependency closure. |
 | [benchmarks.md](benchmarks.md) | How the data path is benchmarked (setup time, latency, throughput through a relay against TLS over TCP), how to run it, and recorded results. |
 | [api/openapi.yaml](api/openapi.yaml) | The control-plane API: client sign-in, enrollment, certificates and entitlements; node joining, bundles, events and audit; the admin API. |

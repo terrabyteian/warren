@@ -5,11 +5,12 @@ name: Release
 #   x86_64), signed ad hoc and not notarized (the project has no Apple
 #   Developer membership yet), and attaches it to the tag's GitHub release
 #   with its SHA-256;
-# - builds the container images ghcr.io/terrabyteian/warren and
-#   ghcr.io/terrabyteian/warren-connector for linux/amd64 and linux/arm64,
-#   tagged X.Y.Z, each with an SBOM of its packages and a provenance
+# - builds the container images ghcr.io/terrabyteian/warren (the control
+#   plane), and ghcr.io/terrabyteian/warren-relay and
+#   ghcr.io/terrabyteian/warren-connector (the data-path build) for
+#   linux/amd64 and linux/arm64, tagged X.Y.Z, each with an SBOM of its packages and a provenance
 #   attestation, signs them with cosign (keyless, this workflow's identity)
-#   and attests an SPDX SBOM of the crates in Cargo.lock to both;
+#   and attests an SPDX SBOM of the crates in Cargo.lock to each;
 # - packages the Helm chart as version X.Y.Z, pushes it to
 #   oci://ghcr.io/terrabyteian/charts/warren and signs it the same way.
 # Run by hand, it builds everything without publishing.
@@ -93,7 +94,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: warren (control plane and relay)
+      - name: warren (control plane)
         id: warren
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -111,7 +112,25 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.licenses=Apache-2.0
-      - name: warren-connector (kernel-mode connector)
+      - name: warren-relay (relay, data-path build)
+        id: relay
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: warren-relay
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          sbom: true
+          provenance: mode=max
+          tags: ${{ env.REGISTRY }}/warren-relay:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=warren-relay
+            org.opencontainers.image.description=warren's data-path build (relay and connector, no control plane) for relays
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - name: warren-connector (kernel-mode connector, data-path build)
         id: connector
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -124,12 +143,12 @@ jobs:
           tags: ${{ env.REGISTRY }}/warren-connector:${{ steps.version.outputs.version }}
           labels: |
             org.opencontainers.image.title=warren-connector
-            org.opencontainers.image.description=warren with iproute2 and nftables for kernel-mode connectors
+            org.opencontainers.image.description=warren's data-path build with iproute2 and nftables for kernel-mode connectors
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.licenses=Apache-2.0
-      # The images' own SBOMs list the base image's packages; the binary's
+      # The images' own SBOMs list the base image's packages; the binaries'
       # crates come from Cargo.lock (a superset: it also locks the macOS
       # client's crates).
       - name: the crates the binary is built from
@@ -147,9 +166,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           WARREN_DIGEST: ${{ steps.warren.outputs.digest }}
+          RELAY_DIGEST: ${{ steps.relay.outputs.digest }}
           CONNECTOR_DIGEST: ${{ steps.connector.outputs.digest }}
         run: |
-          for image in "$REGISTRY/warren@$WARREN_DIGEST" "$REGISTRY/warren-connector@$CONNECTOR_DIGEST"; do
+          for image in "$REGISTRY/warren@$WARREN_DIGEST" "$REGISTRY/warren-relay@$RELAY_DIGEST" \
+            "$REGISTRY/warren-connector@$CONNECTOR_DIGEST"; do
             cosign sign --yes --recursive "$image"
             cosign attest --yes --type spdxjson --predicate warren-crates.spdx.json "$image"
           done

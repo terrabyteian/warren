@@ -2,16 +2,20 @@
 #
 # warren's container images, for linux/amd64 and linux/arm64. The binary is
 # compiled on the build platform and cross-compiled for the other, so a
-# multi-platform build never runs the compiler under emulation. Two targets
-# share that one build:
+# multi-platform build never runs the compiler under emulation. The build
+# stage makes two binaries: the full one, and the data-path one (relay and
+# connector only), which links no control-plane, console or Kubernetes
+# crates. Three targets use them:
 #
-#   warren            (default) distroless, nonroot: the `warren` binary and
-#                     CA certificates. The control plane and the relay.
-#   warren-connector  the same binary on Debian slim with iproute2 and
+#   warren            (default) distroless, nonroot: the full binary and CA
+#                     certificates. The control plane.
+#   warren-relay      distroless, nonroot: the data-path binary. The relay.
+#   warren-connector  the data-path binary on Debian slim with iproute2 and
 #                     nftables, which kernel-mode forwarding runs (`ip`,
 #                     `nft`) to set up the TUN device and NAT.
 #
 #   docker buildx build --platform linux/amd64,linux/arm64 -t warren .
+#   docker buildx build --target warren-relay -t warren-relay .
 #   docker buildx build --target warren-connector -t warren-connector .
 #
 # Base images are pinned by digest. cargo reads only vendor/
@@ -48,21 +52,31 @@ RUN set -eu; \
     fi
 WORKDIR /src
 COPY . .
+# /out/full and /out/data-path each hold a root filesystem's binary and
+# license.
 RUN set -eu; \
     . /env; \
-    cargo build --release -p warren --no-default-features \
-      --features control-plane,relay,connector --target "$target" --locked --offline; \
-    install -D -m 0755 "target/$target/release/warren" /out/usr/bin/warren; \
-    install -D -m 0644 LICENSE /out/usr/share/doc/warren/LICENSE
+    for build in full:control-plane,relay,connector data-path:relay,connector; do \
+      out="/out/${build%%:*}"; \
+      cargo build --release -p warren --no-default-features \
+        --features "${build#*:}" --target "$target" --locked --offline; \
+      install -D -m 0755 "target/$target/release/warren" "$out/usr/bin/warren"; \
+      install -D -m 0644 LICENSE "$out/usr/share/doc/warren/LICENSE"; \
+    done
 
 FROM ${DEBIAN_IMAGE} AS warren-connector
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=build /out/ /
+COPY --from=build /out/data-path/ /
+ENTRYPOINT ["/usr/bin/warren"]
+
+FROM ${DISTROLESS_IMAGE} AS warren-relay
+COPY --from=build /out/data-path/ /
+USER nonroot
 ENTRYPOINT ["/usr/bin/warren"]
 
 FROM ${DISTROLESS_IMAGE} AS warren
-COPY --from=build /out/ /
+COPY --from=build /out/full/ /
 USER nonroot
 ENTRYPOINT ["/usr/bin/warren"]

@@ -199,11 +199,6 @@ spec:
               mountPath: /etc/warren/idp
               readOnly: true
             {{- end }}
-            {{- if $cp.bootstrapAdmin.existingSecret }}
-            - name: bootstrap-admin
-              mountPath: /etc/warren/bootstrap-admin
-              readOnly: true
-            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -238,12 +233,6 @@ spec:
             items:
               - key: {{ $cp.idpClientSecret.key }}
                 path: {{ $cp.idpClientSecret.key }}
-        {{- end }}
-        {{- if $cp.bootstrapAdmin.existingSecret }}
-        - name: bootstrap-admin
-          secret:
-            secretName: {{ $cp.bootstrapAdmin.existingSecret }}
-            defaultMode: 0400
         {{- end }}
   {{- if $cp.persistence.enabled }}
   volumeClaimTemplates:
