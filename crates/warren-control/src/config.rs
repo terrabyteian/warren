@@ -141,8 +141,8 @@ pub struct TlsFiles {
 /// have signed in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Console {
-    /// Admins by email (compared without case), IdP subject or warren user
-    /// ID.
+    /// Admins by email (compared without case), IdP subject,
+    /// `local:<username>` for a built-in account, or warren user ID.
     pub admin_users: Vec<String>,
     /// Admins by IdP group.
     pub admin_groups: Vec<String>,

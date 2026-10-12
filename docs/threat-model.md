@@ -188,7 +188,8 @@ make it hard, visible and recoverable.
   through the IdP when it reports MFA and `auth_time`, or with a built-in
   account's password and authenticator or recovery code, checked exactly
   as for the warren app (T18). An IdP sign-in that reports no MFA or no
-  `auth_time` (Google's) steps up instead with the authenticator code of the
+  `auth_time` (Google's) steps up instead, while built-in accounts are
+  enabled, with the authenticator code of the
   one enabled built-in account whose email is the IdP's verified email,
   under the same lockout, per-source limit and one-use-per-step rules; it
   allows changes for the same hour. That binding is an email an admin set

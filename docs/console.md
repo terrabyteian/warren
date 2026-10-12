@@ -25,11 +25,16 @@ The console needs nothing beyond a running control plane, plus:
 ```yaml
 console:
   admins:
-    users: [ada@example.com]      # by email (any case), IdP subject, built-in username or warren user ID
+    users: [ada@example.com]      # by email (any case), IdP subject, "local:<username>" for a built-in account, or warren user ID
     groups: [warren-admins, "local:admins"]  # by IdP group, or local:<group> for warren's own groups
   sessionLifetime: 12h            # default 12h, at most 24h
   changeMaxAge: 1h                # default 1h: how recent a sign-in changes need
 ```
+
+A built-in account is `local:<username>` in `console.admins.users`, as in
+policy: a plain entry never matches a built-in account's username, and
+`local:` never matches an IdP subject, so an IdP user named like a built-in
+account (or the reverse) is not an admin by that entry.
 
 Open `https://<publicUrl>/` in a browser and sign in.
 
@@ -71,10 +76,13 @@ step up with warren's own authenticator. MFA is never optional for changes.
 
 ### Step-up with a built-in account's authenticator
 
-An admin signed in through the IdP whose sign-in reports no MFA, or no
-`auth_time`, or is too old, confirms with the authenticator code of their
-built-in account instead of signing in again: the notice offers **Confirm
-with your authenticator code** (`/console/step-up`). The code counts as a
+An admin signed in through the IdP whose sign-in reports no MFA or no
+`auth_time` confirms with the authenticator code of their built-in account
+instead of signing in again: the notice offers **Confirm with your
+authenticator code** (`/console/step-up`). A sign-in that reported both,
+but longer ago than `console.changeMaxAge`, signs in again at the IdP
+instead. The step-up follows `localAccounts.enabled`: with built-in
+accounts turned off, no sign-in steps up. The code counts as a
 multi-factor authentication at that moment, so changes are allowed for
 `console.changeMaxAge`; then the admin confirms again. It belongs to that
 console session only, and signing out ends it.
@@ -261,7 +269,9 @@ built-in accounts (with and without an IdP: enrollment, wrong passwords and
 codes, disabled accounts, the per-source limit, the sign-in form's token and
 origin), the step-up of a Google-style sign-in (no MFA, no `auth_time`)
 before a change, which account it binds to, replayed and wrong codes,
-lockout and the per-source limit, every page, each permission
+lockout and the per-source limit, no step-up with built-in accounts turned
+off or for a stale sign-in that reported MFA, admins named as
+`local:<username>` or by IdP subject, every page, each permission
 case (signed out, user, admin without MFA, admin with an old sign-in,
 admin, an IdP that leaves out `auth_time`), form tokens and origins, sign-ins finished in another browser,
 redirects after sign-in, sign-out, disabling a signed-in user, device and

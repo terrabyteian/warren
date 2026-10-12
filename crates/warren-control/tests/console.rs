@@ -130,6 +130,12 @@ impl Deployment {
     /// A deployment, with the IdP configured or not; `extra` is more
     /// configuration, where `{dir}` names the deployment's directory.
     async fn start_with(with_idp: bool, extra: &str) -> Deployment {
+        Deployment::start_with_admins(with_idp, "[Grace@Example.com]", extra).await
+    }
+
+    /// A deployment like `start_with` whose `console.admins.users` is
+    /// `users`.
+    async fn start_with_admins(with_idp: bool, users: &str, extra: &str) -> Deployment {
         let dir = TempDir::new("console");
         let idp = RunningIdp::start(admin_user()).await;
         write(&dir.path().join("policy/groups.yaml"), GROUP);
@@ -156,7 +162,7 @@ impl Deployment {
              policyDir: {dir}/policy\n\
              {idp_config}\
              devices:\n  approval: manual\n\
-             console:\n  admins:\n    groups: [warren-admins, \"local:admins\"]\n    users: [Grace@Example.com]\n\
+             console:\n  admins:\n    groups: [warren-admins, \"local:admins\"]\n    users: {users}\n\
              {extra}",
             data = dir.path().join("data").display(),
             dir = dir.path().display(),
@@ -174,6 +180,34 @@ impl Deployment {
             idp,
             cp,
             audit,
+            bundle,
+        }
+    }
+
+    /// The same deployment, restarted with its configuration changed by
+    /// `change`.
+    async fn restart(self, change: impl FnOnce(&mut Config)) -> Deployment {
+        let mut config = Config::clone(&self.cp.app().config);
+        change(&mut config);
+        let Deployment {
+            _dir,
+            idp,
+            cp,
+            audit: log,
+            base,
+            ..
+        } = self;
+        cp.shutdown().await;
+        let cp = ControlPlane::start_with_audit(config, Some(audit::Sink::memory(log.clone())))
+            .await
+            .unwrap();
+        let bundle = cp.app().authority.trust_bundle();
+        Deployment {
+            _dir,
+            idp,
+            cp,
+            audit: log,
+            base,
             bundle,
         }
     }
@@ -732,6 +766,36 @@ async fn admins_can_be_named_by_email() {
     let mut b = d.signed_in(grace).await;
     assert_eq!(b.get("/console/devices").await.status, StatusCode::OK);
     d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_names_tell_built_in_accounts_from_idp_subjects() {
+    // The bootstrap admin `admin` is not in an admin group here, and an IdP
+    // user's subject is `admin` too: `local:admin` names only the built-in
+    // account, and a plain `admin` only the IdP user.
+    for (users, local_admin) in [("[admin]", false), ("[\"local:admin\"]", true)] {
+        let d = Deployment::start_with_admins(
+            true,
+            users,
+            "localAccounts:\n  bootstrapAdmin:\n    passwordFile: {dir}/admin-password\n    groups: [ops]\n",
+        )
+        .await;
+        let mut own = d.browser();
+        own.local_sign_in("/console/login", "admin", None).await;
+        let status = own.get("/console/users").await.status;
+        assert_eq!(status == StatusCode::OK, local_admin, "{users}: {status}");
+        let mut idp = d
+            .signed_in(IdpUser {
+                sub: "admin".into(),
+                email: "someone@example.com".into(),
+                groups: vec![],
+                amr: vec!["mfa".into()],
+            })
+            .await;
+        let status = idp.get("/console/users").await.status;
+        assert_eq!(status == StatusCode::OK, !local_admin, "{users}: {status}");
+        d.cp.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -1705,6 +1769,68 @@ async fn a_step_up_needs_exactly_one_enabled_account_with_an_authenticator() {
     assert!(!no_step_up(&text(&b.get("/console/users").await)));
     setup.local_sign_in("/console/login", "root", None).await;
     assert!(no_step_up(&text(&b.get("/console/users").await)));
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn step_ups_follow_the_built_in_accounts_switch() {
+    let d = Deployment::with_accounts(true, Some("root@example.com"), "").await;
+    let mut own = d.browser();
+    let (secret, _) = own.local_sign_in("/console/login", "admin", None).await;
+    let step = totp_step(clock::now_secs());
+    let d = d.restart(|c| c.local_accounts.enabled = false).await;
+    let mut b = d.signed_in(google_style_admin(&d)).await;
+    let page = text(&b.get("/console/users").await);
+    assert!(
+        page.contains("Changes need a multi-factor sign-in"),
+        "{page}"
+    );
+    assert!(!page.contains("/console/step-up"), "{page}");
+    let r = b.get("/console/step-up?next=/console/users").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(text(&r).contains("No step-up available"));
+    let r = b
+        .step_up("/console/users", &code_at(&secret, step + 1))
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let page = text(&b.get("/console/users").await);
+    assert!(
+        page.contains("Changes need a multi-factor sign-in"),
+        "{page}"
+    );
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_sign_ins_that_reported_mfa_sign_in_again() {
+    let d = Deployment::with_accounts(true, Some("root@example.com"), "").await;
+    let mut own = d.browser();
+    own.local_sign_in("/console/login", "admin", None).await;
+    d.idp
+        .idp
+        .claims_patch
+        .lock()
+        .unwrap()
+        .insert("auth_time".into(), json!(clock::now_secs() - 7200));
+    let mut b = d.signed_in(admin_user()).await;
+    let page = text(&b.get("/console/users").await);
+    assert!(page.contains("Changes need a recent sign-in"), "{page}");
+    assert!(!page.contains("/console/step-up"), "{page}");
+    let r = b.get("/console/step-up?next=/console/users").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let body = text(&r);
+    assert!(body.contains("too long ago"), "{body}");
+    assert!(body.contains("reauth=1"), "{body}");
+
+    // The same sign-in without `auth_time` steps up.
+    d.idp.idp.claims_patch.lock().unwrap().remove("auth_time");
+    *d.idp.idp.omit_auth_time.lock().unwrap() = true;
+    let mut b = d.signed_in(admin_user()).await;
+    let page = text(&b.get("/console/users").await);
+    assert!(
+        page.contains("/console/step-up?next=/console/users"),
+        "{page}"
+    );
     d.cp.shutdown().await;
 }
 

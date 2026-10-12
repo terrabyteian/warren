@@ -228,13 +228,15 @@ fn display_name(u: &User) -> String {
     }
 }
 
-/// Whether `user` is named by `console.admins`.
+/// Whether `user` is named by `console.admins`. A built-in account's
+/// subject is `local:<username>`, as in policy, so no IdP subject matches it.
 pub fn is_admin(app: &App, user: &User) -> bool {
     let c = &app.config.console;
+    let subject = App::user_entity(user).subject;
     c.admin_groups.iter().any(|g| user.groups.contains(g))
         || c.admin_users.iter().any(|u| {
             *u == user.id
-                || *u == user.subject
+                || *u == subject
                 || (!user.email.is_empty() && u.eq_ignore_ascii_case(&user.email))
         })
 }
@@ -307,15 +309,18 @@ async fn signed_in<B>(app: &App, req: &Request<B>) -> Result<Signed, Stop> {
     }
     let admin = is_admin(app, &user);
     let mut changes = may_change(app, admin, &session, now);
-    // An IdP sign-in without a recent second factor may get one from the
-    // authenticator of the built-in account with the user's verified email.
-    let step_up = match changes {
-        Changes::NeedMfa | Changes::NeedRecentSignIn if !user.is_local() => app
-            .store
+    // An IdP sign-in that reports no MFA or no `auth_time` may get a second
+    // factor from the authenticator of the built-in account with the user's
+    // verified email, while built-in accounts are enabled.
+    let unreported = changes == Changes::NeedMfa
+        || (changes == Changes::NeedRecentSignIn && session.auth_time == AUTH_TIME_UNKNOWN as i64);
+    let step_up = if unreported && !user.is_local() && app.config.local_accounts.enabled {
+        app.store
             .step_up_account(&user.email)
             .await
-            .map_err(internal)?,
-        _ => None,
+            .map_err(internal)?
+    } else {
+        None
     };
     if step_up.is_some() {
         changes = Changes::NeedStepUp;
@@ -740,6 +745,8 @@ fn no_step_up(s: &Signed, next: &str) -> Response<Body> {
     }
     let text = if s.viewer.local {
         "A step-up is for sign-ins through an identity provider. Sign in again with your warren account instead."
+    } else if s.viewer.changes == Changes::NeedRecentSignIn {
+        "Your identity provider reported a second factor, but too long ago. Sign in again."
     } else {
         "To confirm with an authenticator code, you need a warren account with your email address and an authenticator app; ask an administrator. Until then, sign in again with a second factor your identity provider reports."
     };
