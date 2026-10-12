@@ -1355,18 +1355,26 @@ impl Store {
         Ok(true)
     }
 
-    /// Replaces a built-in account's password hash.
-    pub async fn set_password_hash(&self, user_id: &str, hash: &str) -> Result<(), Error> {
-        sqlx::query(
-            "UPDATE local_accounts SET password_hash = ?, updated_at = ? WHERE user_id = ?",
+    /// Replaces a built-in account's password hash `old` with `new`, the
+    /// same password hashed again. Returns false, changing nothing, if the
+    /// hash is no longer `old` (the password was reset or changed).
+    pub async fn set_password_hash(
+        &self,
+        user_id: &str,
+        old: &str,
+        new: &str,
+    ) -> Result<bool, Error> {
+        let r = sqlx::query(
+            "UPDATE local_accounts SET password_hash = ?, updated_at = ? WHERE user_id = ? AND password_hash = ?",
         )
-        .bind(hash)
+        .bind(new)
         .bind(clock::now_secs())
         .bind(user_id)
+        .bind(old)
         .execute(&self.pool)
         .await
         .map_err(db)?;
-        Ok(())
+        Ok(r.rows_affected() == 1)
     }
 
     /// Enrolls an authenticator (its sealed secret, and the time step of
@@ -1888,18 +1896,22 @@ impl Store {
     /// Moves a built-in account sign-in from stage `from` to `to`, for
     /// `user_id`, with the authenticator secret being enrolled. Returns
     /// false when the sign-in is gone or is no longer at `from`, so each
-    /// step happens once.
+    /// step happens once, or when the account's password hash is no longer
+    /// `password_hash`, the one the sign-in checked, so a reset that
+    /// commits during a step ends the sign-in.
     pub async fn advance_auth_request(
         &self,
         state_hash: &str,
         from: Option<&str>,
         to: &str,
         user_id: &str,
+        password_hash: &str,
         pending_secret: Option<&str>,
     ) -> Result<bool, Error> {
         let r = sqlx::query(
             "UPDATE auth_requests SET local_stage = ?, local_user_id = ?, pending_secret = ? \
-             WHERE state_hash = ? AND expires_at > ? AND local_stage IS ?",
+             WHERE state_hash = ? AND expires_at > ? AND local_stage IS ? \
+             AND EXISTS (SELECT 1 FROM local_accounts WHERE user_id = ? AND password_hash = ?)",
         )
         .bind(to)
         .bind(user_id)
@@ -1907,6 +1919,8 @@ impl Store {
         .bind(state_hash)
         .bind(clock::now_secs())
         .bind(from)
+        .bind(user_id)
+        .bind(password_hash)
         .execute(&self.pool)
         .await
         .map_err(db)?;
@@ -2790,6 +2804,71 @@ mod tests {
             .collect();
         assert_eq!(left, [4]);
         assert_eq!(store.event_bounds().await.unwrap(), (4, 4));
+        store.close().await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_reset_during_the_password_step_ends_the_sign_in() {
+        let dir = std::env::temp_dir().join(format!(
+            "warren-store-{}",
+            warren_core::keys::hex(&warren_core::keys::random_bytes::<6>().unwrap())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("warren.db")).await.unwrap();
+        let user = store
+            .create_local_user("ada", None, None, &[], Some("checked"), None)
+            .await
+            .unwrap();
+        let now = clock::now_secs();
+        for state in ["before", "after"] {
+            store
+                .insert_auth_request(state, &AuthRequest::default(), now + 600)
+                .await
+                .unwrap();
+        }
+        // Checked before the reset, advanced after it: refused, and
+        // neither is the old password written back as a rehash.
+        store
+            .reset_local_credentials(&user.id, "token", now + 600)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !store
+                .advance_auth_request("before", None, "code", &user.id, "checked", None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_password_hash(&user.id, "checked", "rehashed")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .local_account(&user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash,
+            None
+        );
+        // The password the sign-in checked is still the account's.
+        store.complete_setup("token", "new").await.unwrap().unwrap();
+        assert!(
+            store
+                .set_password_hash(&user.id, "new", "rehashed")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .advance_auth_request("after", None, "code", &user.id, "rehashed", None)
+                .await
+                .unwrap()
+        );
         store.close().await;
         std::fs::remove_dir_all(dir).ok();
     }

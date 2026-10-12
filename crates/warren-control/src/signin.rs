@@ -515,6 +515,11 @@ pub(crate) async fn password(
         Some(a) => app.store.reserve_local_attempt(&a.user_id, now).await?,
         None => app.unknown_names.attempt(&username, now),
     };
+    let hash = account.as_ref().and_then(|a| a.password_hash.clone());
+    let has_password = hash.is_some();
+    let ok = app
+        .verify_password(reserved.and(hash.clone()), password.clone())
+        .await?;
     let Some(lock) = reserved else {
         failed(
             app,
@@ -526,9 +531,6 @@ pub(crate) async fn password(
         );
         return Ok(retry());
     };
-    let hash = account.as_ref().and_then(|a| a.password_hash.clone());
-    let has_password = hash.is_some();
-    let ok = app.verify_password(hash.clone(), password.clone()).await?;
     let (Some(account), Some(user)) = (account, user) else {
         failed(
             app,
@@ -574,20 +576,31 @@ pub(crate) async fn password(
             "Your warren account is disabled. Contact your administrator.",
         ));
     }
-    if let Some(hash) = &hash
-        && accounts::needs_rehash(hash)
-    {
+    let mut verified = hash.unwrap_or_default();
+    if accounts::needs_rehash(&verified) {
         let rehashed = app.hash_password(password.clone()).await?;
-        app.store
-            .set_password_hash(&account.user_id, &rehashed)
-            .await?;
+        if !app
+            .store
+            .set_password_hash(&account.user_id, &verified, &rehashed)
+            .await?
+        {
+            return Ok(expired());
+        }
+        verified = rehashed;
     }
     if account.totp_secret.is_none() {
         let secret = accounts::new_totp_secret()?;
         let sealed = app.kek.seal(&totp_aad(&account.user_id), &secret)?;
         if !app
             .store
-            .advance_auth_request(&f.key, None, STAGE_ENROLL, &account.user_id, Some(&sealed))
+            .advance_auth_request(
+                &f.key,
+                None,
+                STAGE_ENROLL,
+                &account.user_id,
+                &verified,
+                Some(&sealed),
+            )
             .await?
         {
             return Ok(expired());
@@ -603,7 +616,7 @@ pub(crate) async fn password(
     }
     if !app
         .store
-        .advance_auth_request(&f.key, None, STAGE_CODE, &account.user_id, None)
+        .advance_auth_request(&f.key, None, STAGE_CODE, &account.user_id, &verified, None)
         .await?
     {
         return Ok(expired());
@@ -710,7 +723,14 @@ pub(crate) async fn code(
             .await?
             || !app
                 .store
-                .advance_auth_request(&f.key, Some(STAGE_ENROLL), STAGE_ENROLLED, &user_id, None)
+                .advance_auth_request(
+                    &f.key,
+                    Some(STAGE_ENROLL),
+                    STAGE_ENROLLED,
+                    &user_id,
+                    account.password_hash.as_deref().unwrap_or(""),
+                    None,
+                )
                 .await?
         {
             return Ok(expired());
