@@ -105,6 +105,8 @@ somewhere safe, since without it the database cannot be opened.
 ```sh
 head -c 32 /dev/urandom | base64 > kek
 kubectl -n warren create secret generic warren-kek --from-file=kek=kek
+# With an identity provider (leave out idp and idpClientSecret below
+# without one):
 kubectl -n warren create secret generic warren-idp --from-literal=client-secret='<IdP client secret>'
 # Optional: a certificate for the organization URL that browsers trust,
 # for example one issued by cert-manager into this Secret.
