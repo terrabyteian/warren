@@ -191,6 +191,11 @@ pub struct AuthRequest {
     pub nonce: String,
     /// The control plane's own PKCE verifier toward the IdP.
     pub idp_verifier: String,
+    /// When it was created, Unix seconds.
+    pub created_at: i64,
+    /// Whether the IdP was asked to authenticate the user afresh
+    /// (`prompt=login`).
+    pub login: bool,
 }
 
 /// A one-time sign-in code.
@@ -730,8 +735,8 @@ impl Store {
         expires_at: i64,
     ) -> Result<(), Error> {
         sqlx::query(
-            "INSERT INTO auth_requests (state_hash, client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO auth_requests (state_hash, client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, created_at, login, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(state_hash)
         .bind(&r.client_redirect_uri)
@@ -739,6 +744,8 @@ impl Store {
         .bind(&r.client_challenge)
         .bind(&r.nonce)
         .bind(&r.idp_verifier)
+        .bind(r.created_at)
+        .bind(r.login)
         .bind(expires_at)
         .execute(&self.pool)
         .await
@@ -749,9 +756,9 @@ impl Store {
     /// Takes (and deletes) an unexpired sign-in in flight: each one is
     /// usable once.
     pub async fn take_auth_request(&self, state_hash: &str) -> Result<Option<AuthRequest>, Error> {
-        let row: Option<(String, String, String, String, String)> = sqlx::query_as(
+        let row: Option<(String, String, String, String, String, i64, bool)> = sqlx::query_as(
             "DELETE FROM auth_requests WHERE state_hash = ? AND expires_at > ? \
-             RETURNING client_redirect_uri, client_state, client_challenge, nonce, idp_verifier",
+             RETURNING client_redirect_uri, client_state, client_challenge, nonce, idp_verifier, created_at, login",
         )
         .bind(state_hash)
         .bind(clock::now_secs())
@@ -764,14 +771,22 @@ impl Store {
             .await
             .map_err(db)?;
         Ok(row.map(
-            |(client_redirect_uri, client_state, client_challenge, nonce, idp_verifier)| {
-                AuthRequest {
-                    client_redirect_uri,
-                    client_state,
-                    client_challenge,
-                    nonce,
-                    idp_verifier,
-                }
+            |(
+                client_redirect_uri,
+                client_state,
+                client_challenge,
+                nonce,
+                idp_verifier,
+                created_at,
+                login,
+            )| AuthRequest {
+                client_redirect_uri,
+                client_state,
+                client_challenge,
+                nonce,
+                idp_verifier,
+                created_at,
+                login,
             },
         ))
     }

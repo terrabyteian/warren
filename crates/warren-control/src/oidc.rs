@@ -47,6 +47,8 @@ pub struct SignIn {
     /// never inferred from when the token was issued: a silent single
     /// sign-on issues a new token without authenticating anyone.
     pub auth_time: Option<i64>,
+    /// When the IdP issued the ID token, Unix seconds.
+    pub issued_at: i64,
     /// Whether the authentication used multi-factor authentication.
     pub mfa: bool,
 }
@@ -385,6 +387,7 @@ impl Provider {
             email,
             groups,
             auth_time,
+            issued_at: iat,
             mfa,
         })
     }
@@ -501,6 +504,7 @@ mod tests {
         assert_eq!(s.email, "ada@example.com");
         assert_eq!(s.groups, ["engineering"]);
         assert_eq!(s.auth_time, Some(990));
+        assert_eq!(s.issued_at, 1_000);
         assert!(s.mfa);
     }
 

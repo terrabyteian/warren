@@ -26,7 +26,6 @@ console:
   admins:
     users: [ada@example.com]      # by email (any case), IdP subject or warren user ID
     groups: [warren-admins]       # by IdP group
-  requireMfa: true                # default: admin pages need an MFA sign-in
   sessionLifetime: 12h            # default 12h, at most 24h
   changeMaxAge: 1h                # default 1h: how recent a sign-in changes need
 ```
@@ -35,17 +34,36 @@ Open `https://<publicUrl>/` in a browser and choose **Continue to sign in**.
 
 ### MFA and your identity provider
 
-Admin pages need a sign-in the IdP reported as multi-factor (threat model
-[T5](threat-model.md)): the ID token's `amr` must hold a value from
-`idp.mfaAmrValues` (default `mfa`), or its `acr` one from `idp.mfaAcrValues`.
-An admin whose sign-in does not qualify sees only their own apps and a
-**Sign in again** button that asks the IdP for a fresh sign-in.
+Every admin may read the admin pages. Changes need a sign-in the IdP
+reported as multi-factor (threat model [T5](threat-model.md)): the ID
+token's `amr` must hold a value from `idp.mfaAmrValues` (default `mfa`), or
+its `acr` one from `idp.mfaAcrValues`. An admin whose sign-in does not
+qualify sees disabled buttons, a notice and a **Sign in again** button that
+asks the IdP for a fresh sign-in; a change they post is refused with a page
+saying why.
 
 Some IdPs, Google among them, do not report MFA in the ID token at all. If
 yours reports a second factor under other `amr` or `acr` values, list them
-in `idp.mfaAmrValues` or `idp.mfaAcrValues`. If it reports none, set
-`console.requireMfa: false` and enforce MFA at the IdP for the admins'
-accounts; the console then trusts any sign-in by an admin.
+in `idp.mfaAmrValues` or `idp.mfaAcrValues`. If it reports none, its admins
+can read the admin pages but make no changes for now: a step-up with
+warren's own authenticator-app (TOTP) code, enrolled to the admin, comes
+with built-in accounts. MFA is never optional for changes.
+
+### How recent a sign-in is
+
+Changes also need the admin to have authenticated at the IdP within
+`console.changeMaxAge`, which warren reads from the ID token's `auth_time`.
+**Sign in again** asks the IdP for `prompt=login` and a `max_age` of
+`console.changeMaxAge` (or the policy's shortest `auth.maxAge`, if shorter),
+which ask it to authenticate the admin afresh and to report `auth_time`.
+
+Some IdPs, Google among them, may leave `auth_time` out. A console sign-in
+that sent `prompt=login` then counts as authenticated when its callback
+arrives, provided the ID token carries the sign-in's nonce and was issued
+(`iat`) no earlier than the sign-in started. Any other sign-in without
+`auth_time`, such as a plain one that may have reused the IdP's session,
+counts as never recent enough for changes. The warren app's sign-ins never
+infer `auth_time` this way.
 
 ## Pages
 
@@ -91,9 +109,12 @@ Everything else is read-only. Policy, apps and connector groups are managed
 in Git (the policy directory, or CRDs later) and are marked so: change them
 there and reload with `warren admin policy reload` or SIGHUP.
 
-Changes need a recent sign-in: within `console.changeMaxAge` (default one
-hour) of the admin authenticating at the IdP. Older sign-ins can still look
-around; their buttons are disabled and a notice offers **Sign in again**.
+Changes need a multi-factor sign-in within `console.changeMaxAge` (default
+one hour) of the admin authenticating at the IdP (see
+[MFA and your identity provider](#mfa-and-your-identity-provider)). Other
+admin sign-ins can still look around; their buttons are disabled and a
+notice offers **Sign in again**. If the console session ended before a
+change, signing in again returns to the page the change was made from.
 
 ## Security
 
@@ -131,8 +152,9 @@ The pages use a small template macro in `warren-console`
 markup, instead of a templating crate. A crate such as maud or askama would
 bring proc-macro dependencies into the control plane's closure for what
 about a hundred lines do here, against the dependency policy
-([dependencies.md](dependencies.md)). A test refuses inline format captures
-in templates, which would skip escaping.
+([dependencies.md](dependencies.md)). The macro passes each template
+through `concat!`, so an inline format capture such as `{name}`, which
+would skip escaping, is a compile error.
 
 ## Routes
 
@@ -154,7 +176,7 @@ The console is served on the HTTPS listener, beside the API:
 | `POST /console/devices/{device}/approve` | Approves a pending device. |
 | `POST /console/devices/{device}/revoke` | Revokes a device. |
 | `GET /console/login` | The sign-in page. |
-| `GET /console/login/start` | Starts sign-in at the IdP; `next` is where to return, `reauth=1` asks the IdP to sign in afresh. |
+| `GET /console/login/start` | Starts sign-in at the IdP; `next` is where to return, `reauth=1` asks the IdP to sign in afresh (`prompt=login`, `max_age`). |
 | `POST /console/logout` | Signs out. |
 | `GET /console/assets/console.css` | The stylesheet. |
 | `GET /console/assets/console.js` | The script. |
@@ -168,7 +190,7 @@ admin API and `warren admin` stay the interface for automation.
 `crates/warren-control/tests/console.rs` drives the console as a browser
 against a control plane and a test IdP: sign-in, every page, each permission
 case (signed out, user, admin without MFA, admin with an old sign-in,
-admin), form tokens and origins, sign-ins finished in another browser,
+admin, an IdP that leaves out `auth_time`), form tokens and origins, sign-ins finished in another browser,
 redirects after sign-in, sign-out, disabling a signed-in user, device and
 user changes and their audit records, decisions reported by a connector and
 their explanation, and escaping of values users, devices and connectors

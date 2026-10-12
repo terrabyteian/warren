@@ -91,6 +91,5 @@ console:
   admins:
     users: [ada@example.com]   # by email, IdP subject or warren user ID
     groups: [warren-admins]    # by IdP group
-  requireMfa: true             # admin pages need a sign-in the IdP reported as MFA
   sessionLifetime: 12h         # at most 24h
   changeMaxAge: 1h             # changes need an IdP sign-in this recent

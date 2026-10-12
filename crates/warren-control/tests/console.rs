@@ -1,6 +1,7 @@
 //! The web console end to end: browser sign-in through the OIDC provider,
 //! every page, and every permission case (signed out, user, admin without
-//! MFA, admin with a stale sign-in, admin), form tokens and origins, admin
+//! MFA, admin with a stale sign-in, an IdP that leaves out `auth_time`,
+//! admin), form tokens and origins, admin
 //! actions through the same code as the admin API, decisions reported by a
 //! connector and their explanation, and escaping of what users, devices and
 //! connectors control.
@@ -398,7 +399,11 @@ async fn signed_out_browsers_are_sent_to_sign_in() {
         let base = b.base.clone();
         let r = b.post_with(path, &[("csrf", "x")], &base).await;
         assert_eq!(r.status, StatusCode::SEE_OTHER, "{path}");
-        assert!(location(&r).starts_with("/console/login"), "{path}");
+        let to = location(&r);
+        assert!(to.starts_with("/console/login"), "{path}");
+        // Signing in returns to the page the change was made from.
+        let page = path.rsplitn(3, '/').nth(2).unwrap();
+        assert_eq!(query_of(&to)["next"], page, "{path}");
     }
     // A logout without a session just lands on the sign-in page.
     let base = b.base.clone();
@@ -583,37 +588,70 @@ async fn users_see_only_their_own_apps() {
 }
 
 #[tokio::test]
-async fn admins_without_mfa_get_only_their_own_apps() {
+async fn admins_without_mfa_read_admin_pages_but_change_nothing() {
     let d = Deployment::start().await;
+    let device = d.enroll(plain_user()).await;
+    let ada_id = d.user_id("ada@example.com").await;
     let mut no_mfa = admin_user();
     no_mfa.amr = vec!["pwd".into()];
     let mut b = d.signed_in(no_mfa).await;
-    let r = b.get("/console/devices").await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN);
-    let body = text(&r);
-    assert!(body.contains("Multi-factor sign-in required"), "{body}");
-    assert!(body.contains("/console/login/start?next=/console/devices&amp;reauth=1"));
-    let r = b.get("/console/").await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN);
-    assert_eq!(b.get("/console/me").await.status, StatusCode::OK);
+    for page in ADMIN_PAGES {
+        assert_eq!(b.get(page).await.status, StatusCode::OK, "{page}");
+    }
+    let page = text(&b.get("/console/devices").await);
+    assert!(
+        page.contains("Changes need a multi-factor sign-in"),
+        "{page}"
+    );
+    assert!(page.contains("disabled title=\"Changes need a multi-factor sign-in\""));
+    assert!(page.contains("/console/login/start?next=/console/devices&amp;reauth=1"));
 
-    // Signing in again with MFA opens the admin pages.
+    for (from, path) in [
+        (
+            "/console/devices",
+            format!("/console/devices/{device}/approve"),
+        ),
+        (
+            "/console/devices",
+            format!("/console/devices/{device}/revoke"),
+        ),
+        ("/console/users", format!("/console/users/{ada_id}/disable")),
+        ("/console/users", format!("/console/users/{ada_id}/enable")),
+    ] {
+        let r = b.post_from(from, &path).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{path}");
+        let body = text(&r);
+        assert!(body.contains("Multi-factor sign-in required"), "{body}");
+        assert!(body.contains("Nothing was changed."), "{body}");
+        assert!(
+            body.contains(&format!("/console/login/start?next={from}&amp;reauth=1")),
+            "{body}"
+        );
+    }
+    assert_eq!(d.device_status(&device).await, "pending");
+    let (_, users) = d.admin("GET", "/v1/admin/users", None).await;
+    let ada = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == ada_id.as_str())
+        .unwrap();
+    assert_eq!(ada["disabled"], false);
+
+    // Signing in again with MFA allows changes.
     *d.idp.idp.user.lock().unwrap() = admin_user();
     let landed = b
         .sign_in_with("/console/login/start?next=/console/devices&reauth=1")
         .await;
     assert_eq!(landed, "/console/devices");
-    assert_eq!(b.get("/console/devices").await.status, StatusCode::OK);
-    let prompts: Vec<_> = d
-        .idp
-        .idp
-        .authorize_requests
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|q| q.get("prompt").cloned())
-        .collect();
-    assert_eq!(prompts.last().unwrap().as_deref(), Some("login"));
+    let r = b
+        .post_from(
+            "/console/devices",
+            &format!("/console/devices/{device}/approve"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", text(&r));
+    assert_eq!(d.device_status(&device).await, "approved");
     d.cp.shutdown().await;
 }
 
@@ -808,8 +846,8 @@ async fn changes_need_a_form_token_from_this_origin() {
 async fn changes_need_a_recent_sign_in() {
     let d = Deployment::start().await;
     let device = d.enroll(plain_user()).await;
-    // The IdP does not say when the user authenticated, so the sign-in
-    // counts as old.
+    // The IdP does not say when the user authenticated, and a plain
+    // sign-in may reuse the IdP's session, so it counts as old.
     *d.idp.idp.omit_auth_time.lock().unwrap() = true;
     let mut b = d.signed_in(admin_user()).await;
     let page = text(&b.get("/console/devices").await);
@@ -827,9 +865,22 @@ async fn changes_need_a_recent_sign_in() {
     );
     assert_eq!(d.device_status(&device).await, "pending");
 
-    *d.idp.idp.omit_auth_time.lock().unwrap() = false;
+    // Signing in again asks the IdP to authenticate afresh, so even
+    // without auth_time the sign-in counts from its callback.
     b.sign_in_with("/console/login/start?next=/console/devices&reauth=1")
         .await;
+    let again = d
+        .idp
+        .idp
+        .authorize_requests
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap();
+    assert_eq!(again.get("prompt").map(String::as_str), Some("login"));
+    assert_eq!(again.get("max_age").map(String::as_str), Some("3600"));
+    assert!(!text(&b.get("/console/devices").await).contains("Changes need a recent sign-in"));
     let r = b
         .post_from(
             "/console/devices",

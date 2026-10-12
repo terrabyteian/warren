@@ -4,8 +4,8 @@
 //! template and positional arguments. Every argument is escaped unless it
 //! is already [`Html`], so text from users, the IdP, devices or audit
 //! records can never become markup. Templates use positional `{}` only:
-//! an inline capture such as `{name}` would bypass escaping, and a test
-//! refuses any in this crate's pages.
+//! an inline capture such as `{name}` would bypass escaping, so the macro
+//! makes one a compile error.
 
 use std::fmt::{self, Write};
 
@@ -143,11 +143,20 @@ impl<T: Render + ?Sized> fmt::Display for Escaped<'_, T> {
 
 /// Fills a literal template with positional arguments, escaping each one
 /// that is not already [`Html`].
+///
+/// The template passes through `concat!`, and `format!` cannot capture
+/// variables from a template another macro expanded, so an inline capture
+/// that would skip escaping does not compile:
+///
+/// ```compile_fail
+/// let name = "<script>";
+/// let _ = warren_console::html!("<b>{name}</b>");
+/// ```
 #[macro_export]
 macro_rules! html {
     ($template:literal $(, $arg:expr)* $(,)?) => {
         $crate::html::Html::__from_template(::std::format!(
-            $template $(, $crate::html::Escaped(&$arg))*
+            ::std::concat!($template) $(, $crate::html::Escaped(&$arg))*
         ))
     };
 }

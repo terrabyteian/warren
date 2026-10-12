@@ -238,6 +238,8 @@ async fn authorize<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, Api
                 client_challenge: challenge.into(),
                 nonce: nonce.clone(),
                 idp_verifier: verifier.clone(),
+                created_at: clock::now_secs(),
+                login,
             },
             clock::now_secs() + AUTH_REQUEST_LIFETIME,
         )
@@ -274,6 +276,8 @@ pub(crate) enum IdpSignIn {
         user: crate::store::User,
         /// IdP authentication time, Unix seconds.
         auth_time: i64,
+        /// When the IdP issued the ID token, Unix seconds.
+        issued_at: i64,
         /// Whether the sign-in used MFA.
         mfa: bool,
     },
@@ -351,6 +355,7 @@ pub(crate) async fn finish_idp_sign_in(
     Ok(IdpSignIn::Done {
         user,
         auth_time,
+        issued_at: signin.issued_at,
         mfa: signin.mfa,
     })
 }
@@ -408,6 +413,7 @@ async fn callback<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, ApiE
             user,
             auth_time,
             mfa,
+            ..
         } => (user, auth_time, mfa),
     };
     let actor = Actor::User {

@@ -302,10 +302,16 @@ fn filter(table: &str, placeholder: &str) -> Html {
 /// A button that posts to `action`, or a disabled one explaining why the
 /// viewer cannot make changes yet.
 fn action(viewer: &Viewer, path: &str, label: &str, kind: &str, confirm: Option<&str>) -> Html {
-    if !viewer.can_change {
+    let why = match viewer.changes {
+        Changes::Allowed => None,
+        Changes::NeedMfa => Some("Changes need a multi-factor sign-in"),
+        Changes::NeedRecentSignIn | Changes::NotAdmin => Some("Sign in again to make changes"),
+    };
+    if let Some(why) = why {
         return html!(
-            "<button class=\"btn small {}\" type=\"button\" disabled title=\"Sign in again to make changes\">{}</button>",
+            "<button class=\"btn small {}\" type=\"button\" disabled title=\"{}\">{}</button>",
             kind,
+            why,
             label
         );
     }
@@ -323,17 +329,25 @@ fn action(viewer: &Viewer, path: &str, label: &str, kind: &str, confirm: Option<
     )
 }
 
-/// A note above admin pages when the viewer's sign-in is too old to make
+/// A note above admin pages when the viewer's sign-in cannot make
 /// changes.
 fn reauth_note(viewer: &Viewer, here: &str) -> Html {
-    if viewer.can_change || !viewer.admin {
-        return Html::new();
+    match viewer.changes {
+        Changes::Allowed | Changes::NotAdmin => Html::new(),
+        Changes::NeedMfa => html!(
+            "<div class=\"flash warn\" role=\"note\">{} <a href=\"{}\">Sign in again</a> with a second factor to approve, revoke, disable or enable.</div>",
+            NEED_MFA,
+            start_url(here, true)
+        ),
+        Changes::NeedRecentSignIn => html!(
+            "<div class=\"flash warn\" role=\"note\">Changes need a recent sign-in. <a href=\"{}\">Sign in again</a> to approve, revoke, disable or enable.</div>",
+            start_url(here, true)
+        ),
     }
-    html!(
-        "<div class=\"flash warn\" role=\"note\">Changes need a recent sign-in. <a href=\"{}\">Sign in again</a> to approve, revoke, disable or enable.</div>",
-        start_url(here, true)
-    )
 }
+
+/// Why a sign-in without multi-factor authentication cannot make changes.
+pub const NEED_MFA: &str = "Changes need a multi-factor sign-in, and your identity provider did not report one for this sign-in. For identity providers that never report it, a step-up with a warren authenticator-app code is coming.";
 
 fn stat(label: &str, value: Html, detail: Html, href: Option<&str>) -> Html {
     let inner = html!(
@@ -1203,38 +1217,5 @@ mod tests {
             start_url("/console/devices?status=pending", true),
             "/console/login/start?next=/console/devices%3Fstatus%3Dpending&reauth=1"
         );
-    }
-
-    /// Templates use positional arguments only: an inline capture such as
-    /// `{name}` in a template would skip escaping.
-    #[test]
-    fn templates_never_capture_inline() {
-        let source = include_str!("pages.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap_or_default();
-        let html_calls: Vec<&str> = source.split("html!(").skip(1).collect();
-        for call in html_calls {
-            let Some(template) = call.trim_start().strip_prefix('"') else {
-                continue;
-            };
-            let mut end = 0;
-            let bytes = template.as_bytes();
-            while end < bytes.len()
-                && !(bytes[end] == b'"' && bytes[end.saturating_sub(1)] != b'\\')
-            {
-                end += 1;
-            }
-            let template = &template[..end];
-            let mut rest = template;
-            while let Some(i) = rest.find('{') {
-                rest = &rest[i + 1..];
-                assert!(
-                    rest.starts_with('}') || rest.starts_with('{'),
-                    "a template captures inline: {template}"
-                );
-                rest = &rest[1..];
-            }
-        }
     }
 }

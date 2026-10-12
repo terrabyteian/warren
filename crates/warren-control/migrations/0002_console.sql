@@ -14,3 +14,9 @@ CREATE TABLE console_sessions (
     ended_at   BIGINT
 );
 CREATE INDEX console_sessions_user ON console_sessions (user_id);
+
+-- When each sign-in in flight started and whether it asked the IdP to
+-- authenticate the user afresh: a console sign-in that did, and got back an
+-- ID token issued after it started, counts as authenticated at its callback.
+ALTER TABLE auth_requests ADD COLUMN created_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE auth_requests ADD COLUMN login BOOLEAN NOT NULL DEFAULT FALSE;

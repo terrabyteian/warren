@@ -71,9 +71,6 @@ pub struct Console {
     pub admin_users: Vec<String>,
     /// Admins by IdP group.
     pub admin_groups: Vec<String>,
-    /// Whether admin pages need a sign-in the IdP reported as
-    /// multi-factor (threat model T5). On by default.
-    pub require_mfa: bool,
     /// How long a console sign-in lasts.
     pub session_lifetime: Duration,
     /// How recently an admin must have authenticated at the IdP to make a
@@ -86,7 +83,6 @@ impl Default for Console {
         Console {
             admin_users: Vec::new(),
             admin_groups: Vec::new(),
-            require_mfa: true,
             session_lifetime: Duration::from_secs(12 * 3600),
             change_max_age: Duration::from_secs(3600),
         }
@@ -640,7 +636,7 @@ fn parse_console(r: &mut Reader, node: &Node) -> Console {
     let f = r.map(
         node,
         "console",
-        &["admins", "requireMfa", "sessionLifetime", "changeMaxAge"],
+        &["admins", "sessionLifetime", "changeMaxAge"],
     );
     if let Some(a) = get(&f, "admins") {
         let af = r.map(a, "console.admins", &["users", "groups"]);
@@ -649,14 +645,6 @@ fn parse_console(r: &mut Reader, node: &Node) -> Console {
         }
         if let Some(g) = get(&af, "groups") {
             console.admin_groups = r.strings(g, "console.admins.groups");
-        }
-    }
-    if let Some(m) = get(&f, "requireMfa") {
-        match r.string(m, "console.requireMfa").as_deref() {
-            Some("true") => console.require_mfa = true,
-            Some("false") => console.require_mfa = false,
-            Some(_) => r.err(m, "console.requireMfa must be true or false"),
-            None => {}
         }
     }
     if let Some(d) =
@@ -911,18 +899,16 @@ mod tests {
     fn console_settings() {
         let c = Config::parse(MINIMAL).unwrap();
         assert_eq!(c.console, Console::default());
-        assert!(c.console.require_mfa);
         let c = Config::parse(&format!(
-            "{MINIMAL}console:\n  admins:\n    users: [ada@example.com]\n    groups: [warren-admins]\n  requireMfa: false\n  sessionLifetime: 8h\n  changeMaxAge: 30m\n"
+            "{MINIMAL}console:\n  admins:\n    users: [ada@example.com]\n    groups: [warren-admins]\n  sessionLifetime: 8h\n  changeMaxAge: 30m\n"
         ))
         .unwrap();
         assert_eq!(c.console.admin_users, ["ada@example.com"]);
         assert_eq!(c.console.admin_groups, ["warren-admins"]);
-        assert!(!c.console.require_mfa);
         assert_eq!(c.console.session_lifetime, Duration::from_secs(8 * 3600));
         assert_eq!(c.console.change_max_age, Duration::from_secs(1800));
         for (bad, why) in [
-            ("console:\n  requireMfa: maybe\n", "requireMfa"),
+            ("console:\n  requireMfa: false\n", "requireMfa"),
             ("console:\n  sessionLifetime: 2d\n", "24h"),
             ("console:\n  changeMaxAge: 13h\n", "changeMaxAge"),
             ("console:\n  admins:\n    roles: [x]\n", "roles"),

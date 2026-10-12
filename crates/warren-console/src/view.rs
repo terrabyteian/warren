@@ -10,12 +10,27 @@ pub struct Viewer {
     pub name: String,
     /// Whether the admin pages are open to them.
     pub admin: bool,
-    /// Whether their sign-in is recent enough for admin changes.
-    pub can_change: bool,
+    /// Whether they may make admin changes, and if not, why not.
+    pub changes: Changes,
     /// The form token every POST must carry.
     pub csrf: String,
     /// Now, Unix seconds: what relative times are measured from.
     pub now: i64,
+}
+
+/// Whether a viewer may make admin changes (approve, revoke, disable,
+/// enable), and if not, why not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Changes {
+    /// They may.
+    Allowed,
+    /// They are not an admin.
+    #[default]
+    NotAdmin,
+    /// Their identity provider did not report a multi-factor sign-in.
+    NeedMfa,
+    /// Their sign-in is older than changes allow.
+    NeedRecentSignIn,
 }
 
 /// A notice shown at the top of a page after an action.

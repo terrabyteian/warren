@@ -960,6 +960,14 @@ async fn sign_in_asks_for_and_records_freshness() {
         .unwrap()
         .identity;
     assert_eq!(identity.auth_time, AUTH_TIME_UNKNOWN);
+    // Even after `prompt=login`: only the console infers it.
+    let q = unsure.browser_sign_in_with(&[("prompt", "login")]).await;
+    let reply = unsure.exchange(&q["code"], &q["verifier"]).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        unsure.session.as_ref().unwrap().auth_time,
+        AUTH_TIME_UNKNOWN as i64
+    );
     d.cp.shutdown().await;
 }
 

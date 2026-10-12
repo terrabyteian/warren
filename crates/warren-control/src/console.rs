@@ -11,11 +11,11 @@
 //! signing out takes effect at once. Every POST carries a form token
 //! derived from the session token and must come from this origin.
 //!
-//! Admin pages are open to the users and groups `console.admins` names,
-//! with a sign-in the IdP reported as multi-factor unless
-//! `console.requireMfa` is off; changes also need an authentication within
-//! `console.changeMaxAge` (threat model T5). Changes go through the same
-//! code as the admin API. Everyone signed in sees the apps open to them.
+//! Admin pages are open to the users and groups `console.admins` names.
+//! Changes need a sign-in the IdP reported as multi-factor, authenticated
+//! within `console.changeMaxAge` (threat model T5), and go through the
+//! same code as the admin API. Everyone signed in sees the apps open to
+//! them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -29,9 +29,10 @@ use warren_console::html::Html;
 use warren_console::pages;
 use warren_console::view::*;
 use warren_core::clock;
+use warren_core::identity::AUTH_TIME_UNKNOWN;
 use warren_core::jose::b64url;
 use warren_core::keys::sha256;
-use warren_policy::compile::Access;
+use warren_policy::compile::{Access, what_matches};
 use warren_policy::model::{self, DestinationKind};
 
 use crate::api::{IdpSignIn, finish_idp_sign_in, s256};
@@ -230,17 +231,26 @@ struct Signed {
     session: ConsoleSession,
     user: User,
     viewer: Viewer,
-    /// Named by `console.admins`, whether or not the sign-in qualifies.
-    named_admin: bool,
+}
+
+/// Where to return after signing in during `req`: the page itself for a
+/// GET, and for a change the page it was made from.
+fn return_to<B>(req: &Request<B>) -> String {
+    if req.method() == Method::GET {
+        return safe_next(req.uri().path_and_query().map(|p| p.as_str()));
+    }
+    let page = req
+        .uri()
+        .path()
+        .split('/')
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("/");
+    safe_next(Some(&page))
 }
 
 fn login_redirect<B>(req: &Request<B>, why: Option<&str>) -> Response<Body> {
-    let here = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/console/");
-    let next = safe_next(Some(here));
+    let next = return_to(req);
     let mut ser = form_urlencoded::Serializer::new(String::new());
     ser.append_pair("next", &next);
     if let Some(w) = why {
@@ -277,14 +287,12 @@ async fn signed_in<B>(app: &App, req: &Request<B>) -> Result<Signed, Stop> {
         set_cookie(&mut resp, SESSION_COOKIE, "", 0);
         return Err(Box::new(resp));
     }
-    let named_admin = is_admin(app, &user);
-    let admin = named_admin && (session.mfa || !app.config.console.require_mfa);
-    let fresh = now - session.auth_time <= app.config.console.change_max_age.as_secs() as i64;
+    let admin = is_admin(app, &user);
     let viewer = Viewer {
         user_id: user.id.clone(),
         name: display_name(&user),
         admin,
-        can_change: admin && fresh,
+        changes: may_change(app, admin, &session, now),
         csrf: csrf_token(&token),
         now,
     };
@@ -292,31 +300,29 @@ async fn signed_in<B>(app: &App, req: &Request<B>) -> Result<Signed, Stop> {
         session,
         user,
         viewer,
-        named_admin,
     })
 }
 
-/// Refuses non-admins, and admins whose sign-in did not use MFA when the
-/// console requires it.
-fn require_admin<B>(s: &Signed, req: &Request<B>) -> Result<(), Stop> {
+/// Whether a sign-in may make admin changes: the one check every change
+/// passes. An admin needs a sign-in the IdP reported as multi-factor
+/// (threat model T5) that authenticated them within
+/// `console.changeMaxAge`.
+fn may_change(app: &App, admin: bool, session: &ConsoleSession, now: i64) -> Changes {
+    if !admin {
+        Changes::NotAdmin
+    } else if !session.mfa {
+        Changes::NeedMfa
+    } else if now - session.auth_time > app.config.console.change_max_age.as_secs() as i64 {
+        Changes::NeedRecentSignIn
+    } else {
+        Changes::Allowed
+    }
+}
+
+/// Refuses everyone `console.admins` does not name.
+fn require_admin(s: &Signed) -> Result<(), Stop> {
     if s.viewer.admin {
         return Ok(());
-    }
-    if s.named_admin {
-        let next = safe_next(req.uri().path_and_query().map(|p| p.as_str()));
-        let again = warren_console::html!(
-            "<p><a class=\"btn primary\" href=\"{}\">Sign in again</a></p>",
-            pages::start_url(&next, true)
-        );
-        return Err(Box::new(html(
-            StatusCode::FORBIDDEN,
-            pages::message(
-                Some(&s.viewer),
-                "Multi-factor sign-in required",
-                "Your identity provider did not report multi-factor authentication for this sign-in, and the console requires it for administrators. Sign in again with a second factor.",
-                Some(again),
-            ),
-        )));
     }
     Err(Box::new(html(
         StatusCode::FORBIDDEN,
@@ -411,6 +417,15 @@ async fn login_start<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, A
     let q = query(req)?;
     let next = safe_next(param(&q, "next"));
     let reauth = param(&q, "reauth") == Some("1");
+    // Signing in again is for changes, so ask the IdP for a sign-in recent
+    // enough for them too.
+    let policy_max_age = app.compiled().and_then(|c| c.shortest_max_age());
+    let max_age = if reauth {
+        let change = app.config.console.change_max_age.as_secs() as i64;
+        Some(policy_max_age.map_or(change, |m| m.min(change)))
+    } else {
+        policy_max_age
+    };
     let binding = new_secret()?;
     let state = new_secret()?;
     let nonce = new_secret()?;
@@ -424,12 +439,13 @@ async fn login_start<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, A
                 client_challenge: secret_hash(&binding),
                 nonce: nonce.clone(),
                 idp_verifier: verifier.clone(),
+                created_at: clock::now_secs(),
+                login: reauth,
             },
             clock::now_secs() + LOGIN_LIFETIME,
         )
         .await?;
     let callback = format!("{}/v1/auth/callback", app.config.public_url);
-    let max_age = app.compiled().and_then(|c| c.shortest_max_age());
     match app
         .idp
         .authorize_url(&callback, &state, &nonce, &s256(&verifier), max_age, reauth)
@@ -457,6 +473,12 @@ async fn login_start<B>(app: &App, req: &Request<B>) -> Result<Response<Body>, A
 
 /// Finishes a console sign-in at the IdP's callback: checks the browser is
 /// the one that started it, then opens a console session.
+///
+/// When the IdP does not say when it authenticated the user, the session
+/// counts as authenticated now only if this sign-in asked the IdP to
+/// authenticate them afresh (`prompt=login`) and the ID token, carrying
+/// this request's nonce, was issued after the request was made. Otherwise
+/// the time stays unknown, which is never recent enough for changes.
 pub(crate) async fn finish_sign_in<B>(
     app: &App,
     req: &Request<B>,
@@ -496,8 +518,17 @@ pub(crate) async fn finish_sign_in<B>(
         IdpSignIn::Done {
             user,
             auth_time,
+            issued_at,
             mfa,
-        } => (user, auth_time, mfa),
+        } => {
+            let fresh = pending.login && issued_at >= pending.created_at;
+            let auth_time = if auth_time == AUTH_TIME_UNKNOWN as i64 && fresh {
+                clock::now_secs()
+            } else {
+                auth_time
+            };
+            (user, auth_time, mfa)
+        }
     };
     let token = new_secret()?;
     let lifetime = app.config.console.session_lifetime.as_secs() as i64;
@@ -619,10 +650,10 @@ async fn get_page<B>(app: &App, req: &Request<B>, segments: &[&str]) -> Response
         };
     }
     // The console's start: the overview for admins, their apps for others.
-    if segments == ["console", ""] && !s.named_admin {
+    if segments == ["console", ""] && !s.viewer.admin {
         return see_other("/console/me");
     }
-    if let Err(resp) = require_admin(&s, req) {
+    if let Err(resp) = require_admin(&s) {
         return *resp;
     }
     let page = match segments {
@@ -680,39 +711,36 @@ fn flash(q: &[(String, String)], what: &str) -> Option<Flash> {
     Some(Flash { ok: true, text })
 }
 
-/// Checks an admin change request: signed in, an admin with a recent
-/// enough sign-in, and a valid form from this origin.
+/// Checks an admin change request: signed in, an admin whose sign-in may
+/// make changes, and a valid form from this origin.
 async fn change_request(app: &App, req: Request<Incoming>) -> Result<Signed, Stop> {
     let s = signed_in(app, &req).await?;
-    require_admin(&s, &req)?;
-    if !s.viewer.can_change {
-        // Back to the page the change was made from.
-        let page = req
-            .uri()
-            .path()
-            .split('/')
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("/");
-        let again = warren_console::html!(
-            "<p><a class=\"btn primary\" href=\"{}\">Sign in again</a></p>",
-            pages::start_url(&safe_next(Some(&page)), true)
-        );
-        return Err(Box::new(html(
-            StatusCode::FORBIDDEN,
-            pages::message(
-                Some(&s.viewer),
-                "Sign in again to make changes",
-                &format!(
-                    "Changes need a sign-in from the last {}. Nothing was changed.",
-                    duration_words(app.config.console.change_max_age.as_secs() as i64)
-                ),
-                Some(again),
+    require_admin(&s)?;
+    let (title, text) = match s.viewer.changes {
+        Changes::Allowed => {
+            check_post(app, &s, req).await?;
+            return Ok(s);
+        }
+        Changes::NeedMfa => (
+            "Multi-factor sign-in required",
+            format!("{} Nothing was changed.", pages::NEED_MFA),
+        ),
+        Changes::NeedRecentSignIn | Changes::NotAdmin => (
+            "Sign in again to make changes",
+            format!(
+                "Changes need a sign-in from the last {}. Nothing was changed.",
+                duration_words(app.config.console.change_max_age.as_secs() as i64)
             ),
-        )));
-    }
-    check_post(app, &s, req).await?;
-    Ok(s)
+        ),
+    };
+    let again = warren_console::html!(
+        "<p><a class=\"btn primary\" href=\"{}\">Sign in again</a></p>",
+        pages::start_url(&return_to(&req), true)
+    );
+    Err(Box::new(html(
+        StatusCode::FORBIDDEN,
+        pages::message(Some(&s.viewer), title, &text, Some(again)),
+    )))
 }
 
 fn console_actor(s: &Signed) -> Actor {
@@ -1083,17 +1111,6 @@ fn destination_rows(app: &model::App) -> Vec<DestinationRow> {
         .collect()
 }
 
-/// Whether `rule` names `app`, by name or by its labels.
-fn names_app(rule: &model::Rule, app: &model::App) -> bool {
-    rule.what.apps.contains(&app.meta.name)
-        || (!rule.what.match_labels.is_empty()
-            && rule
-                .what
-                .match_labels
-                .iter()
-                .all(|(k, v)| app.meta.labels.get(k) == Some(v)))
-}
-
 async fn apps(app: &App) -> Result<(Vec<AppRow>, Vec<GroupScope>), ApiError> {
     let Some(compiled) = app.compiled() else {
         return Ok((Vec::new(), Vec::new()));
@@ -1122,7 +1139,7 @@ async fn apps(app: &App) -> Result<(Vec<AppRow>, Vec<GroupScope>), ApiError> {
                 .flat_map(|p| {
                     p.rules
                         .iter()
-                        .filter(|r| names_app(r, a))
+                        .filter(|r| what_matches(&r.what, a))
                         .map(move |r| format!("{}/{}", p.meta.name, r.name))
                 })
                 .collect(),
