@@ -34,6 +34,9 @@ pub enum Changes {
     NeedMfa,
     /// Their sign-in is older than changes allow.
     NeedRecentSignIn,
+    /// Their IdP sign-in lacks a recent multi-factor authentication, which
+    /// the authenticator code of their built-in account can provide.
+    NeedStepUp,
 }
 
 /// The sign-in page: the IdP, built-in accounts, or both.

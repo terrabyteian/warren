@@ -112,13 +112,16 @@ impl Deployment {
     }
 
     /// A deployment with built-in accounts: the bootstrap admin `admin`, in
-    /// `local:admins`, which the console names as admins. `extra` goes
-    /// under `localAccounts`.
-    async fn with_accounts(with_idp: bool, extra: &str) -> Deployment {
+    /// `local:admins`, which the console names as admins, with `email` if
+    /// given. `extra` goes under `localAccounts`.
+    async fn with_accounts(with_idp: bool, email: Option<&str>, extra: &str) -> Deployment {
+        let email = email
+            .map(|e| format!("    email: {e}\n"))
+            .unwrap_or_default();
         Deployment::start_with(
             with_idp,
             &format!(
-                "localAccounts:\n  bootstrapAdmin:\n    passwordFile: {{dir}}/admin-password\n{extra}"
+                "localAccounts:\n  bootstrapAdmin:\n    passwordFile: {{dir}}/admin-password\n{email}{extra}"
             ),
         )
         .await
@@ -461,6 +464,21 @@ impl Browser {
                 (secret, location(&reply))
             }
         }
+    }
+}
+
+impl Browser {
+    /// Posts the step-up form with `code`, returning to `next`.
+    async fn step_up(&mut self, next: &str, code: &str) -> Reply {
+        let page = text(&self.get(&format!("/console/step-up?next={next}")).await);
+        let token = csrf(&page);
+        let base = self.base.clone();
+        self.post_with(
+            "/console/step-up",
+            &[("csrf", &token), ("next", next), ("code", code)],
+            &base,
+        )
+        .await
     }
 }
 
@@ -1278,7 +1296,7 @@ async fn names_users_and_devices_control_are_escaped() {
 
 #[tokio::test]
 async fn built_in_accounts_sign_in_without_an_idp() {
-    let d = Deployment::with_accounts(false, "").await;
+    let d = Deployment::with_accounts(false, None, "").await;
     let mut b = d.browser();
     let to = location(&b.get("/console/users").await);
     assert_eq!(query_of(&to)["next"], "/console/users");
@@ -1386,7 +1404,7 @@ async fn built_in_accounts_sign_in_without_an_idp() {
 
 #[tokio::test]
 async fn disabled_built_in_accounts_cannot_sign_in_to_the_console() {
-    let d = Deployment::with_accounts(false, "").await;
+    let d = Deployment::with_accounts(false, None, "").await;
     let mut b = d.browser();
     let (status, _) = d.admin("POST", "/v1/admin/users/admin/disable", None).await;
     assert_eq!(status, 200);
@@ -1427,7 +1445,7 @@ async fn disabled_built_in_accounts_cannot_sign_in_to_the_console() {
 
 #[tokio::test]
 async fn console_sign_in_failures_count_against_the_source() {
-    let d = Deployment::with_accounts(false, "  maxFailuresPerSource: 3\n").await;
+    let d = Deployment::with_accounts(false, None, "  maxFailuresPerSource: 3\n").await;
     let mut b = d.browser();
     for i in 0..3 {
         let r = b
@@ -1446,7 +1464,7 @@ async fn console_sign_in_failures_count_against_the_source() {
 
 #[tokio::test]
 async fn built_in_accounts_and_the_idp_share_the_sign_in_page() {
-    let d = Deployment::with_accounts(true, "").await;
+    let d = Deployment::with_accounts(true, None, "").await;
     let mut b = d.browser();
     let page = text(&b.get("/console/login?next=/console/devices").await);
     assert!(
@@ -1512,6 +1530,231 @@ async fn built_in_accounts_and_the_idp_share_the_sign_in_page() {
     assert!(!page.contains("Changes need"), "{page}");
     let idp_admin = d.signed_in(admin_user()).await;
     assert!(idp_admin.cookies.contains_key(SESSION_COOKIE));
+    d.cp.shutdown().await;
+}
+
+/// An admin as Google signs them in: no MFA reported, no `auth_time`.
+fn google_style_admin(d: &Deployment) -> IdpUser {
+    *d.idp.idp.omit_auth_time.lock().unwrap() = true;
+    let mut admin = admin_user();
+    admin.amr = vec![];
+    admin
+}
+
+#[tokio::test]
+async fn idp_sign_ins_without_mfa_change_only_after_a_step_up() {
+    let d = Deployment::with_accounts(true, Some("Root@Example.com"), "").await;
+    // A user to disable, known from their own console sign-in.
+    d.signed_in(plain_user()).await;
+    let ada = d.user_id("ada@example.com").await;
+    let disable = format!("/console/users/{ada}/disable");
+    let disabled = || async {
+        let (_, users) = d.admin("GET", "/v1/admin/users", None).await;
+        users
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["id"] == ada.as_str())
+            .unwrap()["disabled"]
+            == true
+    };
+    // The admin's built-in account, with the IdP account's email, enrolls
+    // its authenticator.
+    let mut own = d.browser();
+    let (secret, _) = own.local_sign_in("/console/login", "admin", None).await;
+    let enrolled = totp_step(clock::now_secs());
+
+    let mut b = d.signed_in(google_style_admin(&d)).await;
+    let page = text(&b.get("/console/users").await);
+    assert!(
+        page.contains("Confirm with your authenticator code"),
+        "{page}"
+    );
+    assert!(page.contains("/console/step-up?next=/console/users"));
+    assert!(
+        page.contains("disabled title=\"Confirm with your authenticator code to make changes\"")
+    );
+    let r = b.post_from("/console/users", &disable).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let body = text(&r);
+    assert!(body.contains("Nothing was changed."), "{body}");
+    assert!(
+        body.contains("/console/step-up?next=/console/users"),
+        "{body}"
+    );
+    assert!(!disabled().await);
+
+    // The step-up page names the account whose code it takes.
+    let r = b.get("/console/step-up?next=/console/users").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(text(&r).contains("<strong>admin</strong>"));
+
+    // Its form needs the session's token, from this origin.
+    let base = b.base.clone();
+    let code = code_at(&secret, enrolled + 1);
+    let fields = [("next", "/console/users"), ("code", code.as_str())];
+    let r = b.post_with("/console/step-up", &fields, &base).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "no token");
+    let token = csrf(&text(&b.get("/console/users").await));
+    let with_token = [
+        ("csrf", token.as_str()),
+        ("next", "/console/users"),
+        ("code", code.as_str()),
+    ];
+    let r = b
+        .post_with("/console/step-up", &with_token, "https://evil.example")
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "another origin");
+
+    // A wrong code, and the code the sign-in already used, are refused.
+    let r = b
+        .step_up("/console/users", &code_at(&secret, enrolled - 5))
+        .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert!(text(&r).contains("That code is not right"));
+    let r = b
+        .step_up("/console/users", &code_at(&secret, enrolled))
+        .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "a replayed code");
+    let r = b.post_from("/console/users", &disable).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(!disabled().await);
+    let refused = audited(&d, "console step-up refused: wrong authenticator code");
+    assert_eq!(refused["auth_protocol"], "TOTP");
+
+    // The next code steps the sign-in up: changes work.
+    let r = b.step_up("/console/users", &code).await;
+    assert_eq!(location(&r), "/console/users");
+    let page = text(&b.get("/console/users").await);
+    assert!(
+        !page.contains("Confirm with your authenticator code"),
+        "{page}"
+    );
+    let r = b.post_from("/console/users", &disable).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", text(&r));
+    assert!(disabled().await);
+    let r = audited(
+        &d,
+        "stepped up a console sign-in with a built-in account's authenticator code",
+    );
+    assert_eq!(r["auth_protocol"], "TOTP");
+    assert_eq!(r["is_mfa"], true);
+    assert_eq!(r["user"]["name"], "admin");
+    assert_eq!(r["actor"]["user"]["email_addr"], "root@example.com");
+    // The step-up is the session's own: another IdP sign-in needs its own.
+    let mut other = d.signed_in(google_style_admin(&d)).await;
+    let page = text(&other.get("/console/users").await);
+    assert!(
+        page.contains("Confirm with your authenticator code"),
+        "{page}"
+    );
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_step_up_needs_exactly_one_enabled_account_with_an_authenticator() {
+    let d = Deployment::with_accounts(true, Some("root@example.com"), "").await;
+    let no_step_up = |page: &str| {
+        page.contains("Changes need a multi-factor sign-in") && !page.contains("/console/step-up")
+    };
+    // No authenticator yet.
+    let mut b = d.signed_in(google_style_admin(&d)).await;
+    assert!(no_step_up(&text(&b.get("/console/users").await)));
+    let r = b.get("/console/step-up?next=/console/users").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(text(&r).contains("No step-up available"));
+    let r = b.step_up("/console/users", "123456").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+
+    let mut own = d.browser();
+    own.local_sign_in("/console/login", "admin", None).await;
+    assert!(!no_step_up(&text(&b.get("/console/users").await)));
+
+    // Disabled.
+    d.admin("POST", "/v1/admin/users/admin/disable", None).await;
+    assert!(no_step_up(&text(&b.get("/console/users").await)));
+    d.admin("POST", "/v1/admin/users/admin/enable", None).await;
+    assert!(!no_step_up(&text(&b.get("/console/users").await)));
+
+    // Two accounts with the email: neither is the one.
+    let (status, created) = d
+        .admin(
+            "POST",
+            "/v1/admin/users",
+            Some(json!({ "username": "root", "email": "ROOT@example.com" })),
+        )
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let mut setup = d.browser();
+    let page = text(&setup.get(created["setup_url"].as_str().unwrap()).await);
+    let token = field(&page, "token");
+    let base = setup.base.clone();
+    let r = setup
+        .post_with(
+            "/v1/auth/setup",
+            &[
+                ("token", &token),
+                ("password", PASSWORD),
+                ("confirm", PASSWORD),
+            ],
+            &base,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", text(&r));
+    // Without an authenticator it does not count yet; with one it does.
+    assert!(!no_step_up(&text(&b.get("/console/users").await)));
+    setup.local_sign_in("/console/login", "root", None).await;
+    assert!(no_step_up(&text(&b.get("/console/users").await)));
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_step_ups_lock_the_account() {
+    let d = Deployment::with_accounts(true, Some("root@example.com"), "").await;
+    let mut own = d.browser();
+    let (secret, _) = own.local_sign_in("/console/login", "admin", None).await;
+    let step = totp_step(clock::now_secs());
+    let mut b = d.signed_in(google_style_admin(&d)).await;
+    for _ in 0..5 {
+        let r = b.step_up("/console/", &code_at(&secret, step - 5)).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    }
+    audited(&d, "built-in account locked after too many failed sign-ins");
+    // The right code is refused while the account is locked, and so is a
+    // sign-in with it.
+    let r = b.step_up("/console/", &code_at(&secret, step + 1)).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    audited(
+        &d,
+        "console step-up refused: the account is locked after too many failed sign-ins",
+    );
+    let r = d
+        .browser()
+        .password("/console/login", "admin", PASSWORD)
+        .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    d.cp.shutdown().await;
+}
+
+#[tokio::test]
+async fn step_ups_count_against_the_source() {
+    let d = Deployment::with_accounts(
+        true,
+        Some("root@example.com"),
+        "  maxFailuresPerSource: 3\n",
+    )
+    .await;
+    let mut own = d.browser();
+    let (secret, _) = own.local_sign_in("/console/login", "admin", None).await;
+    let step = totp_step(clock::now_secs());
+    let mut b = d.signed_in(google_style_admin(&d)).await;
+    for _ in 0..3 {
+        let r = b.step_up("/console/", "000000").await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    }
+    let r = b.step_up("/console/", &code_at(&secret, step + 1)).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(text(&r).contains("too many failed sign-ins"));
     d.cp.shutdown().await;
 }
 

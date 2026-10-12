@@ -187,8 +187,17 @@ make it hard, visible and recoverable.
   sign-in that authenticated the admin within the last hour by default:
   through the IdP when it reports MFA and `auth_time`, or with a built-in
   account's password and authenticator or recovery code, checked exactly
-  as for the warren app (T18). A step-up with TOTP for IdP sign-ins that do
-  not report MFA comes later. Every console form, the sign-in form included,
+  as for the warren app (T18). An IdP sign-in that reports no MFA or no
+  `auth_time` (Google's) steps up instead with the authenticator code of the
+  one enabled built-in account whose email is the IdP's verified email,
+  under the same lockout, per-source limit and one-use-per-step rules; it
+  allows changes for the same hour. That binding is an email an admin set
+  on the built-in account and warren does not verify, as trusted as the
+  emails `console.admins` names: whoever can set it (the admin socket, or
+  Git) can pick whose IdP sign-ins the account's authenticator steps up, so
+  a step-up needs both that IdP sign-in and that authenticator, and nothing
+  more proves they belong to one person. Every console form, the sign-in and
+  step-up forms included,
   sits behind form tokens, origin checks and a strict content security
   policy ([console.md](console.md#security)). Policy from Git or CRDs is reviewed
   outside warren before it applies (G19).
@@ -454,7 +463,10 @@ Residual risk: TOTP can be phished by a page that relays the user's password
 and code in real time; passkeys, which bind to the origin, arrive later. The
 web console's sign-in takes the same password and code, so a relayed
 sign-in can open a console session too, and for an admin that session can
-make console changes until `console.changeMaxAge` passes.
+make console changes until `console.changeMaxAge` passes. The console's
+step-up takes the same code: a phishing page that relays an admin's IdP
+sign-in and then their authenticator code in real time gets a session that
+can make changes for that long.
 
 ## 6. Accepted risks
 

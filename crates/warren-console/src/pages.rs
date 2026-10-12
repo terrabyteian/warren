@@ -358,6 +358,7 @@ fn action(viewer: &Viewer, path: &str, label: &str, kind: &str, confirm: Option<
         Changes::Allowed => None,
         Changes::NeedMfa => Some("Changes need a multi-factor sign-in"),
         Changes::NeedRecentSignIn | Changes::NotAdmin => Some("Sign in again to make changes"),
+        Changes::NeedStepUp => Some("Confirm with your authenticator code to make changes"),
     };
     if let Some(why) = why {
         return html!(
@@ -395,11 +396,50 @@ fn reauth_note(viewer: &Viewer, here: &str) -> Html {
             "<div class=\"flash warn\" role=\"note\">Changes need a recent sign-in. <a href=\"{}\">Sign in again</a> to approve, revoke, disable or enable.</div>",
             again_url(viewer, here)
         ),
+        Changes::NeedStepUp => html!(
+            "<div class=\"flash warn\" role=\"note\">{} <a href=\"{}\">Confirm with your authenticator code</a> to approve, revoke, disable or enable.</div>",
+            NEED_STEP_UP,
+            step_up_url(here)
+        ),
     }
 }
 
 /// Why a sign-in without multi-factor authentication cannot make changes.
-pub const NEED_MFA: &str = "Changes need a multi-factor sign-in, and your identity provider did not report one for this sign-in. For identity providers that never report it, a step-up with a warren authenticator-app code is coming.";
+pub const NEED_MFA: &str = "Changes need a multi-factor sign-in, and your identity provider did not report one for this sign-in.";
+
+/// Why an IdP sign-in needs a step-up before changes.
+pub const NEED_STEP_UP: &str = "Changes need a recent multi-factor sign-in, and your identity provider did not report one for this sign-in.";
+
+/// Where the step-up form is, returning to `next`.
+pub fn step_up_url(next: &str) -> String {
+    format!("/console/step-up?next={}", next_param(next))
+}
+
+/// The step-up page: the authenticator code of the built-in account
+/// `username`, which allows changes for `window`.
+pub fn step_up(
+    viewer: &Viewer,
+    next: &str,
+    username: &str,
+    window: &str,
+    error: Option<&str>,
+) -> Html {
+    let error = match error {
+        Some(e) => html!("<div class=\"flash bad\" role=\"alert\">{}</div>", e),
+        None => Html::new(),
+    };
+    let body = html!(
+        "<section class=\"card narrow\"><p>{} Enter the 6-digit code from the authenticator app of your warren account <strong>{}</strong>. Changes are then allowed for {}.</p>{}<form class=\"stack\" method=\"post\" action=\"/console/step-up\">{}<input type=\"hidden\" name=\"next\" value=\"{}\"><label for=\"code\">Code</label><input id=\"code\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" autocapitalize=\"none\" spellcheck=\"false\" required autofocus><button class=\"btn primary\" type=\"submit\">Confirm</button></form><p><a href=\"{}\">Back</a></p></section>",
+        NEED_STEP_UP,
+        username,
+        window,
+        error,
+        csrf_field(viewer),
+        next,
+        next
+    );
+    layout(viewer, Nav::None, "Confirm it's you", None, body)
+}
 
 fn stat(label: &str, value: Html, detail: Html, href: Option<&str>) -> Html {
     let inner = html!(

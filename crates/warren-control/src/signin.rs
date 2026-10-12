@@ -411,7 +411,7 @@ fn actor(user: &User) -> Actor {
     }
 }
 
-fn logon_record(
+pub(crate) fn logon_record(
     success: bool,
     actor: &Actor,
     message: &str,
@@ -429,7 +429,7 @@ fn logon_record(
 
 /// Counts an attempt against its source, refusing it once the source has
 /// made too many.
-fn too_many(app: &App, peer: &Peer) -> Option<Response<Body>> {
+pub(crate) fn too_many(app: &App, peer: &Peer) -> Option<Response<Body>> {
     (!app.limiter.attempt(source(peer), clock::now_secs())).then(too_many_page)
 }
 
@@ -446,13 +446,12 @@ fn too_many_page() -> Response<Body> {
 fn failed(
     app: &App,
     peer: &Peer,
-    user: Option<&User>,
+    who: &Actor,
     locked: Option<&LocalAccount>,
     message: &str,
     protocol: &str,
 ) {
-    let actor = user.map(actor).unwrap_or(Actor::Anonymous);
-    app.audit(logon_record(false, &actor, message, protocol, peer));
+    app.audit(logon_record(false, who, message, protocol, peer));
     let Some(account) = locked else {
         return;
     };
@@ -576,7 +575,7 @@ pub(crate) async fn check_password(
         failed(
             app,
             peer,
-            user.as_ref(),
+            &user.as_ref().map(actor).unwrap_or(Actor::Anonymous),
             None,
             "sign-in refused: the username is locked after too many failed sign-ins",
             "password",
@@ -587,7 +586,7 @@ pub(crate) async fn check_password(
         failed(
             app,
             peer,
-            None,
+            &Actor::Anonymous,
             None,
             "sign-in refused: unknown username",
             "password",
@@ -609,7 +608,7 @@ pub(crate) async fn check_password(
         failed(
             app,
             peer,
-            Some(&user),
+            &actor(&user),
             (lock > 0).then_some(&account),
             why,
             "password",
@@ -761,9 +760,8 @@ pub(crate) async fn code(
         .filter(|c| !c.is_whitespace())
         .collect();
 
-    let reserved = app.store.reserve_local_attempt(&user_id, now).await?;
-
     if stage == Some(STAGE_ENROLL) {
+        let reserved = app.store.reserve_local_attempt(&user_id, now).await?;
         let sealed = f.request.pending_secret.clone().unwrap_or_default();
         let secret = app.kek.open(&totp_aad(&user_id), &sealed)?;
         let retry = || {
@@ -782,7 +780,7 @@ pub(crate) async fn code(
             failed(
                 app,
                 peer,
-                Some(&user),
+                &actor(&user),
                 None,
                 "authenticator enrollment refused: the account is locked after too many failed sign-ins",
                 "password+TOTP",
@@ -793,7 +791,7 @@ pub(crate) async fn code(
             failed(
                 app,
                 peer,
-                Some(&user),
+                &actor(&user),
                 (lock > 0).then_some(&account),
                 "authenticator enrollment refused: wrong code",
                 "password+TOTP",
@@ -854,44 +852,95 @@ pub(crate) async fn code(
             &f.request.client_redirect_uri,
         )
     };
-    let Some(lock) = reserved else {
+    match check_code(app, &account, &actor(&user), &typed, Purpose::SignIn, peer).await? {
+        Some(protocol) => finish(app, &f.key, &user, protocol, peer).await,
+        None => Ok(retry()),
+    }
+}
+
+/// What an authenticator code is checked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    /// The second step of a sign-in: an authenticator or recovery code.
+    SignIn,
+    /// A console step-up for an IdP sign-in: an authenticator code only.
+    StepUp,
+}
+
+impl Purpose {
+    fn what(self) -> &'static str {
+        match self {
+            Purpose::SignIn => "sign-in",
+            Purpose::StepUp => "console step-up",
+        }
+    }
+
+    fn totp(self) -> &'static str {
+        match self {
+            Purpose::SignIn => "password+TOTP",
+            Purpose::StepUp => "TOTP",
+        }
+    }
+}
+
+/// Checks a code typed for `account`, the one check of a built-in account's
+/// second factor: the attempt counts against the account before it is
+/// checked (locking it after `MAX_FAILED_ATTEMPTS` failures in a row), an
+/// authenticator code's time step is accepted once, a recovery code (for a
+/// sign-in) once, and every failure is audited as `who`. Returns the
+/// protocol it passed with, or `None`. The caller counts the attempt
+/// against its source first.
+pub(crate) async fn check_code(
+    app: &App,
+    account: &LocalAccount,
+    who: &Actor,
+    typed: &str,
+    purpose: Purpose,
+    peer: &Peer,
+) -> Result<Option<&'static str>, ApiError> {
+    let user_id = &account.user_id;
+    let now = clock::now_secs();
+    let Some(lock) = app.store.reserve_local_attempt(user_id, now).await? else {
         failed(
             app,
             peer,
-            Some(&user),
+            who,
             None,
-            "sign-in refused: the account is locked after too many failed sign-ins",
-            "password+TOTP",
+            &format!(
+                "{} refused: the account is locked after too many failed sign-ins",
+                purpose.what()
+            ),
+            purpose.totp(),
         );
-        return Ok(retry());
+        return Ok(None);
     };
     let secret = app.kek.open(
-        &totp_aad(&user_id),
+        &totp_aad(user_id),
         account.totp_secret.as_deref().unwrap_or(""),
     )?;
+    let recovery = match purpose {
+        Purpose::SignIn => accounts::normalize_recovery_code(typed),
+        Purpose::StepUp => None,
+    };
     let (accepted, protocol) =
-        match accounts::verify_totp(&secret, &typed, now, account.totp_last_step) {
+        match accounts::verify_totp(&secret, typed, now, account.totp_last_step) {
             Some(step) => (
                 app.store
-                    .record_local_success(&user_id, Some(step), now)
+                    .record_local_success(user_id, Some(step), now)
                     .await?,
-                "password+TOTP",
+                purpose.totp(),
             ),
-            None => match accounts::normalize_recovery_code(&typed) {
+            None => match recovery {
                 Some(code) => {
                     let left = app
                         .store
-                        .use_recovery_code(&user_id, &accounts::recovery_code_hash(&code))
+                        .use_recovery_code(user_id, &accounts::recovery_code_hash(&code))
                         .await?;
                     match left {
                         Some(left) => {
-                            app.store.record_local_success(&user_id, None, now).await?;
-                            let mut r = audit::record(
-                                Activity::Update,
-                                true,
-                                &actor(&user),
-                                "recovery code used",
-                            );
+                            app.store.record_local_success(user_id, None, now).await?;
+                            let mut r =
+                                audit::record(Activity::Update, true, who, "recovery code used");
                             r.insert("entity".into(), audit::entity("recovery-code", ""));
                             r.insert("unmapped".into(), json!({ "recovery_codes_left": left }));
                             app.audit(r);
@@ -900,22 +949,26 @@ pub(crate) async fn code(
                         None => (false, "password+recovery code"),
                     }
                 }
-                None => (false, "password+TOTP"),
+                None => (false, purpose.totp()),
             },
         };
     if !accepted {
+        let codes = match purpose {
+            Purpose::SignIn => "authenticator or recovery code",
+            Purpose::StepUp => "authenticator code",
+        };
         failed(
             app,
             peer,
-            Some(&user),
-            (lock > 0).then_some(&account),
-            "sign-in refused: wrong authenticator or recovery code",
+            who,
+            (lock > 0).then_some(account),
+            &format!("{} refused: wrong {codes}", purpose.what()),
             protocol,
         );
-        return Ok(retry());
+        return Ok(None);
     }
     app.limiter.succeeded(source(peer), now);
-    finish(app, &f.key, &user, protocol, peer).await
+    Ok(Some(protocol))
 }
 
 /// `POST /v1/auth/continue`: after the recovery codes were shown.

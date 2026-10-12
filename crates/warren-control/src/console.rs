@@ -42,7 +42,7 @@ use crate::app::{App, new_secret, secret_hash};
 use crate::audit::{self, Activity, Actor};
 use crate::oidc::Provider;
 use crate::signin::{self, PasswordCheck};
-use crate::store::{AuthRequest, ConsoleSession, Device, User, new_id};
+use crate::store::{AuthRequest, ConsoleSession, Device, LocalAccount, User, new_id};
 use crate::web::{self, ApiError, Body, Peer, param, query, read_body};
 
 /// The `client_redirect_uri` that marks an auth request as a console
@@ -89,6 +89,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/console/login"),
     ("POST", "/console/login"),
     ("GET", "/console/login/start"),
+    ("GET", "/console/step-up"),
+    ("POST", "/console/step-up"),
     ("POST", "/console/logout"),
     ("GET", "/console/assets/console.css"),
     ("GET", "/console/assets/console.js"),
@@ -244,6 +246,9 @@ struct Signed {
     session: ConsoleSession,
     user: User,
     viewer: Viewer,
+    /// The built-in account whose authenticator code can step this sign-in
+    /// up, when it needs one and has one.
+    step_up: Option<LocalAccount>,
 }
 
 /// Where to return after signing in during `req`: the page itself for a
@@ -301,12 +306,26 @@ async fn signed_in<B>(app: &App, req: &Request<B>) -> Result<Signed, Stop> {
         return Err(Box::new(resp));
     }
     let admin = is_admin(app, &user);
+    let mut changes = may_change(app, admin, &session, now);
+    // An IdP sign-in without a recent second factor may get one from the
+    // authenticator of the built-in account with the user's verified email.
+    let step_up = match changes {
+        Changes::NeedMfa | Changes::NeedRecentSignIn if !user.is_local() => app
+            .store
+            .step_up_account(&user.email)
+            .await
+            .map_err(internal)?,
+        _ => None,
+    };
+    if step_up.is_some() {
+        changes = Changes::NeedStepUp;
+    }
     let viewer = Viewer {
         user_id: user.id.clone(),
         name: display_name(&user),
         admin,
         local: user.is_local(),
-        changes: may_change(app, admin, &session, now),
+        changes,
         csrf: csrf_token(&token),
         now,
     };
@@ -314,19 +333,24 @@ async fn signed_in<B>(app: &App, req: &Request<B>) -> Result<Signed, Stop> {
         session,
         user,
         viewer,
+        step_up,
     })
 }
 
 /// Whether a sign-in may make admin changes: the one check every change
-/// passes. An admin needs a multi-factor sign-in (threat model T5) that
-/// authenticated them within `console.changeMaxAge`: one the IdP reported
-/// as such, or a built-in account's, which always is.
+/// passes. An admin needs a multi-factor authentication (threat model T5)
+/// within `console.changeMaxAge`: a sign-in the IdP reported as such, a
+/// built-in account's sign-in, which always is, or a step-up with a
+/// built-in account's authenticator code.
 fn may_change(app: &App, admin: bool, session: &ConsoleSession, now: i64) -> Changes {
+    let max_age = app.config.console.change_max_age.as_secs() as i64;
     if !admin {
         Changes::NotAdmin
+    } else if session.step_up_at.is_some_and(|t| now - t <= max_age) {
+        Changes::Allowed
     } else if !session.mfa {
         Changes::NeedMfa
-    } else if now - session.auth_time > app.config.console.change_max_age.as_secs() as i64 {
+    } else if now - session.auth_time > max_age {
         Changes::NeedRecentSignIn
     } else {
         Changes::Allowed
@@ -688,6 +712,7 @@ pub(crate) async fn open_session(
         user_id: user.id.clone(),
         auth_time,
         mfa,
+        step_up_at: None,
         expires_at: clock::now_secs() + lifetime,
         ended_at: None,
     };
@@ -703,6 +728,144 @@ pub(crate) async fn open_session(
     set_cookie(&mut resp, SESSION_COOKIE, &token, lifetime);
     set_cookie(&mut resp, LOGIN_COOKIE, "", 0);
     Ok(resp)
+}
+
+// Step-up.
+
+/// The step-up page's answer when the sign-in cannot step up: it may make
+/// changes already, or no built-in account can step it up.
+fn no_step_up(s: &Signed, next: &str) -> Response<Body> {
+    if s.viewer.changes == Changes::Allowed {
+        return see_other(next);
+    }
+    let text = if s.viewer.local {
+        "A step-up is for sign-ins through an identity provider. Sign in again with your warren account instead."
+    } else {
+        "To confirm with an authenticator code, you need a warren account with your email address and an authenticator app; ask an administrator. Until then, sign in again with a second factor your identity provider reports."
+    };
+    let again = warren_console::html!(
+        "<p><a class=\"btn primary\" href=\"{}\">Sign in again</a></p>",
+        pages::again_url(&s.viewer, next)
+    );
+    html(
+        StatusCode::FORBIDDEN,
+        pages::message(Some(&s.viewer), "No step-up available", text, Some(again)),
+    )
+}
+
+/// How long a step-up allows changes, in words.
+fn change_window(app: &App) -> String {
+    duration_words(app.config.console.change_max_age.as_secs() as i64)
+}
+
+/// `GET /console/step-up`: the authenticator code form, for an admin whose
+/// IdP sign-in needs a second factor for changes.
+async fn step_up_page<B>(app: &App, req: &Request<B>) -> Response<Body> {
+    let s = match signed_in(app, req).await {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = require_admin(&s) {
+        return *resp;
+    }
+    let q = match query(req) {
+        Ok(q) => q,
+        Err(e) => return error_page(Some(&s.viewer), &e),
+    };
+    let next = safe_next(param(&q, "next"));
+    match &s.step_up {
+        Some(account) => html(
+            StatusCode::OK,
+            pages::step_up(
+                &s.viewer,
+                &next,
+                &account.username,
+                &change_window(app),
+                None,
+            ),
+        ),
+        None => no_step_up(&s, &next),
+    }
+}
+
+/// `POST /console/step-up`: checks the authenticator code of the built-in
+/// account bound to this IdP sign-in by its verified email, with the same
+/// limits as a sign-in, and records the step-up on the console session.
+async fn step_up(app: &App, req: Request<Incoming>, peer: &Peer) -> Response<Body> {
+    let s = match signed_in(app, &req).await {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = require_admin(&s) {
+        return *resp;
+    }
+    let form = match check_post(app, &s, req).await {
+        Ok(form) => form,
+        Err(resp) => return *resp,
+    };
+    let next = safe_next(param(&form, "next"));
+    let Some(account) = &s.step_up else {
+        return no_step_up(&s, &next);
+    };
+    if signin::too_many(app, peer).is_some() {
+        return html(
+            StatusCode::TOO_MANY_REQUESTS,
+            pages::message(
+                Some(&s.viewer),
+                "Too many failed attempts",
+                signin::TOO_MANY,
+                None,
+            ),
+        );
+    }
+    let typed: String = param(&form, "code")
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let who = actor(&s.user);
+    let passed =
+        match signin::check_code(app, account, &who, &typed, signin::Purpose::StepUp, peer).await {
+            Ok(p) => p,
+            Err(e) => return error_page(Some(&s.viewer), &e),
+        };
+    let Some(protocol) = passed else {
+        return html(
+            StatusCode::UNAUTHORIZED,
+            pages::step_up(
+                &s.viewer,
+                &next,
+                &account.username,
+                &change_window(app),
+                Some(
+                    "That code is not right or was already used, or the account is temporarily locked. Enter the newest code, or try again later.",
+                ),
+            ),
+        );
+    };
+    let now = clock::now_secs();
+    match app.store.step_up_console_session(&s.session.id, now).await {
+        Ok(true) => {}
+        Ok(false) => return back_to_sign_in(&next, "expired"),
+        Err(e) => return error_page(Some(&s.viewer), &e.into()),
+    }
+    let mut r = signin::logon_record(
+        true,
+        &who,
+        "stepped up a console sign-in with a built-in account's authenticator code",
+        protocol,
+        peer,
+    );
+    r.insert(
+        "user".into(),
+        serde_json::json!({ "uid": account.user_id, "name": account.username }),
+    );
+    r.insert(
+        "entity".into(),
+        audit::entity("console-session", &s.session.id),
+    );
+    app.audit(r);
+    see_other(&next)
 }
 
 async fn logout(app: &App, req: Request<Incoming>) -> Response<Body> {
@@ -757,6 +920,8 @@ pub async fn route(app: &Arc<App>, req: Request<Incoming>, peer: &Peer) -> Respo
         (&Method::GET, ["console", "login"]) => login_page(app, &req).await,
         (&Method::POST, ["console", "login"]) => login_password(app, req, peer).await,
         (&Method::GET, ["console", "login", "start"]) => login_start(app, &req).await,
+        (&Method::GET, ["console", "step-up"]) => Ok(step_up_page(app, &req).await),
+        (&Method::POST, ["console", "step-up"]) => Ok(step_up(app, req, peer).await),
         (&Method::POST, ["console", "logout"]) => Ok(logout(app, req).await),
         (&Method::GET, _) => Ok(get_page(app, &req, &segments).await),
         (&Method::POST, ["console", "users", id, action @ ("disable" | "enable")]) => {
@@ -873,6 +1038,21 @@ async fn change_request(app: &App, req: Request<Incoming>) -> Result<Signed, Sto
                 duration_words(app.config.console.change_max_age.as_secs() as i64)
             ),
         ),
+        Changes::NeedStepUp => {
+            let confirm = warren_console::html!(
+                "<p><a class=\"btn primary\" href=\"{}\">Confirm with your authenticator code</a></p>",
+                pages::step_up_url(&return_to(&req))
+            );
+            return Err(Box::new(html(
+                StatusCode::FORBIDDEN,
+                pages::message(
+                    Some(&s.viewer),
+                    "Confirm it's you to make changes",
+                    &format!("{} Nothing was changed.", pages::NEED_STEP_UP),
+                    Some(confirm),
+                ),
+            )));
+        }
     };
     let again = warren_console::html!(
         "<p><a class=\"btn primary\" href=\"{}\">Sign in again</a></p>",

@@ -61,15 +61,45 @@ through the IdP is when the IdP reports it: the ID token's `amr` must hold
 a value from `idp.mfaAmrValues` (default `mfa`), or its `acr` one from
 `idp.mfaAcrValues`. An admin whose sign-in does not
 qualify sees disabled buttons, a notice and a **Sign in again** button that
-asks the IdP for a fresh sign-in; a change they post is refused with a page
-saying why.
+asks the IdP for a fresh sign-in, or the step-up below; a change they post
+is refused with a page saying why.
 
 Some IdPs, Google among them, do not report MFA in the ID token at all. If
 yours reports a second factor under other `amr` or `acr` values, list them
 in `idp.mfaAmrValues` or `idp.mfaAcrValues`. If it reports none, its admins
-can read the admin pages but make no changes when signed in through it; an
-admin with a built-in account can sign in with that instead. MFA is never
-optional for changes.
+step up with warren's own authenticator. MFA is never optional for changes.
+
+### Step-up with a built-in account's authenticator
+
+An admin signed in through the IdP whose sign-in reports no MFA, or no
+`auth_time`, or is too old, confirms with the authenticator code of their
+built-in account instead of signing in again: the notice offers **Confirm
+with your authenticator code** (`/console/step-up`). The code counts as a
+multi-factor authentication at that moment, so changes are allowed for
+`console.changeMaxAge`; then the admin confirms again. It belongs to that
+console session only, and signing out ends it.
+
+Their built-in account is the one that is enabled, not deleted, has an
+authenticator, and has the IdP's verified email as its email (in any
+case). If no such account exists, or more than one does, there is no
+step-up. To set one up, create a built-in account with the admin's email
+(`warren admin users create <username> --email <email>`, or a `LocalUser`
+in the policy directory) and have the admin sign in with it once, in the
+console or the warren app, to enroll the authenticator. The account itself
+needs no admin rights; the console still decides those from the IdP
+sign-in.
+
+The step-up takes authenticator codes only, not recovery codes, and
+counts against the account exactly as a sign-in does: each code once, the
+lockout after five failures in a row (which also stops the account's
+sign-ins), and `localAccounts.maxFailuresPerSource`.
+
+**Trust.** The binding is the built-in account's email, which an admin set
+and warren does not verify, the same trust `console.admins.users` already
+places in email addresses. Whoever can set a built-in account's email
+(through the admin socket, or the policy directory) can choose whose IdP
+sign-ins its authenticator steps up, so treat those as admin powers
+([threat model T5](threat-model.md#t5-control-plane-compromise)).
 
 ### How recent a sign-in is
 
@@ -137,7 +167,8 @@ one hour) of the admin authenticating (see
 [MFA and your identity provider](#mfa-and-your-identity-provider)). Other
 admin sign-ins can still look around; their buttons are disabled and a
 notice offers **Sign in again**: at the IdP for an IdP sign-in, on the
-sign-in page's form for a built-in account. If the console session ended before a
+sign-in page's form for a built-in account, or **Confirm with your
+authenticator code** when an IdP sign-in can step up. If the console session ended before a
 change, signing in again returns to the page the change was made from.
 
 ## Security
@@ -154,6 +185,9 @@ change, signing in again returns to the page the change was made from.
   enrollment steps are the warren app's own pages, bound to the browser by
   their `__Host-warren-signin` cookie (`SameSite=Strict`) and refused from
   another origin ([threat model T18](threat-model.md#t18-attacks-on-built-in-accounts)).
+- **Step-up** posts a console form like any other (session form token,
+  origin checks) and goes through the same code check as a built-in
+  account's sign-in; its time is stored on the console session.
 - **Sessions** are a random 256-bit token in a `__Host-warren-console`
   cookie: `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, host-only, lasting
   `console.sessionLifetime`. The database keeps only its hash. The session
@@ -208,6 +242,8 @@ The console is served on the HTTPS listener, beside the API:
 | `POST /console/devices/{device}/revoke` | Revokes a device. |
 | `GET /console/login` | The sign-in page; `next` is where to return, `reauth=1` shows it even to a signed-in browser, to sign in again. |
 | `POST /console/login` | A built-in account's username and password, from the sign-in page's form; answers with its authenticator code step. |
+| `GET /console/step-up` | The step-up form for an IdP sign-in that needs a second factor for changes; `next` is where to return. |
+| `POST /console/step-up` | An authenticator code of the admin's built-in account; allows changes for `console.changeMaxAge`. |
 | `GET /console/login/start` | Starts sign-in at the IdP; `next` is where to return, `reauth=1` asks the IdP to sign in afresh (`prompt=login`, `max_age`). Without an IdP, goes to the sign-in page. |
 | `POST /console/logout` | Signs out. |
 | `GET /console/assets/console.css` | The stylesheet. |
@@ -223,7 +259,9 @@ admin API and `warren admin` stay the interface for automation.
 against a control plane and a test IdP: sign-in through the IdP and with
 built-in accounts (with and without an IdP: enrollment, wrong passwords and
 codes, disabled accounts, the per-source limit, the sign-in form's token and
-origin), every page, each permission
+origin), the step-up of a Google-style sign-in (no MFA, no `auth_time`)
+before a change, which account it binds to, replayed and wrong codes,
+lockout and the per-source limit, every page, each permission
 case (signed out, user, admin without MFA, admin with an old sign-in,
 admin, an IdP that leaves out `auth_time`), form tokens and origins, sign-ins finished in another browser,
 redirects after sign-in, sign-out, disabling a signed-in user, device and
