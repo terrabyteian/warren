@@ -67,8 +67,18 @@ pub fn check_private(path: &Path) -> Result<(), String> {
 pub fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let fail = |e: std::io::Error| format!("{}: {e}", path.display());
-    let tmp = path.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{}: not a file path", path.display()))?;
+    let nonce = warren_core::keys::random_bytes::<6>().map_err(|e| e.to_string())?;
+    let mut staging = std::ffi::OsString::from(".");
+    staging.push(name);
+    staging.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        warren_core::keys::hex(&nonce)
+    ));
+    let tmp = path.with_file_name(staging);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -77,9 +87,14 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
         options.mode(0o600);
     }
     let mut file = options.open(&tmp).map_err(fail)?;
-    file.write_all(data).map_err(fail)?;
-    file.sync_all().map_err(fail)?;
-    std::fs::rename(&tmp, path).map_err(fail)
+    let written = file
+        .write_all(data)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.map_err(fail)
 }
 
 /// Reads JSON from `path`; `None` if the file does not exist.
@@ -368,8 +383,50 @@ mod tests {
         };
         store.save_profile(&p).unwrap();
         assert_eq!(store.profile().unwrap(), Some(p));
-        assert!(!dir.join("profile.tmp").exists());
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [PROFILE]);
         check_private(&dir.join(PROFILE)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_writers_to_sibling_files_do_not_collide() {
+        let dir = std::env::temp_dir().join(format!(
+            "warren-state-{}",
+            warren_core::keys::hex(&warren_core::keys::random_bytes::<6>().unwrap())
+        ));
+        create_private_dir(&dir).unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|s| {
+            for (i, file) in ["certificate.pem", "certificate.json"]
+                .iter()
+                .cycle()
+                .take(4)
+                .enumerate()
+            {
+                let (dir, barrier) = (&dir, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    for n in 0..200 {
+                        write_private(&dir.join(file), format!("{i}-{n}").as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["certificate.json", "certificate.pem"]);
+        for f in &names {
+            check_private(&dir.join(f)).unwrap();
+            let text = std::fs::read_to_string(dir.join(f)).unwrap();
+            assert!(text.ends_with("-199"), "{f}: {text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
